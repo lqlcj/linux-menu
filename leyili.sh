@@ -576,7 +576,8 @@ show_status_menu(){
     render_menu_item 4 "停止服务"
     render_menu_item 5 "启动服务"
     render_menu_item 6 "查看客户端链接"
-    render_menu_item 7 "重新生成密钥对"
+    render_menu_item 7 "节点二维码"
+    render_menu_item 8 "修改节点参数"
     render_menu_item 0 "返回上级"
     render_divider
     read -p "  请输入序号: " choice
@@ -618,7 +619,10 @@ show_status_menu(){
         show_client_link
         ;;
       7)
-        regenerate_keypair
+        show_qrcode
+        ;;
+      8)
+        modify_node_params
         ;;
       0)
         return
@@ -1109,96 +1113,222 @@ show_client_link(){
   echo ""
   echo -e "  ${B}客户端链接：${N}"
   echo -e "  ${G}${current_link:-${MENU_LINK:-未找到}}${N}"
+  print_qrcode "${current_link:-$MENU_LINK}"
   pause_screen
 }
 
-regenerate_keypair(){
-  local keypair=""
-  local new_pri=""
-  local new_pub=""
-  local current_ip=""
-  local current_link=""
-  local current_tag=""
-  local current_listen_addr=""
-  local current_mode=""
-  local current_bind_ipv4=""
+modify_node_params(){
+  local new_port=""
+  local new_sni=""
+  local new_uuid=""
+  local regen_keypair="n"
+  local new_pri="" new_pub="" keypair=""
+  local cur_port cur_sni cur_uuid
+  local backup_path=""
 
-  if ! require_singbox_installed; then
-    return 1
-  fi
+  if ! require_root; then return 1; fi
+  if ! require_singbox_installed; then return 1; fi
 
-  echo -e "${Y}==> 重新生成密钥对...${N}"
-  if ! keypair=$(sing-box generate reality-keypair); then
+  if [ ! -f "$CONFIG_PATH" ]; then
     echo ""
-    echo -e "${R}密钥对生成失败${N}"
-    pause_screen
-    return 1
-  fi
-
-  new_pri=$(echo "$keypair" | grep PrivateKey | awk '{print $2}')
-  new_pub=$(echo "$keypair" | grep PublicKey | awk '{print $2}')
-  if [ -z "$new_pri" ] || [ -z "$new_pub" ]; then
-    echo ""
-    echo -e "${R}密钥对解析失败${N}"
-    pause_screen
-    return 1
-  fi
-
-  if ! sed -i "s|\"private_key\":.*|\"private_key\": \"$new_pri\",|" "$CONFIG_PATH"; then
-    echo ""
-    echo -e "${R}配置文件更新失败${N}"
-    pause_screen
-    return 1
-  fi
-
-  if ! sing-box check -c "$CONFIG_PATH"; then
-    echo ""
-    echo -e "${R}新配置校验失败，已保留当前文件，请检查配置${N}"
-    pause_screen
-    return 1
-  fi
-
-  if ! systemctl restart sing-box; then
-    echo ""
-    echo -e "${R}sing-box 重启失败，请检查上方输出${N}"
+    echo -e "${R}未找到配置文件：$CONFIG_PATH${N}"
     pause_screen
     return 1
   fi
 
   load_proxy_context
-  current_ip="${MENU_IP:-}"
-  current_tag="${MENU_TAG:-reality}"
-  current_listen_addr="${MENU_LISTEN_ADDR:-0.0.0.0}"
-  current_mode="${MENU_MODE:-ipv4}"
-  current_bind_ipv4="${MENU_BIND_IPV4:-}"
-  current_link=$(build_client_link "$MENU_UUID" "$current_ip" "$MENU_PORT" "$MENU_SNI" "$new_pub" "$MENU_SHORT_ID" "$current_tag" 2>/dev/null || true)
+  cur_port="${MENU_PORT:-}"
+  cur_sni="${MENU_SNI:-}"
+  cur_uuid="${MENU_UUID:-}"
 
-  if [ -n "$MENU_UUID" ] && [ -n "$MENU_PORT" ] && [ -n "$MENU_SNI" ] && [ -n "$MENU_SHORT_ID" ]; then
-    write_proxy_info \
-      "$MENU_UUID" \
-      "$new_pub" \
-      "$new_pri" \
-      "$current_ip" \
-      "$MENU_PORT" \
-      "$MENU_SNI" \
-      "$MENU_SHORT_ID" \
-      "$current_tag" \
-      "$current_listen_addr" \
-      "$current_link" \
-      "$current_mode" \
-      "$current_bind_ipv4"
-  else
-    set_info_value "PublicKey" "$new_pub"
-    set_info_value "PrivateKey" "$new_pri"
-    [ -n "$current_ip" ] && set_info_value "IP" "$current_ip"
-    [ -n "$current_link" ] && set_info_value "Link" "$current_link"
-    [ -n "$current_mode" ] && set_info_value "Mode" "$current_mode"
-    [ -n "$current_bind_ipv4" ] && set_info_value "BindIPv4" "$current_bind_ipv4"
+  echo ""
+  echo -e "  ${B}${C}修改节点参数${N}  ${D}直接回车保留当前值${N}"
+  render_divider
+
+  # 端口
+  while true; do
+    read -p "  端口 (${cur_port:-当前未知}): " new_port
+    new_port="${new_port:-$cur_port}"
+    if validate_port "$new_port"; then
+      break
+    fi
+    echo -e "${R}端口必须是 1-65535 的数字${N}"
+  done
+
+  # SNI
+  while true; do
+    read -p "  SNI 域名 (${cur_sni:-当前未知}): " new_sni
+    new_sni="${new_sni:-$cur_sni}"
+    new_sni=$(sanitize_sni "$new_sni")
+    if [ -n "$new_sni" ]; then
+      break
+    fi
+    echo -e "${R}SNI 不能为空${N}"
+  done
+
+  # UUID
+  read -p "  UUID (回车保留当前 / 输入 new 随机生成新 UUID): " new_uuid
+  case "$new_uuid" in
+    new|NEW)
+      new_uuid=$(cat /proc/sys/kernel/random/uuid)
+      echo -e "  ${D}新 UUID：$new_uuid${N}"
+      ;;
+    "")
+      new_uuid="$cur_uuid"
+      ;;
+  esac
+
+  if [ -z "$new_uuid" ]; then
+    echo -e "${R}UUID 无效${N}"
+    pause_screen
+    return 1
+  fi
+
+  # 是否同时重新生成密钥对
+  read -p "  同时重新生成 Reality 密钥对？(y/N): " regen_keypair
+  if [ "$regen_keypair" = "y" ] || [ "$regen_keypair" = "Y" ]; then
+    echo -e "${Y}==> 生成新密钥对...${N}"
+    if ! keypair=$(sing-box generate reality-keypair); then
+      echo -e "${R}密钥对生成失败${N}"
+      pause_screen
+      return 1
+    fi
+    new_pri=$(echo "$keypair" | grep PrivateKey | awk '{print $2}')
+    new_pub=$(echo "$keypair" | grep PublicKey | awk '{print $2}')
+    if [ -z "$new_pri" ] || [ -z "$new_pub" ]; then
+      echo -e "${R}密钥对解析失败${N}"
+      pause_screen
+      return 1
+    fi
+    echo -e "  ${D}新 PublicKey：$new_pub${N}"
   fi
 
   echo ""
-  echo -e "  新 PublicKey : ${G}$new_pub${N}"
-  echo -e "  ${Y}记得更新客户端的 pbk 参数${N}"
+  echo -e "  将写入：端口 ${C}$new_port${N}  SNI ${C}$new_sni${N}  UUID ${C}$new_uuid${N}"
+  if [ -n "$new_pub" ]; then
+    echo -e "  PublicKey  : ${C}$new_pub${N}  ${Y}(记得更新客户端 pbk 参数)${N}"
+  fi
+  read -p "  确认修改？(y/N): " confirm
+  if [ "$confirm" != "y" ] && [ "$confirm" != "Y" ]; then
+    echo -e "  已取消"
+    sleep 1
+    return 0
+  fi
+
+  # 备份
+  backup_path="${CONFIG_PATH}.bak.$(date +%Y%m%d%H%M%S)"
+  if ! cp "$CONFIG_PATH" "$backup_path"; then
+    echo -e "${R}配置备份失败${N}"
+    pause_screen
+    return 1
+  fi
+
+  # 写入字段
+  if ! sed -i \
+    -e "s|\"listen_port\":.*|\"listen_port\": $new_port,|" \
+    -e "s|\"server_name\":.*|\"server_name\": \"$new_sni\",|g" \
+    -e "s|\"server\":.*\"server_port\"|\"server\": \"$new_sni\", \"server_port\"|" \
+    -e "s|\"uuid\":.*|\"uuid\": \"$new_uuid\",|" \
+    "$CONFIG_PATH"; then
+    cp "$backup_path" "$CONFIG_PATH" 2>/dev/null || true
+    echo -e "${R}配置写入失败，已恢复备份${N}"
+    pause_screen
+    return 1
+  fi
+
+  if [ -n "$new_pri" ]; then
+    if ! sed -i "s|\"private_key\":.*|\"private_key\": \"$new_pri\",|" "$CONFIG_PATH"; then
+      cp "$backup_path" "$CONFIG_PATH" 2>/dev/null || true
+      echo -e "${R}密钥写入失败，已恢复备份${N}"
+      pause_screen
+      return 1
+    fi
+  fi
+
+  # 校验
+  if ! sing-box check -c "$CONFIG_PATH"; then
+    cp "$backup_path" "$CONFIG_PATH" 2>/dev/null || true
+    echo ""
+    echo -e "${R}配置校验失败，已恢复备份${N}"
+    pause_screen
+    return 1
+  fi
+
+  # 重启
+  if ! systemctl restart sing-box; then
+    cp "$backup_path" "$CONFIG_PATH" 2>/dev/null || true
+    echo ""
+    echo -e "${R}服务重启失败，已恢复备份${N}"
+    pause_screen
+    return 1
+  fi
+
+  # 同步 info 文件
+  load_proxy_context
+  local final_pub="${new_pub:-$MENU_PUBLIC_KEY}"
+  local new_link
+  new_link=$(build_client_link "$new_uuid" "$MENU_IP" "$new_port" "$new_sni" "$final_pub" "$MENU_SHORT_ID" "${MENU_TAG:-reality}" 2>/dev/null || true)
+  set_info_value "Port" "$new_port"
+  set_info_value "SNI"  "$new_sni"
+  set_info_value "UUID" "$new_uuid"
+  if [ -n "$new_pub" ]; then
+    set_info_value "PublicKey"  "$new_pub"
+    set_info_value "PrivateKey" "$new_pri"
+  fi
+  [ -n "$new_link" ] && set_info_value "Link" "$new_link"
+
+  echo ""
+  echo -e "${G}节点参数已更新并重启服务${N}"
+  echo -e "  备份文件：${D}$backup_path${N}"
+  if [ -n "$new_link" ]; then
+    echo ""
+    echo -e "  ${B}新客户端链接：${N}"
+    echo -e "  ${G}$new_link${N}"
+    print_qrcode "$new_link"
+  fi
+  pause_screen
+}
+
+print_qrcode(){
+  local link="$1"
+
+  if [ -z "$link" ]; then
+    return 1
+  fi
+
+  if ! command -v qrencode >/dev/null 2>&1; then
+    echo -e "${Y}==> 未检测到 qrencode，正在安装...${N}"
+    if ! apt-get install -y qrencode 2>/dev/null; then
+      echo -e "${R}qrencode 安装失败，请手动执行：apt install qrencode${N}"
+      return 1
+    fi
+  fi
+
+  echo ""
+  echo -e "  ${B}扫码导入：${N}"
+  echo ""
+  qrencode -t ANSIUTF8 "$link"
+}
+
+show_qrcode(){
+  local link=""
+
+  if ! require_singbox_installed; then return 1; fi
+
+  load_proxy_context
+  link=$(build_client_link "$MENU_UUID" "$MENU_IP" "$MENU_PORT" "$MENU_SNI" "$MENU_PUBLIC_KEY" "$MENU_SHORT_ID" "${MENU_TAG:-reality}" 2>/dev/null || true)
+
+  if [ -z "$link" ]; then
+    echo ""
+    echo -e "${R}节点信息不完整，无法生成二维码${N}"
+    pause_screen
+    return 1
+  fi
+
+  echo ""
+  echo -e "  ${B}客户端链接：${N}"
+  echo -e "  ${G}$link${N}"
+  print_qrcode "$link"
   pause_screen
 }
 
@@ -1811,6 +1941,7 @@ EOF
   echo ""
   echo -e "  ${B}客户端链接：${N}"
   echo -e "  ${G}${link:-未生成}${N}"
+  print_qrcode "${link:-}"
   echo ""
   echo -e "  信息已保存至 ${Y}$INFO_PATH${N}"
   echo -e "  输入 ${B}${COMMAND_NAME}${N} 进入管理菜单"
