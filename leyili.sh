@@ -1223,27 +1223,35 @@ modify_node_params(){
     return 1
   fi
 
-  # 写入字段
-  if ! sed -i \
-    -e "s|\"listen_port\":.*|\"listen_port\": $new_port,|" \
-    -e "s|\"server_name\":.*|\"server_name\": \"$new_sni\",|g" \
-    -e "s|\"server\":.*\"server_port\"|\"server\": \"$new_sni\", \"server_port\"|" \
-    -e "s|\"uuid\":.*|\"uuid\": \"$new_uuid\",|" \
-    "$CONFIG_PATH"; then
+  # 用 jq 安全修改 JSON
+  if ! command -v jq >/dev/null 2>&1; then
+    echo -e "${Y}==> 安装 jq...${N}"
+    if ! apt-get install -y jq 2>/dev/null; then
+      echo -e "${R}jq 安装失败，请手动执行：apt install jq${N}"
+      pause_screen
+      return 1
+    fi
+  fi
+
+  local jq_filter='.inbounds[0].listen_port = ($port | tonumber)
+    | .inbounds[0].users[0].uuid = $uuid
+    | .inbounds[0].tls.server_name = $sni
+    | .inbounds[0].tls.reality.handshake.server = $sni'
+
+  if [ -n "$new_pri" ]; then
+    jq_filter="$jq_filter | .inbounds[0].tls.reality.private_key = \"$new_pri\""
+  fi
+
+  local tmp_file
+  tmp_file=$(mktemp)
+  if ! jq --arg port "$new_port" --arg sni "$new_sni" --arg uuid "$new_uuid"        "$jq_filter" "$CONFIG_PATH" > "$tmp_file"; then
+    rm -f "$tmp_file"
     cp "$backup_path" "$CONFIG_PATH" 2>/dev/null || true
     echo -e "${R}配置写入失败，已恢复备份${N}"
     pause_screen
     return 1
   fi
-
-  if [ -n "$new_pri" ]; then
-    if ! sed -i "s|\"private_key\":.*|\"private_key\": \"$new_pri\",|" "$CONFIG_PATH"; then
-      cp "$backup_path" "$CONFIG_PATH" 2>/dev/null || true
-      echo -e "${R}密钥写入失败，已恢复备份${N}"
-      pause_screen
-      return 1
-    fi
-  fi
+  mv "$tmp_file" "$CONFIG_PATH"
 
   # 校验
   if ! sing-box check -c "$CONFIG_PATH"; then
