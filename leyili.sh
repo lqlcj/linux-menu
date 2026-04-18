@@ -1122,7 +1122,7 @@ modify_node_params(){
   local new_sni=""
   local new_uuid=""
   local regen_keypair="n"
-  local new_pri="" new_pub="" keypair=""
+  local new_pri="" new_pub="" keypair="" new_short_id=""
   local cur_port cur_sni cur_uuid
   local backup_path=""
 
@@ -1184,8 +1184,8 @@ modify_node_params(){
     return 1
   fi
 
-  # 是否同时重新生成密钥对
-  read -p "  同时重新生成 Reality 密钥对？(y/N): " regen_keypair
+  # 是否同时重新生成密钥对和 ShortID
+  read -p "  同时重新生成 Reality 密钥对 + ShortID？(y/N): " regen_keypair
   if [ "$regen_keypair" = "y" ] || [ "$regen_keypair" = "Y" ]; then
     echo -e "${Y}==> 生成新密钥对...${N}"
     if ! keypair=$(sing-box generate reality-keypair); then
@@ -1200,13 +1200,16 @@ modify_node_params(){
       pause_screen
       return 1
     fi
+    new_short_id=$(openssl rand -hex 4)
     echo -e "  ${D}新 PublicKey：$new_pub${N}"
+    echo -e "  ${D}新 ShortID  ：$new_short_id${N}"
   fi
 
   echo ""
   echo -e "  将写入：端口 ${C}$new_port${N}  SNI ${C}$new_sni${N}  UUID ${C}$new_uuid${N}"
   if [ -n "$new_pub" ]; then
-    echo -e "  PublicKey  : ${C}$new_pub${N}  ${Y}(记得更新客户端 pbk 参数)${N}"
+    echo -e "  PublicKey  : ${C}$new_pub${N}  ${Y}(记得更新客户端 pbk / sid 参数)${N}"
+    echo -e "  ShortID    : ${C}$new_short_id${N}"
   fi
   read -p "  确认修改？(y/N): " confirm
   if [ "$confirm" != "y" ] && [ "$confirm" != "Y" ]; then
@@ -1239,12 +1242,17 @@ modify_node_params(){
     | .inbounds[0].tls.reality.handshake.server = $sni'
 
   if [ -n "$new_pri" ]; then
-    jq_filter="$jq_filter | .inbounds[0].tls.reality.private_key = \"$new_pri\""
+    jq_filter="$jq_filter | .inbounds[0].tls.reality.private_key = \$pri"
+  fi
+  if [ -n "$new_short_id" ]; then
+    jq_filter="$jq_filter | .inbounds[0].tls.reality.short_id = [\$sid]"
   fi
 
   local tmp_file
   tmp_file=$(mktemp)
-  if ! jq --arg port "$new_port" --arg sni "$new_sni" --arg uuid "$new_uuid"        "$jq_filter" "$CONFIG_PATH" > "$tmp_file"; then
+  if ! jq --arg port "$new_port" --arg sni "$new_sni" --arg uuid "$new_uuid" \
+       --arg pri "${new_pri:-}" --arg sid "${new_short_id:-}" \
+       "$jq_filter" "$CONFIG_PATH" > "$tmp_file"; then
     rm -f "$tmp_file"
     cp "$backup_path" "$CONFIG_PATH" 2>/dev/null || true
     echo -e "${R}配置写入失败，已恢复备份${N}"
@@ -1282,6 +1290,7 @@ modify_node_params(){
   if [ -n "$new_pub" ]; then
     set_info_value "PublicKey"  "$new_pub"
     set_info_value "PrivateKey" "$new_pri"
+    set_info_value "ShortID"    "$new_short_id"
   fi
   [ -n "$new_link" ] && set_info_value "Link" "$new_link"
 
