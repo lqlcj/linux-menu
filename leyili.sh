@@ -61,27 +61,22 @@ pause_screen(){
 }
 
 render_divider(){
-  echo -e "  ${D}────────────────────────────────────────${N}"
+  echo -e "  ${D}──────────────────────────────────────────────────────${N}"
 }
 
 render_brand_banner(){
   echo ""
-  echo -e "  ${L}┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓${N}"
-  echo -e "  ${L}┃${N} ${B}${W}${APP_NAME} Linux Menu${N}"
-  echo -e "  ${L}┃${N} ${D}Sing-box · System · Admin · External Toolkit${N}"
-  echo -e "  ${L}┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛${N}"
+  echo -e "  ${L}╔══════════════════════════════════════════════════════╗${N}"
+  echo -e "  ${L}║${N}  ${B}${W}${APP_NAME}${N}  ${D}Linux Menu${N}"
+  echo -e "  ${L}╚══════════════════════════════════════════════════════╝${N}"
 }
 
 render_section_header(){
   local title="$1"
-  local subtitle="$2"
 
   clear
   render_brand_banner
-  echo -e "  ${B}${C}${title}${N}"
-  if [ -n "$subtitle" ]; then
-    echo -e "  ${D}${subtitle}${N}"
-  fi
+  echo -e "  ${B}${C}›  ${title}${N}"
   render_divider
 }
 
@@ -89,7 +84,7 @@ render_menu_item(){
   local key="$1"
   local label="$2"
 
-  echo -e "  ${Y}${B}${key})${N} ${label}"
+  echo -e "  ${D}│${N}  ${Y}${B}${key}${N}  ${label}"
 }
 
 render_info_line(){
@@ -557,9 +552,10 @@ build_client_link(){
 
   case "$ip" in
     *:*)
-      if [[ "$ip" != \[*\] ]]; then
-        host="[$ip]"
-      fi
+      case "$ip" in
+        \[*\]) ;;
+        *) host="[$ip]" ;;
+      esac
       ;;
   esac
 
@@ -573,7 +569,7 @@ show_status_menu(){
   fi
 
   while true; do
-    render_section_header "查看状态" "运行状态 · 实时日志 · 服务控制 · 节点信息"
+    render_section_header "查看状态"
     render_menu_item 1 "查看运行状态"
     render_menu_item 2 "实时日志"
     render_menu_item 3 "重启服务"
@@ -583,7 +579,7 @@ show_status_menu(){
     render_menu_item 7 "重新生成密钥对"
     render_menu_item 0 "返回上级"
     render_divider
-    read -p "  请选择: " choice
+    read -p "  请输入序号: " choice
 
     case $choice in
       1)
@@ -633,7 +629,7 @@ show_status_menu(){
 
 show_system_menu(){
   while true; do
-    render_section_header "系统基础设置" "系统更新 · 时间同步 · 基础工具 · 网络优化"
+    render_section_header "系统基础设置"
     render_menu_item 1 "更新系统"
     render_menu_item 2 "启用自动更新"
     render_menu_item 3 "校正系统时间"
@@ -644,7 +640,7 @@ show_system_menu(){
     render_menu_item 8 "添加 SWAP (2G)"
     render_menu_item 0 "返回上级"
     render_divider
-    read -p "  请选择: " choice
+    read -p "  请输入序号: " choice
 
     case $choice in
       1)
@@ -680,7 +676,7 @@ show_system_menu(){
 
 show_admin_menu(){
   while true; do
-    render_section_header "管理员设置" "用户管理 · SSH 加固 · sudo 权限"
+    render_section_header "管理员设置"
     render_menu_item 1 "创建普通用户"
     render_menu_item 2 "加入 sudo 组"
     render_menu_item 3 "测试用户登录"
@@ -689,7 +685,7 @@ show_admin_menu(){
     render_menu_item 6 "配置 sudo 免密"
     render_menu_item 0 "返回上级"
     render_divider
-    read -p "  请选择: " choice
+    read -p "  请输入序号: " choice
 
     case $choice in
       1)
@@ -719,12 +715,12 @@ show_admin_menu(){
 
 show_external_services_menu(){
   while true; do
-    render_section_header "外部服务" "面板安装 · 节点评测"
+    render_section_header "外部服务"
     render_menu_item 1 "安装 1Panel"
     render_menu_item 2 "NodeQuality 测评"
     render_menu_item 0 "返回上级"
     render_divider
-    read -p "  请选择: " choice
+    read -p "  请输入序号: " choice
 
     case $choice in
       1)
@@ -1445,7 +1441,11 @@ configure_swap(){
       echo -e "${Y}==> 创建 ${SWAP_SIZE} SWAP 文件...${N}"
       if ! fallocate -l "$SWAP_SIZE" "$SWAPFILE_PATH"; then
         echo -e "${Y}==> fallocate 失败，改用 dd 创建...${N}"
-        dd if=/dev/zero of="$SWAPFILE_PATH" bs=1M count="$SWAP_SIZE_MB" status=progress
+        dd if=/dev/zero of="$SWAPFILE_PATH" bs=1M count="$SWAP_SIZE_MB" status=progress || {
+          echo -e "${R}SWAP 文件创建失败${N}"
+          pause_screen
+          return 1
+        }
       fi
     fi
 
@@ -1556,7 +1556,7 @@ do_install(){
   local install_mode="ipv4"
   local mode_label=""
 
-  render_section_header "Leyili Sing-box 安装向导" "Reality · VLESS · 自动部署"
+  render_section_header "Leyili Sing-box 安装向导"
   echo -e "  ${Y}直接回车使用括号内默认值${N}"
   echo ""
 
@@ -1632,7 +1632,7 @@ do_install(){
 
   echo -e "${Y}==> 生成参数...${N}"
   UUID=$(cat /proc/sys/kernel/random/uuid)
-  SHORT_ID=$(cat /dev/urandom | tr -dc 'a-f0-9' | head -c 8)
+  SHORT_ID=$(openssl rand -hex 4)
   if ! keypair=$(sing-box generate reality-keypair); then
     echo ""
     echo -e "${R}密钥对生成失败${N}"
@@ -1796,9 +1796,9 @@ EOF
   register_sb_command || true
 
   echo ""
-  echo -e "  ${G}┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓${N}"
-  echo -e "  ${G}┃${N} ${B}${W}${APP_NAME} · Sing-box 安装完成${N}"
-  echo -e "  ${G}┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛${N}"
+  echo -e "  ${G}╔══════════════════════════════════════════════════════╗${N}"
+  echo -e "  ${G}║${N}  ${B}${W}${APP_NAME}${N}  ${G}Sing-box 安装完成${N}"
+  echo -e "  ${G}╚══════════════════════════════════════════════════════╝${N}"
   echo -e "  模式      : ${C}$mode_label${N}"
   echo -e "  UUID      : ${C}$UUID${N}"
   echo -e "  PublicKey : ${C}$public_key${N}"
@@ -1845,14 +1845,13 @@ show_menu(){
       mode_label="未安装"
     fi
 
-    render_section_header "管理菜单" "Leyili 出品 · Linux / Sing-box / Admin Control Center"
-    echo -e "  ${L}●${N} 版本      : ${C}$ver${N}"
-    echo -e "  ${L}●${N} 状态      : $status_str"
-    echo -e "  ${L}●${N} 模式      : ${C}$mode_label${N}"
-    echo -e "  ${L}●${N} 端口      : ${C}${MENU_PORT:-未知}${N}"
-    echo -e "  ${L}●${N} 域名      : ${C}${MENU_SNI:-未知}${N}"
-    echo -e "  ${L}●${N} 服务器 IP : ${C}${MENU_IP:-未知}${N}"
-    echo -e "  ${L}●${N} 配置文件  : ${C}$CONFIG_PATH${N}"
+    render_section_header "管理菜单"
+    echo -e "  ${L}│${N}  版本      ${D}·${N}  ${C}$ver${N}"
+    echo -e "  ${L}│${N}  状态      ${D}·${N}  $status_str"
+    echo -e "  ${L}│${N}  模式      ${D}·${N}  ${C}$mode_label${N}"
+    echo -e "  ${L}│${N}  端口      ${D}·${N}  ${C}${MENU_PORT:-未知}${N}"
+    echo -e "  ${L}│${N}  域名      ${D}·${N}  ${C}${MENU_SNI:-未知}${N}"
+    echo -e "  ${L}│${N}  IP        ${D}·${N}  ${C}${MENU_IP:-未知}${N}"
     render_divider
     render_menu_item 1 "管理员设置"
     render_menu_item 2 "系统基础设置"
@@ -1862,7 +1861,7 @@ show_menu(){
     render_menu_item 6 "卸载 sing-box"
     render_menu_item 0 "退出"
     render_divider
-    read -p "  请选择: " choice
+    read -p "  请输入序号: " choice
 
     case $choice in
       1)
