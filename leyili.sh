@@ -29,6 +29,127 @@ SSH_RANDOM_PORT_MAX="65535"
 G="\033[32m" Y="\033[33m" C="\033[36m" R="\033[31m" B="\033[1m" N="\033[0m"
 L="\033[94m" W="\033[97m" D="\033[2m"
 
+# ─── 通用辅助 ────────────────────────────────────────
+detect_distro(){
+  if [ ! -r /etc/os-release ]; then
+    printf '%s' "unknown"
+    return
+  fi
+  # shellcheck disable=SC1091
+  . /etc/os-release
+  printf '%s' "${ID:-unknown}"
+}
+
+is_debian_family(){
+  local id id_like
+  if [ ! -r /etc/os-release ]; then
+    return 1
+  fi
+  # shellcheck disable=SC1091
+  . /etc/os-release
+  id="${ID:-}"
+  id_like="${ID_LIKE:-}"
+  case "$id" in
+    debian|ubuntu|raspbian|linuxmint|devuan|kali|pop|elementary|zorin)
+      return 0
+      ;;
+  esac
+  case "$id_like" in
+    *debian*|*ubuntu*)
+      return 0
+      ;;
+  esac
+  return 1
+}
+
+require_debian_family(){
+  if is_debian_family; then
+    return 0
+  fi
+
+  echo ""
+  echo -e "  ${R}此脚本仅支持 Debian / Ubuntu 系发行版${N}"
+  echo -e "  当前系统: ${C}$(detect_distro)${N}"
+  echo -e "  如需强制运行可设置环境变量 ${B}LEYILI_ALLOW_ANY_DISTRO=1${N}"
+  return 1
+}
+
+cleanup_old_backups(){
+  local pattern="$1"
+  local keep="${2:-5}"
+  local victim
+
+  if [ -z "$pattern" ]; then
+    return 0
+  fi
+
+  # shellcheck disable=SC2086
+  ls -1t $pattern 2>/dev/null | tail -n +$((keep + 1)) | while IFS= read -r victim; do
+    [ -n "$victim" ] && rm -f "$victim"
+  done
+}
+
+check_port_in_use(){
+  local port="$1"
+
+  if [ -z "$port" ]; then
+    return 1
+  fi
+
+  if command -v ss >/dev/null 2>&1; then
+    ss -tlnH 2>/dev/null | awk -v p=":${port}$" '$4 ~ p {found=1} END {exit !found}'
+    return $?
+  fi
+
+  if command -v netstat >/dev/null 2>&1; then
+    netstat -tln 2>/dev/null | awk -v p=":${port}$" '$4 ~ p {found=1} END {exit !found}'
+    return $?
+  fi
+
+  return 1
+}
+
+detect_firewall_backend(){
+  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -qi "^Status: active"; then
+    printf '%s' "ufw"
+    return
+  fi
+
+  if command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active firewalld >/dev/null 2>&1; then
+    printf '%s' "firewalld"
+    return
+  fi
+
+  printf '%s' "none"
+}
+
+allow_tcp_port_in_firewall(){
+  local port="$1"
+  local backend
+  backend=$(detect_firewall_backend)
+
+  case "$backend" in
+    ufw)
+      if ufw allow "${port}/tcp" >/dev/null 2>&1; then
+        echo -e "  防火墙  : ${C}ufw 已放行 ${port}/tcp${N}"
+      else
+        echo -e "  防火墙  : ${Y}ufw 放行失败，请手动执行 ufw allow ${port}/tcp${N}"
+      fi
+      ;;
+    firewalld)
+      if firewall-cmd --permanent --add-port="${port}/tcp" >/dev/null 2>&1 \
+         && firewall-cmd --reload >/dev/null 2>&1; then
+        echo -e "  防火墙  : ${C}firewalld 已放行 ${port}/tcp${N}"
+      else
+        echo -e "  防火墙  : ${Y}firewalld 放行失败，请手动执行 firewall-cmd --permanent --add-port=${port}/tcp${N}"
+      fi
+      ;;
+    *)
+      echo -e "  防火墙  : ${D}未启用 ufw/firewalld（如有外部安全组请自行放行 ${port}/tcp）${N}"
+      ;;
+  esac
+}
+
 register_sb_command(){
   local source_path=""
 
@@ -60,6 +181,12 @@ pause_screen(){
   read -p "按回车返回..." _
 }
 
+notify_invalid_choice(){
+  echo ""
+  echo -e "  ${Y}无效选项，请重新输入${N}"
+  sleep 1
+}
+
 render_divider(){
   echo -e "  ${D}──────────────────────────────────────────────────────${N}"
 }
@@ -67,7 +194,7 @@ render_divider(){
 render_brand_banner(){
   echo ""
   echo -e "  ${L}╔══════════════════════════════════════════════════════╗${N}"
-  echo -e "  ${L}║${N}  ${B}${W}${APP_NAME}${N}  ${D}Linux Menu${N}"
+  echo -e "  ${L}║${N}  ${B}${W}${APP_NAME}${N}  ${D}Linux Menu${N}                                  ${L}║${N}"
   echo -e "  ${L}╚══════════════════════════════════════════════════════╝${N}"
 }
 
@@ -578,6 +705,9 @@ show_status_menu(){
     render_menu_item 6 "查看客户端链接"
     render_menu_item 7 "节点二维码"
     render_menu_item 8 "修改节点参数"
+    render_menu_item 9 "查看配置"
+    render_menu_item 10 "编辑配置"
+    render_menu_item 11 "清理配置备份"
     render_menu_item 0 "返回上级"
     render_divider
     read -p "  请输入序号: " choice
@@ -624,8 +754,20 @@ show_status_menu(){
       8)
         modify_node_params
         ;;
+      9)
+        view_singbox_config
+        ;;
+      10)
+        edit_singbox_config
+        ;;
+      11)
+        cleanup_config_backups
+        ;;
       0)
         return
+        ;;
+      *)
+        notify_invalid_choice
         ;;
     esac
   done
@@ -642,6 +784,10 @@ show_system_menu(){
     render_menu_item 6 "initcwnd 优化"
     render_menu_item 7 "查看网络优化状态"
     render_menu_item 8 "添加 SWAP (2G)"
+    render_menu_item 9 "禁用自动更新"
+    render_menu_item 10 "移除 TCP 调优"
+    render_menu_item 11 "移除 initcwnd 优化"
+    render_menu_item 12 "移除 SWAP"
     render_menu_item 0 "返回上级"
     render_divider
     read -p "  请输入序号: " choice
@@ -671,8 +817,23 @@ show_system_menu(){
       8)
         configure_swap
         ;;
+      9)
+        disable_auto_updates
+        ;;
+      10)
+        remove_tcp_tuning
+        ;;
+      11)
+        remove_initcwnd_optimization
+        ;;
+      12)
+        remove_swap
+        ;;
       0)
         return
+        ;;
+      *)
+        notify_invalid_choice
         ;;
     esac
   done
@@ -687,6 +848,8 @@ show_admin_menu(){
     render_menu_item 4 "修改 SSH 端口"
     render_menu_item 5 "禁止 root 登录"
     render_menu_item 6 "配置 sudo 免密"
+    render_menu_item 7 "恢复 root SSH 登录"
+    render_menu_item 8 "移除 sudo 免密"
     render_menu_item 0 "返回上级"
     render_divider
     read -p "  请输入序号: " choice
@@ -710,8 +873,17 @@ show_admin_menu(){
       6)
         configure_passwordless_sudo
         ;;
+      7)
+        enable_root_ssh_login
+        ;;
+      8)
+        remove_passwordless_sudo
+        ;;
       0)
         return
+        ;;
+      *)
+        notify_invalid_choice
         ;;
     esac
   done
@@ -735,6 +907,9 @@ show_external_services_menu(){
         ;;
       0)
         return
+        ;;
+      *)
+        notify_invalid_choice
         ;;
     esac
   done
@@ -873,13 +1048,23 @@ configure_ssh_port(){
   while true; do
     read -p "  新 SSH 端口 (${suggested_ssh_port}): " ssh_port
     ssh_port="${ssh_port:-$suggested_ssh_port}"
-    if validate_port "$ssh_port"; then
-      break
+    if ! validate_port "$ssh_port"; then
+      echo -e "${R}端口必须是 1-65535 的数字${N}"
+      continue
     fi
-    echo -e "${R}端口必须是 1-65535 的数字${N}"
+    if [ "$ssh_port" = "$current_ssh_port" ]; then
+      echo -e "${Y}新端口与当前 SSH 端口相同，无需修改${N}"
+      sleep 1
+      return 0
+    fi
+    if check_port_in_use "$ssh_port"; then
+      echo -e "${R}端口 ${ssh_port} 已被占用，请换一个${N}"
+      continue
+    fi
+    break
   done
 
-  echo -e "${Y}警告：${N} 修改后请确认安全组和防火墙已放行新端口。"
+  echo -e "${Y}警告：${N} 修改后请确认安全组（云平台）已放行新端口。"
   read -p "  确认将 SSH 端口修改为 ${ssh_port} 并重启 SSH 服务？(y/N): " confirm
   if [ "$confirm" != "y" ] && [ "$confirm" != "Y" ]; then
     echo -e "  已取消"
@@ -887,7 +1072,10 @@ configure_ssh_port(){
     return 0
   fi
 
+  allow_tcp_port_in_firewall "$ssh_port"
+
   if apply_sshd_setting "Port" "$ssh_port" "SSH 端口已更新并重启服务"; then
+    cleanup_old_backups "${SSHD_CONFIG_PATH}.bak.*" 5
     load_proxy_context
     server_ip="${MENU_IP:-你的IP}"
     echo -e "  新登录方式: ${C}ssh 用户名@${server_ip} -p ${ssh_port}${N}"
@@ -913,7 +1101,32 @@ disable_root_ssh_login(){
   fi
 
   if apply_sshd_setting "PermitRootLogin" "no" "root SSH 登录已禁用"; then
+    cleanup_old_backups "${SSHD_CONFIG_PATH}.bak.*" 5
     echo -e "  当前设置: ${C}PermitRootLogin no${N}"
+    echo -e "  配置文件: ${C}$SSHD_CONFIG_PATH${N}"
+    pause_screen
+  fi
+}
+
+enable_root_ssh_login(){
+  local confirm=""
+
+  if ! require_root; then
+    return 1
+  fi
+
+  echo ""
+  echo -e "${Y}警告：${N} 恢复 root 登录后建议继续使用密钥登录，避免暴力破解。"
+  read -p "  确认恢复 root 通过 SSH 登录？(y/N): " confirm
+  if [ "$confirm" != "y" ] && [ "$confirm" != "Y" ]; then
+    echo -e "  已取消"
+    sleep 1
+    return 0
+  fi
+
+  if apply_sshd_setting "PermitRootLogin" "yes" "root SSH 登录已恢复"; then
+    cleanup_old_backups "${SSHD_CONFIG_PATH}.bak.*" 5
+    echo -e "  当前设置: ${C}PermitRootLogin yes${N}"
     echo -e "  配置文件: ${C}$SSHD_CONFIG_PATH${N}"
     pause_screen
   fi
@@ -991,6 +1204,44 @@ configure_passwordless_sudo(){
   pause_screen
 }
 
+remove_passwordless_sudo(){
+  local username=""
+  local dropin_path=""
+
+  if ! require_root; then
+    return 1
+  fi
+
+  echo ""
+  username=$(prompt_for_linux_username "  请输入要移除 sudo 免密的用户名: ")
+  if [ -z "$username" ]; then
+    echo -e "${R}用户名读取失败${N}"
+    pause_screen
+    return 1
+  fi
+
+  dropin_path="${SUDOERS_DROPIN_DIR}/${username}-nopasswd"
+  if [ ! -f "$dropin_path" ]; then
+    echo -e "${Y}未找到 ${C}$dropin_path${N}${Y}，无需移除${N}"
+    pause_screen
+    return 0
+  fi
+
+  if ! rm -f "$dropin_path"; then
+    echo -e "${R}移除失败${N}"
+    pause_screen
+    return 1
+  fi
+
+  if command -v visudo >/dev/null 2>&1 && ! visudo -cf /etc/sudoers >/dev/null 2>&1; then
+    echo -e "${Y}移除后 /etc/sudoers 校验有告警，请人工检查${N}"
+  fi
+
+  echo ""
+  echo -e "${G}已移除 ${C}$username${N}${G} 的 sudo 免密规则${N}"
+  pause_screen
+}
+
 update_system_packages(){
   echo ""
   echo -e "${Y}==> 更新软件源...${N}"
@@ -1038,6 +1289,45 @@ enable_auto_updates(){
 
   echo ""
   echo -e "${G}自动更新配置完成${N}"
+  pause_screen
+}
+
+disable_auto_updates(){
+  local confirm=""
+
+  if ! require_root; then
+    return 1
+  fi
+
+  if ! dpkg -s unattended-upgrades >/dev/null 2>&1; then
+    echo ""
+    echo -e "${Y}unattended-upgrades 未安装，无需禁用${N}"
+    pause_screen
+    return 0
+  fi
+
+  echo ""
+  read -p "  是否同时卸载 unattended-upgrades 软件包？(y/N): " confirm
+
+  echo -e "${Y}==> 关闭自动更新...${N}"
+  systemctl disable --now unattended-upgrades.service >/dev/null 2>&1 || true
+  systemctl disable --now apt-daily.timer apt-daily-upgrade.timer >/dev/null 2>&1 || true
+  cat > /etc/apt/apt.conf.d/20auto-upgrades << 'EOF'
+APT::Periodic::Update-Package-Lists "0";
+APT::Periodic::Unattended-Upgrade "0";
+EOF
+
+  if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
+    echo -e "${Y}==> 卸载 unattended-upgrades...${N}"
+    if ! apt-get remove --purge -y unattended-upgrades; then
+      echo -e "${R}卸载失败，请检查上方输出${N}"
+      pause_screen
+      return 1
+    fi
+  fi
+
+  echo ""
+  echo -e "${G}自动更新已禁用${N}"
   pause_screen
 }
 
@@ -1282,8 +1572,9 @@ modify_node_params(){
   # 同步 info 文件
   load_proxy_context
   local final_pub="${new_pub:-$MENU_PUBLIC_KEY}"
+  local final_short_id="${new_short_id:-$MENU_SHORT_ID}"
   local new_link
-  new_link=$(build_client_link "$new_uuid" "$MENU_IP" "$new_port" "$new_sni" "$final_pub" "$MENU_SHORT_ID" "${MENU_TAG:-reality}" 2>/dev/null || true)
+  new_link=$(build_client_link "$new_uuid" "$MENU_IP" "$new_port" "$new_sni" "$final_pub" "$final_short_id" "${MENU_TAG:-reality}" 2>/dev/null || true)
   set_info_value "Port" "$new_port"
   set_info_value "SNI"  "$new_sni"
   set_info_value "UUID" "$new_uuid"
@@ -1293,6 +1584,7 @@ modify_node_params(){
     set_info_value "ShortID"    "$new_short_id"
   fi
   [ -n "$new_link" ] && set_info_value "Link" "$new_link"
+  cleanup_old_backups "${CONFIG_PATH}.bak.*" 5
 
   echo ""
   echo -e "${G}节点参数已更新并重启服务${N}"
@@ -1412,6 +1704,40 @@ EOF
   pause_screen
 }
 
+remove_tcp_tuning(){
+  local confirm=""
+
+  if ! require_root; then
+    return 1
+  fi
+
+  if [ ! -f "$TCP_TUNING_PATH" ]; then
+    echo ""
+    echo -e "${Y}未检测到 TCP 优化配置，无需移除${N}"
+    pause_screen
+    return 0
+  fi
+
+  echo ""
+  echo -e "${Y}==> 即将移除 ${C}$TCP_TUNING_PATH${N}${Y}，并恢复默认 qdisc / 拥塞算法${N}"
+  read -p "  确认继续？(y/N): " confirm
+  if [ "$confirm" != "y" ] && [ "$confirm" != "Y" ]; then
+    echo -e "  已取消"
+    sleep 1
+    return 0
+  fi
+
+  rm -f "$TCP_TUNING_PATH"
+
+  sysctl -w net.core.default_qdisc=pfifo_fast >/dev/null 2>&1 || true
+  sysctl -w net.ipv4.tcp_congestion_control=cubic >/dev/null 2>&1 || true
+  sysctl --system >/dev/null 2>&1 || true
+
+  echo ""
+  echo -e "${G}TCP 优化已移除（部分参数重启后完全复位）${N}"
+  pause_screen
+}
+
 apply_initcwnd_optimization(){
   local route_line route_spec ip_bin current_route
 
@@ -1491,6 +1817,59 @@ EOF
     echo -e "  initrwnd: ${C}${INITCWND_VALUE}${N}"
   fi
   echo -e "  持久化服务: ${C}$(basename "$INITCWND_SERVICE_PATH")${N}"
+  pause_screen
+}
+
+remove_initcwnd_optimization(){
+  local confirm=""
+  local service_name
+  local route_line route_spec
+
+  if ! require_root; then
+    return 1
+  fi
+
+  service_name=$(basename "$INITCWND_SERVICE_PATH")
+  if [ ! -f "$INITCWND_SERVICE_PATH" ] && ! systemctl cat "$service_name" >/dev/null 2>&1; then
+    echo ""
+    echo -e "${Y}未检测到 initcwnd 持久化服务，无需移除${N}"
+    pause_screen
+    return 0
+  fi
+
+  echo ""
+  read -p "  确认移除 initcwnd 持久化服务并恢复默认路由？(y/N): " confirm
+  if [ "$confirm" != "y" ] && [ "$confirm" != "Y" ]; then
+    echo -e "  已取消"
+    sleep 1
+    return 0
+  fi
+
+  systemctl disable --now "$service_name" >/dev/null 2>&1 || true
+  rm -f "$INITCWND_SERVICE_PATH"
+  systemctl daemon-reload >/dev/null 2>&1 || true
+
+  if command -v ip >/dev/null 2>&1; then
+    route_line=$(ip route show default 2>/dev/null | head -1)
+    if [ -n "$route_line" ]; then
+      route_spec=$(printf '%s\n' "$route_line" | awk '{
+        sep=""
+        for (i = 1; i <= NF; i++) {
+          if ($i == "initcwnd" || $i == "initrwnd") {
+            i++
+            next
+          }
+          printf "%s%s", sep, $i
+          sep=" "
+        }
+      }')
+      # shellcheck disable=SC2086
+      ip route replace $route_spec >/dev/null 2>&1 || true
+    fi
+  fi
+
+  echo ""
+  echo -e "${G}initcwnd 优化已移除${N}"
   pause_screen
 }
 
@@ -1630,6 +2009,60 @@ EOF
   pause_screen
 }
 
+remove_swap(){
+  local confirm=""
+  local tmp_file=""
+
+  if ! require_root; then
+    return 1
+  fi
+
+  if [ ! -f "$SWAPFILE_PATH" ] && [ ! -f "$SWAP_SYSCTL_PATH" ] \
+     && ! grep -Eq "^[[:space:]]*${SWAPFILE_PATH}[[:space:]]" /etc/fstab 2>/dev/null; then
+    echo ""
+    echo -e "${Y}未检测到脚本创建的 SWAP，无需移除${N}"
+    pause_screen
+    return 0
+  fi
+
+  echo ""
+  echo -e "${Y}==> 即将关闭并删除 ${C}$SWAPFILE_PATH${N}${Y}，并移除 swappiness 配置${N}"
+  read -p "  确认继续？(y/N): " confirm
+  if [ "$confirm" != "y" ] && [ "$confirm" != "Y" ]; then
+    echo -e "  已取消"
+    sleep 1
+    return 0
+  fi
+
+  if swapon --show=NAME --noheadings 2>/dev/null | grep -Fxq "$SWAPFILE_PATH"; then
+    echo -e "${Y}==> 关闭 SWAP...${N}"
+    if ! swapoff "$SWAPFILE_PATH"; then
+      echo -e "${R}关闭 SWAP 失败，可能存在占用${N}"
+      pause_screen
+      return 1
+    fi
+  fi
+
+  if [ -f "$SWAPFILE_PATH" ]; then
+    rm -f "$SWAPFILE_PATH"
+  fi
+
+  if grep -Eq "^[[:space:]]*${SWAPFILE_PATH}[[:space:]]" /etc/fstab 2>/dev/null; then
+    tmp_file=$(mktemp)
+    awk -v p="$SWAPFILE_PATH" '$1 != p {print}' /etc/fstab > "$tmp_file" && mv "$tmp_file" /etc/fstab
+  fi
+
+  if [ -f "$SWAP_SYSCTL_PATH" ]; then
+    rm -f "$SWAP_SYSCTL_PATH"
+    sysctl --system >/dev/null 2>&1 || true
+  fi
+
+  echo ""
+  echo -e "${G}SWAP 已移除${N}"
+  free -h
+  pause_screen
+}
+
 install_1panel(){
   local tmp_script
 
@@ -1685,6 +2118,232 @@ run_nodequality_benchmark(){
   rm -f "$tmp_script"
   echo ""
   echo -e "${G}NodeQuality 测评执行完成${N}"
+  pause_screen
+}
+
+# ─── 脚本自更新 / 配置管理 ────────────────────────────
+get_latest_singbox_version(){
+  local ver=""
+  ver=$(curl -fsSL --max-time 5 "https://api.github.com/repos/SagerNet/sing-box/releases/latest" 2>/dev/null \
+        | sed -n 's/.*"tag_name":[[:space:]]*"v\{0,1\}\([^"]*\)".*/\1/p' | head -1)
+  printf '%s' "$ver"
+}
+
+get_current_singbox_version(){
+  if ! command -v sing-box >/dev/null 2>&1; then
+    printf '%s' ""
+    return
+  fi
+  sing-box version 2>/dev/null | head -1 | awk '{print $3}'
+}
+
+update_self_script(){
+  local tmp_file=""
+  local confirm=""
+
+  if ! require_root; then
+    return 1
+  fi
+
+  if [ -z "$SELF_INSTALL_URL" ]; then
+    echo ""
+    echo -e "${R}未配置 SELF_INSTALL_URL，无法自更新${N}"
+    pause_screen
+    return 1
+  fi
+
+  echo ""
+  echo -e "${Y}==> 下载最新脚本...${N}"
+  tmp_file=$(mktemp)
+  if ! curl -fsSL --max-time 15 "$SELF_INSTALL_URL" -o "$tmp_file"; then
+    rm -f "$tmp_file"
+    echo -e "${R}下载失败，请检查网络或 SELF_INSTALL_URL${N}"
+    pause_screen
+    return 1
+  fi
+
+  if ! bash -n "$tmp_file"; then
+    rm -f "$tmp_file"
+    echo -e "${R}新脚本语法校验失败，已放弃更新${N}"
+    pause_screen
+    return 1
+  fi
+
+  if [ -f "$SCRIPT_PATH" ] && cmp -s "$tmp_file" "$SCRIPT_PATH"; then
+    rm -f "$tmp_file"
+    echo -e "${G}当前已是最新版本${N}"
+    pause_screen
+    return 0
+  fi
+
+  echo -e "  来源: ${C}$SELF_INSTALL_URL${N}"
+  read -p "  确认覆盖 ${SCRIPT_PATH}？(y/N): " confirm
+  if [ "$confirm" != "y" ] && [ "$confirm" != "Y" ]; then
+    rm -f "$tmp_file"
+    echo -e "  已取消"
+    sleep 1
+    return 0
+  fi
+
+  if [ -f "$SCRIPT_PATH" ]; then
+    cp "$SCRIPT_PATH" "${SCRIPT_PATH}.bak.$(date +%Y%m%d%H%M%S)" 2>/dev/null || true
+    cleanup_old_backups "${SCRIPT_PATH}.bak.*" 3
+  fi
+
+  if ! install -m 0755 "$tmp_file" "$SCRIPT_PATH"; then
+    rm -f "$tmp_file"
+    echo -e "${R}写入 $SCRIPT_PATH 失败${N}"
+    pause_screen
+    return 1
+  fi
+  rm -f "$tmp_file"
+
+  echo ""
+  echo -e "${G}脚本已更新，请重新运行 ${B}${COMMAND_NAME}${N}"
+  pause_screen
+  exit 0
+}
+
+view_singbox_config(){
+  if ! require_singbox_installed; then
+    return 1
+  fi
+
+  if [ ! -f "$CONFIG_PATH" ]; then
+    echo ""
+    echo -e "${R}未找到配置文件：$CONFIG_PATH${N}"
+    pause_screen
+    return 1
+  fi
+
+  echo ""
+  echo -e "  ${B}${C}$CONFIG_PATH${N}"
+  render_divider
+  if command -v jq >/dev/null 2>&1; then
+    jq . "$CONFIG_PATH" 2>/dev/null || cat "$CONFIG_PATH"
+  else
+    cat "$CONFIG_PATH"
+  fi
+  pause_screen
+}
+
+edit_singbox_config(){
+  local editor_bin=""
+  local backup_path=""
+
+  if ! require_root; then
+    return 1
+  fi
+  if ! require_singbox_installed; then
+    return 1
+  fi
+  if [ ! -f "$CONFIG_PATH" ]; then
+    echo ""
+    echo -e "${R}未找到配置文件：$CONFIG_PATH${N}"
+    pause_screen
+    return 1
+  fi
+
+  editor_bin="${EDITOR:-}"
+  if [ -z "$editor_bin" ] || ! command -v "$editor_bin" >/dev/null 2>&1; then
+    for candidate in nano vim vi; do
+      if command -v "$candidate" >/dev/null 2>&1; then
+        editor_bin="$candidate"
+        break
+      fi
+    done
+  fi
+
+  if [ -z "$editor_bin" ]; then
+    echo ""
+    echo -e "${R}未找到可用的编辑器（nano/vim/vi），请先安装或设置 EDITOR${N}"
+    pause_screen
+    return 1
+  fi
+
+  backup_path="${CONFIG_PATH}.bak.$(date +%Y%m%d%H%M%S)"
+  if ! cp "$CONFIG_PATH" "$backup_path"; then
+    echo -e "${R}配置备份失败${N}"
+    pause_screen
+    return 1
+  fi
+
+  "$editor_bin" "$CONFIG_PATH"
+
+  if ! sing-box check -c "$CONFIG_PATH"; then
+    echo ""
+    read -p "  配置校验失败，是否回滚到编辑前备份？(Y/n): " rollback
+    if [ "$rollback" != "n" ] && [ "$rollback" != "N" ]; then
+      cp "$backup_path" "$CONFIG_PATH"
+      echo -e "${G}已回滚${N}"
+    else
+      echo -e "${Y}已保留有问题的配置（备份：$backup_path）${N}"
+    fi
+    pause_screen
+    return 1
+  fi
+
+  if ! systemctl restart sing-box; then
+    cp "$backup_path" "$CONFIG_PATH" 2>/dev/null || true
+    systemctl restart sing-box >/dev/null 2>&1 || true
+    echo -e "${R}服务重启失败，已回滚${N}"
+    pause_screen
+    return 1
+  fi
+
+  cleanup_old_backups "${CONFIG_PATH}.bak.*" 5
+
+  echo ""
+  echo -e "${G}配置已更新并重启服务${N}"
+  echo -e "  备份文件: ${C}$backup_path${N}"
+  pause_screen
+}
+
+cleanup_config_backups(){
+  local count=0
+  local confirm=""
+
+  if ! require_root; then
+    return 1
+  fi
+
+  count=$(ls -1 "${CONFIG_PATH}".bak.* 2>/dev/null | wc -l)
+  count=$((count + $(ls -1 "${SSHD_CONFIG_PATH}".bak.* 2>/dev/null | wc -l)))
+  count=$((count + $(ls -1 "${SCRIPT_PATH}".bak.* 2>/dev/null | wc -l)))
+
+  echo ""
+  echo -e "  ${B}当前备份文件${N}"
+  ls -1 "${CONFIG_PATH}".bak.* "${SSHD_CONFIG_PATH}".bak.* "${SCRIPT_PATH}".bak.* 2>/dev/null || true
+  echo ""
+  if [ "$count" -eq 0 ]; then
+    echo -e "${Y}无需清理${N}"
+    pause_screen
+    return 0
+  fi
+
+  read -p "  保留最近几份备份？(默认 3): " keep
+  keep="${keep:-3}"
+  case "$keep" in
+    ''|*[!0-9]*)
+      echo -e "${R}必须为非负整数${N}"
+      pause_screen
+      return 1
+      ;;
+  esac
+
+  read -p "  确认按此规则清理？(y/N): " confirm
+  if [ "$confirm" != "y" ] && [ "$confirm" != "Y" ]; then
+    echo -e "  已取消"
+    sleep 1
+    return 0
+  fi
+
+  cleanup_old_backups "${CONFIG_PATH}.bak.*" "$keep"
+  cleanup_old_backups "${SSHD_CONFIG_PATH}.bak.*" "$keep"
+  cleanup_old_backups "${SCRIPT_PATH}.bak.*" "$keep"
+
+  echo ""
+  echo -e "${G}备份已清理${N}"
   pause_screen
 }
 
@@ -1944,7 +2603,7 @@ EOF
 
   echo ""
   echo -e "  ${G}╔══════════════════════════════════════════════════════╗${N}"
-  echo -e "  ${G}║${N}  ${B}${W}${APP_NAME}${N}  ${G}Sing-box 安装完成${N}"
+  echo -e "  ${G}║${N}  ${B}${W}${APP_NAME}${N}  ${G}Sing-box 安装完成${N}                           ${G}║${N}"
   echo -e "  ${G}╚══════════════════════════════════════════════════════╝${N}"
   echo -e "  模式      : ${C}$mode_label${N}"
   echo -e "  UUID      : ${C}$UUID${N}"
@@ -2007,6 +2666,7 @@ show_menu(){
     render_menu_item 4 "查看状态"
     render_menu_item 5 "外部服务"
     render_menu_item 6 "卸载 sing-box"
+    render_menu_item 7 "更新脚本"
     render_menu_item 0 "退出"
     render_divider
     read -p "  请输入序号: " choice
@@ -2020,6 +2680,23 @@ show_menu(){
         ;;
       3)
         if is_singbox_installed; then
+          local cur_ver latest_ver confirm
+          cur_ver=$(get_current_singbox_version)
+          latest_ver=$(get_latest_singbox_version)
+          echo ""
+          echo -e "  当前版本: ${C}${cur_ver:-未知}${N}"
+          echo -e "  最新版本: ${C}${latest_ver:-获取失败}${N}"
+          if [ -n "$cur_ver" ] && [ -n "$latest_ver" ] && [ "$cur_ver" = "$latest_ver" ]; then
+            echo -e "${G}已是最新版本${N}"
+            sleep 1
+            continue
+          fi
+          read -p "  确认升级 sing-box 内核？(y/N): " confirm
+          if [ "$confirm" != "y" ] && [ "$confirm" != "Y" ]; then
+            echo -e "  已取消"
+            sleep 1
+            continue
+          fi
           echo -e "${Y}==> 升级内核（不覆盖配置）...${N}"
           if ! bash <(curl -fsSL "$INSTALL_URL"); then
             echo ""
@@ -2062,13 +2739,24 @@ show_menu(){
         echo -e "  已取消"
         sleep 1
         ;;
+      7)
+        update_self_script
+        ;;
       0)
         exit 0
+        ;;
+      *)
+        notify_invalid_choice
         ;;
     esac
   done
 }
 
 # ─── 入口判断 ─────────────────────────────────────────
+if [ "${LEYILI_ALLOW_ANY_DISTRO:-0}" != "1" ]; then
+  if ! require_debian_family; then
+    exit 1
+  fi
+fi
 register_sb_command || true
 show_menu
