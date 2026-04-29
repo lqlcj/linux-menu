@@ -890,10 +890,6 @@ show_system_menu(){
     render_menu_item 6 "initcwnd 优化"
     render_menu_item 7 "查看网络优化状态"
     render_menu_item 8 "添加 SWAP (2G)"
-    render_menu_item 9 "禁用自动更新"
-    render_menu_item 10 "移除 TCP 调优"
-    render_menu_item 11 "移除 initcwnd 优化"
-    render_menu_item 12 "移除 SWAP"
     render_menu_item 0 "返回上级"
     render_divider
     read -p "  请输入序号: " choice
@@ -912,28 +908,16 @@ show_system_menu(){
         install_basic_tools
         ;;
       5)
-        apply_tcp_tuning
+        show_tcp_tuning_menu
         ;;
       6)
-        apply_initcwnd_optimization
+        show_initcwnd_tuning_menu
         ;;
       7)
         show_network_optimization_status
         ;;
       8)
         configure_swap
-        ;;
-      9)
-        disable_auto_updates
-        ;;
-      10)
-        remove_tcp_tuning
-        ;;
-      11)
-        remove_initcwnd_optimization
-        ;;
-      12)
-        remove_swap
         ;;
       0)
         return
@@ -954,8 +938,6 @@ show_admin_menu(){
     render_menu_item 4 "修改 SSH 端口"
     render_menu_item 5 "禁止 root 登录"
     render_menu_item 6 "配置 sudo 免密"
-    render_menu_item 7 "恢复 root SSH 登录"
-    render_menu_item 8 "移除 sudo 免密"
     render_menu_item 0 "返回上级"
     render_divider
     read -p "  请输入序号: " choice
@@ -978,12 +960,6 @@ show_admin_menu(){
         ;;
       6)
         configure_passwordless_sudo
-        ;;
-      7)
-        enable_root_ssh_login
-        ;;
-      8)
-        remove_passwordless_sudo
         ;;
       0)
         return
@@ -1022,7 +998,7 @@ show_external_services_menu(){
 }
 
 show_ipv6_firewall_menu(){
-  local input_policy ssh_port status_str
+  local ssh_port
 
   if ! require_root; then
     return 1
@@ -1036,23 +1012,9 @@ show_ipv6_firewall_menu(){
   fi
 
   while true; do
-    input_policy=$(ip6_get_input_policy)
     ssh_port=$(ip6_detect_ssh_port)
 
-    case "$input_policy" in
-      DROP)
-        status_str="${G}已启用${N}  ${D}默认 DROP${N}"
-        ;;
-      ACCEPT)
-        status_str="${R}未启用${N}  ${D}默认 ACCEPT (v6 入站完全裸奔)${N}"
-        ;;
-      *)
-        status_str="${Y}未知${N}"
-        ;;
-    esac
-
     render_section_header "IPv6 防火墙管理"
-    echo -e "  ${L}│${N}  状态      ${D}·${N}  $status_str"
     echo -e "  ${L}│${N}  SSH 端口  ${D}·${N}  ${C}${ssh_port}${N}"
     echo -e "  ${L}│${N}  说明      ${D}·${N}  ${D}本菜单只动 IPv6，不影响 1Panel 管理的 IPv4${N}"
     render_divider
@@ -1062,7 +1024,6 @@ show_ipv6_firewall_menu(){
     render_menu_item 4 "开放端口"
     render_menu_item 5 "关闭端口"
     render_menu_item 6 "紧急放行 (关闭 v6 防火墙)"
-    render_menu_item 7 "手动保存规则"
     render_menu_item 0 "返回上级"
     render_divider
     read -p "  请输入序号: " choice
@@ -1085,9 +1046,6 @@ show_ipv6_firewall_menu(){
         ;;
       6)
         ip6_emergency_disable
-        ;;
-      7)
-        ip6_manual_save
         ;;
       0)
         return
@@ -1341,16 +1299,6 @@ ip6_emergency_disable(){
 
   echo ""
   echo -e "${Y}已关闭 v6 防火墙${N}"
-  pause_screen
-}
-
-ip6_manual_save(){
-  echo ""
-  if ip6_save_rules; then
-    echo -e "${G}IPv6 规则已持久化${N}"
-  else
-    echo -e "${R}持久化失败${N}"
-  fi
   pause_screen
 }
 
@@ -1809,6 +1757,58 @@ install_basic_tools(){
   pause_screen
 }
 
+show_tcp_tuning_menu(){
+  while true; do
+    render_section_header "TCP 参数调优"
+    render_menu_item 1 "美西"
+    render_menu_item 2 "日本"
+    render_menu_item 0 "返回上级"
+    render_divider
+    read -p "  请选择地区: " choice
+
+    case "$choice" in
+      1)
+        apply_tcp_tuning "us-west"
+        ;;
+      2)
+        apply_tcp_tuning "japan"
+        ;;
+      0)
+        return
+        ;;
+      *)
+        notify_invalid_choice
+        ;;
+    esac
+  done
+}
+
+show_initcwnd_tuning_menu(){
+  while true; do
+    render_section_header "initcwnd 优化"
+    render_menu_item 1 "美西 (20)"
+    render_menu_item 2 "日本 (16)"
+    render_menu_item 0 "返回上级"
+    render_divider
+    read -p "  请选择地区: " choice
+
+    case "$choice" in
+      1)
+        apply_initcwnd_optimization 20
+        ;;
+      2)
+        apply_initcwnd_optimization 16
+        ;;
+      0)
+        return
+        ;;
+      *)
+        notify_invalid_choice
+        ;;
+    esac
+  done
+}
+
 show_client_link(){
   local current_link=""
   local ipv6_link=""
@@ -2105,8 +2105,59 @@ show_qrcode(){
 }
 
 apply_tcp_tuning(){
+  local profile="${1:-us-west}"
+  local profile_label="美西"
+
+  if [ "$profile" = "japan" ]; then
+    profile_label="日本"
+  fi
+
   echo ""
-  echo -e "${Y}==> 写入 TCP 参数优化配置...${N}"
+  echo -e "${Y}==> 写入 ${profile_label} TCP 参数优化配置...${N}"
+  if [ "$profile" = "japan" ]; then
+    cat > "$TCP_TUNING_PATH" << 'EOF'
+# --- 核心网络吞吐优化 ---
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = bbr
+net.ipv4.tcp_fastopen = 3
+
+# --- 缓冲区设置 (软银10Gbps，4G内存，郑州→东京60ms RTT) ---
+net.core.rmem_max = 268435456
+net.core.wmem_max = 268435456
+net.core.rmem_default = 262144
+net.core.wmem_default = 262144
+net.ipv4.tcp_rmem = 4096 262144 268435456
+net.ipv4.tcp_wmem = 4096 262144 268435456
+
+# --- 延迟与公平性 ---
+net.ipv4.tcp_notsent_lowat = 16384
+net.ipv4.tcp_slow_start_after_idle = 0
+net.ipv4.tcp_window_scaling = 1
+net.ipv4.tcp_timestamps = 1
+net.ipv4.tcp_sack = 1
+net.ipv4.tcp_mtu_probing = 1
+net.ipv4.ip_no_pmtu_disc = 0
+net.ipv4.tcp_adv_win_scale = 1
+
+# --- 连接回收与高并发处理 ---
+net.ipv4.tcp_tw_reuse = 1
+net.ipv4.tcp_fin_timeout = 5
+net.ipv4.tcp_max_tw_buckets = 65536
+net.ipv4.tcp_max_orphans = 32768
+net.core.somaxconn = 8192
+net.core.netdev_max_backlog = 16384
+net.ipv4.tcp_max_syn_backlog = 8192
+net.ipv4.tcp_syncookies = 1
+
+# --- 保活设置 (防止软银防火墙踢掉代理连接) ---
+net.ipv4.tcp_keepalive_time = 600
+net.ipv4.tcp_keepalive_intvl = 15
+net.ipv4.tcp_keepalive_probes = 5
+
+# --- 端口范围 ---
+net.ipv4.ip_local_port_range = 1024 65535
+EOF
+  else
   cat > "$TCP_TUNING_PATH" << 'EOF'
 # --- 核心网络吞吐优化 ---
 net.core.default_qdisc = fq
@@ -2148,6 +2199,7 @@ net.ipv4.tcp_keepalive_probes = 5
 # --- 端口范围 ---
 net.ipv4.ip_local_port_range = 1024 65535
 EOF
+  fi
 
   echo -e "${Y}==> 应用 sysctl 配置...${N}"
   if ! sysctl -p "$TCP_TUNING_PATH"; then
@@ -2158,6 +2210,7 @@ EOF
 
   echo ""
   echo -e "  ${B}${C}TCP 参数校验${N}"
+  echo -e "  地区配置: ${C}$profile_label${N}"
   sysctl net.ipv4.tcp_congestion_control
   sysctl net.ipv4.tcp_notsent_lowat
   sysctl net.ipv4.tcp_fin_timeout
@@ -2203,6 +2256,7 @@ remove_tcp_tuning(){
 
 apply_initcwnd_optimization(){
   local route_line route_spec ip_bin current_route
+  local initcwnd_value="${1:-$INITCWND_VALUE}"
 
   echo ""
 
@@ -2234,8 +2288,8 @@ apply_initcwnd_optimization(){
   ip_bin=$(command -v ip 2>/dev/null || echo /sbin/ip)
 
   echo -e "${Y}==> 当前默认路由:${N} ${C}$route_line${N}"
-  echo -e "${Y}==> 应用 initcwnd/initrwnd ${INITCWND_VALUE}...${N}"
-  if ! ip route replace $route_spec initcwnd $INITCWND_VALUE initrwnd $INITCWND_VALUE; then
+  echo -e "${Y}==> 应用 initcwnd/initrwnd ${initcwnd_value}...${N}"
+  if ! ip route replace $route_spec initcwnd $initcwnd_value initrwnd $initcwnd_value; then
     echo -e "${R}默认路由优化失败，请检查路由权限或当前网络环境${N}"
     pause_screen
     return 1
@@ -2250,7 +2304,7 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
-ExecStart=$ip_bin route replace $route_spec initcwnd $INITCWND_VALUE initrwnd $INITCWND_VALUE
+ExecStart=$ip_bin route replace $route_spec initcwnd $initcwnd_value initrwnd $initcwnd_value
 RemainAfterExit=yes
 
 [Install]
@@ -2273,11 +2327,11 @@ EOF
   echo ""
   echo -e "${G}initcwnd 优化已生效${N}"
   echo -e "  当前默认路由: ${C}$current_route${N}"
-  if printf '%s\n' "$current_route" | grep -Eq "(^| )initcwnd ${INITCWND_VALUE}( |$)"; then
-    echo -e "  initcwnd: ${C}${INITCWND_VALUE}${N}"
+  if printf '%s\n' "$current_route" | grep -Eq "(^| )initcwnd ${initcwnd_value}( |$)"; then
+    echo -e "  initcwnd: ${C}${initcwnd_value}${N}"
   fi
-  if printf '%s\n' "$current_route" | grep -Eq "(^| )initrwnd ${INITCWND_VALUE}( |$)"; then
-    echo -e "  initrwnd: ${C}${INITCWND_VALUE}${N}"
+  if printf '%s\n' "$current_route" | grep -Eq "(^| )initrwnd ${initcwnd_value}( |$)"; then
+    echo -e "  initrwnd: ${C}${initcwnd_value}${N}"
   fi
   echo -e "  持久化服务: ${C}$(basename "$INITCWND_SERVICE_PATH")${N}"
   pause_screen
@@ -2526,62 +2580,39 @@ remove_swap(){
   pause_screen
 }
 
-install_1panel(){
-  local tmp_script
+run_external_script_and_exit(){
+  local label="$1"
+  local url="$2"
 
   echo ""
-  echo -e "${Y}==> 下载 1Panel 安装脚本...${N}"
-  tmp_script=$(mktemp)
+  echo -e "${Y}==> 当前 ${APP_NAME} 菜单将退出，并交给 ${label} 脚本...${N}"
+  exec bash -c '
+    label="$1"
+    url="$2"
+    tmp_script=$(mktemp)
+    trap '\''rm -f "$tmp_script"'\'' EXIT
 
-  if ! curl -fsSL "$ONEPANEL_INSTALL_URL" -o "$tmp_script"; then
-    rm -f "$tmp_script"
-    echo -e "${R}1Panel 安装脚本下载失败${N}"
-    pause_screen
-    return 1
-  fi
+    echo "==> 下载 ${label} 脚本..."
+    if ! curl -fsSL "$url" -o "$tmp_script"; then
+      echo "${label} 脚本下载失败"
+      exit 1
+    fi
 
-  echo -e "${Y}==> 开始安装 1Panel...${N}"
-  if ! bash "$tmp_script"; then
-    rm -f "$tmp_script"
-    echo ""
-    echo -e "${R}1Panel 安装过程返回错误，请检查上方输出${N}"
-    pause_screen
-    return 1
-  fi
+    echo "==> 开始执行 ${label}..."
+    bash "$tmp_script"
+  ' _ "$label" "$url"
 
-  rm -f "$tmp_script"
-  echo ""
-  echo -e "${G}1Panel 安装脚本执行完成${N}"
+  echo -e "${R}${label} 脚本启动失败${N}"
   pause_screen
+  return 1
+}
+
+install_1panel(){
+  run_external_script_and_exit "1Panel 安装" "$ONEPANEL_INSTALL_URL"
 }
 
 run_nodequality_benchmark(){
-  local tmp_script
-
-  echo ""
-  echo -e "${Y}==> 下载 NodeQuality 测评脚本...${N}"
-  tmp_script=$(mktemp)
-
-  if ! curl -fsSL "$NODEQUALITY_RUN_URL" -o "$tmp_script"; then
-    rm -f "$tmp_script"
-    echo -e "${R}NodeQuality 测评脚本下载失败${N}"
-    pause_screen
-    return 1
-  fi
-
-  echo -e "${Y}==> 开始执行 NodeQuality 测评，耗时可能较长...${N}"
-  if ! bash "$tmp_script"; then
-    rm -f "$tmp_script"
-    echo ""
-    echo -e "${R}NodeQuality 测评执行失败，请检查上方输出${N}"
-    pause_screen
-    return 1
-  fi
-
-  rm -f "$tmp_script"
-  echo ""
-  echo -e "${G}NodeQuality 测评执行完成${N}"
-  pause_screen
+  run_external_script_and_exit "NodeQuality 测评" "$NODEQUALITY_RUN_URL"
 }
 
 # ─── 脚本自更新 / 配置管理 ────────────────────────────
