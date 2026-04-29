@@ -775,6 +775,27 @@ build_client_link(){
     "$uuid" "$host" "$port" "$sni" "$public_key" "$short_id" "$tag"
 }
 
+build_dualstack_ipv6_link(){
+  local uuid="$1"
+  local port="$2"
+  local sni="$3"
+  local public_key="$4"
+  local short_id="$5"
+  local tag="${6:-reality}"
+  local ipv6=""
+
+  if [ "${MENU_MODE:-}" != "dualstack" ]; then
+    return 1
+  fi
+
+  ipv6=$(detect_primary_ipv6)
+  if [ -z "$ipv6" ] || [ "$ipv6" = "$MENU_IP" ]; then
+    return 1
+  fi
+
+  build_client_link "$uuid" "$ipv6" "$port" "$sni" "$public_key" "$short_id" "${tag}-ipv6"
+}
+
 show_status_menu(){
   if ! require_singbox_installed; then
     return
@@ -1790,6 +1811,7 @@ install_basic_tools(){
 
 show_client_link(){
   local current_link=""
+  local ipv6_link=""
   local mode_label=""
 
   echo ""
@@ -1801,6 +1823,7 @@ show_client_link(){
 
   load_proxy_context
   current_link=$(build_client_link "$MENU_UUID" "$MENU_IP" "$MENU_PORT" "$MENU_SNI" "$MENU_PUBLIC_KEY" "$MENU_SHORT_ID" "$MENU_TAG" 2>/dev/null || true)
+  ipv6_link=$(build_dualstack_ipv6_link "$MENU_UUID" "$MENU_PORT" "$MENU_SNI" "$MENU_PUBLIC_KEY" "$MENU_SHORT_ID" "$MENU_TAG" 2>/dev/null || true)
 
   if [ -n "$current_link" ]; then
     set_info_value "Link" "$current_link"
@@ -1822,6 +1845,12 @@ show_client_link(){
   echo -e "  ${B}客户端链接：${N}"
   echo -e "  ${G}${current_link:-${MENU_LINK:-未找到}}${N}"
   print_qrcode "${current_link:-$MENU_LINK}"
+  if [ -n "$ipv6_link" ]; then
+    echo ""
+    echo -e "  ${B}IPv6 客户端链接：${N}"
+    echo -e "  ${G}${ipv6_link}${N}"
+    print_qrcode "$ipv6_link"
+  fi
   pause_screen
 }
 
@@ -1992,7 +2021,9 @@ modify_node_params(){
   local final_pub="${new_pub:-$MENU_PUBLIC_KEY}"
   local final_short_id="${new_short_id:-$MENU_SHORT_ID}"
   local new_link
+  local ipv6_new_link
   new_link=$(build_client_link "$new_uuid" "$MENU_IP" "$new_port" "$new_sni" "$final_pub" "$final_short_id" "${MENU_TAG:-reality}" 2>/dev/null || true)
+  ipv6_new_link=$(build_dualstack_ipv6_link "$new_uuid" "$new_port" "$new_sni" "$final_pub" "$final_short_id" "${MENU_TAG:-reality}" 2>/dev/null || true)
   set_info_value "Port" "$new_port"
   set_info_value "SNI"  "$new_sni"
   set_info_value "UUID" "$new_uuid"
@@ -2012,6 +2043,12 @@ modify_node_params(){
     echo -e "  ${B}新客户端链接：${N}"
     echo -e "  ${G}$new_link${N}"
     print_qrcode "$new_link"
+  fi
+  if [ -n "$ipv6_new_link" ]; then
+    echo ""
+    echo -e "  ${B}新 IPv6 客户端链接：${N}"
+    echo -e "  ${G}$ipv6_new_link${N}"
+    print_qrcode "$ipv6_new_link"
   fi
   pause_screen
 }
@@ -2039,11 +2076,13 @@ print_qrcode(){
 
 show_qrcode(){
   local link=""
+  local ipv6_link=""
 
   if ! require_singbox_installed; then return 1; fi
 
   load_proxy_context
   link=$(build_client_link "$MENU_UUID" "$MENU_IP" "$MENU_PORT" "$MENU_SNI" "$MENU_PUBLIC_KEY" "$MENU_SHORT_ID" "${MENU_TAG:-reality}" 2>/dev/null || true)
+  ipv6_link=$(build_dualstack_ipv6_link "$MENU_UUID" "$MENU_PORT" "$MENU_SNI" "$MENU_PUBLIC_KEY" "$MENU_SHORT_ID" "${MENU_TAG:-reality}" 2>/dev/null || true)
 
   if [ -z "$link" ]; then
     echo ""
@@ -2056,6 +2095,12 @@ show_qrcode(){
   echo -e "  ${B}客户端链接：${N}"
   echo -e "  ${G}$link${N}"
   print_qrcode "$link"
+  if [ -n "$ipv6_link" ]; then
+    echo ""
+    echo -e "  ${B}IPv6 客户端链接：${N}"
+    echo -e "  ${G}$ipv6_link${N}"
+    print_qrcode "$ipv6_link"
+  fi
   pause_screen
 }
 
