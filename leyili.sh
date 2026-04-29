@@ -24,6 +24,8 @@ SSHD_CONFIG_PATH="/etc/ssh/sshd_config"
 SUDOERS_DROPIN_DIR="/etc/sudoers.d"
 SSH_RANDOM_PORT_MIN="20000"
 SSH_RANDOM_PORT_MAX="65535"
+IP6_RULES_PATH_DEBIAN="/etc/iptables/rules.v6"
+IP6_RULES_PATH_RHEL="/etc/sysconfig/ip6tables"
 
 # ─── 颜色 ────────────────────────────────────────────
 G="\033[32m" Y="\033[33m" C="\033[36m" R="\033[31m" B="\033[1m" N="\033[0m"
@@ -148,6 +150,77 @@ allow_tcp_port_in_firewall(){
       echo -e "  防火墙  : ${D}未启用 ufw/firewalld（如有外部安全组请自行放行 ${port}/tcp）${N}"
       ;;
   esac
+}
+
+ip6_get_input_policy(){
+  ip6tables -L INPUT -n 2>/dev/null | head -n1 | awk '{print $4}'
+}
+
+ip6_detect_ssh_port(){
+  local port=""
+
+  if command -v ss >/dev/null 2>&1; then
+    port=$(ss -tlnp 2>/dev/null | awk '/sshd/ {print $4}' \
+           | awk -F: '{print $NF}' | sort -u | head -n1)
+  fi
+
+  if [ -z "$port" ]; then
+    port=$(get_current_ssh_port)
+  fi
+
+  printf '%s' "${port:-22}"
+}
+
+ip6_check_current_ssh_v6(){
+  local ip=""
+
+  if [ -n "${SSH_CLIENT:-}" ]; then
+    ip=$(printf '%s' "$SSH_CLIENT" | awk '{print $1}')
+    case "$ip" in
+      *:*)
+        return 0
+        ;;
+    esac
+  fi
+  return 1
+}
+
+ip6_ensure_persistence(){
+  if is_debian_family; then
+    if dpkg -s iptables-persistent >/dev/null 2>&1; then
+      return 0
+    fi
+
+    echo -e "${Y}==> 安装 iptables-persistent（重启后自动加载规则）...${N}"
+    echo "iptables-persistent iptables-persistent/autosave_v4 boolean false" \
+        | debconf-set-selections 2>/dev/null
+    echo "iptables-persistent iptables-persistent/autosave_v6 boolean false" \
+        | debconf-set-selections 2>/dev/null
+    if ! DEBIAN_FRONTEND=noninteractive apt-get update -qq; then
+      return 1
+    fi
+    if ! DEBIAN_FRONTEND=noninteractive apt-get install -y iptables-persistent >/dev/null; then
+      return 1
+    fi
+    return 0
+  fi
+
+  echo -e "${Y}非 Debian 系发行版，跳过持久化工具自动安装${N}"
+  return 0
+}
+
+ip6_save_rules(){
+  local target="$IP6_RULES_PATH_DEBIAN"
+
+  if ! is_debian_family; then
+    target="$IP6_RULES_PATH_RHEL"
+  fi
+
+  mkdir -p "$(dirname "$target")"
+  if ! ip6tables-save > "$target"; then
+    return 1
+  fi
+  return 0
 }
 
 register_sb_command(){
@@ -500,13 +573,13 @@ detect_primary_ipv6(){
 describe_install_mode(){
   case "$1" in
     ipv6-in-ipv4-out)
-      printf '%s' 'IPv6 入站 + IPv4 出站'
+      printf '%s' '双栈入站 + 仅 IPv4 出站'
       ;;
     dualstack)
-      printf '%s' 'IPv4 + IPv6'
+      printf '%s' '双栈入站 + 仅 IPv4 出站'
       ;;
     *)
-      printf '%s' '仅 IPv4'
+      printf '%s' '仅 IPv4 入站 + 仅 IPv4 出站'
       ;;
   esac
 }
@@ -913,6 +986,339 @@ show_external_services_menu(){
         ;;
     esac
   done
+}
+
+show_ipv6_firewall_menu(){
+  local input_policy ssh_port status_str
+
+  if ! require_root; then
+    return 1
+  fi
+
+  if ! command -v ip6tables >/dev/null 2>&1; then
+    echo ""
+    echo -e "${R}系统未安装 ip6tables，无法管理 IPv6 防火墙${N}"
+    pause_screen
+    return 1
+  fi
+
+  while true; do
+    input_policy=$(ip6_get_input_policy)
+    ssh_port=$(ip6_detect_ssh_port)
+
+    case "$input_policy" in
+      DROP)
+        status_str="${G}已启用${N}  ${D}默认 DROP${N}"
+        ;;
+      ACCEPT)
+        status_str="${R}未启用${N}  ${D}默认 ACCEPT (v6 入站完全裸奔)${N}"
+        ;;
+      *)
+        status_str="${Y}未知${N}"
+        ;;
+    esac
+
+    render_section_header "IPv6 防火墙管理"
+    echo -e "  ${L}│${N}  状态      ${D}·${N}  $status_str"
+    echo -e "  ${L}│${N}  SSH 端口  ${D}·${N}  ${C}${ssh_port}${N}"
+    echo -e "  ${L}│${N}  说明      ${D}·${N}  ${D}本菜单只动 IPv6，不影响 1Panel 管理的 IPv4${N}"
+    render_divider
+    render_menu_item 1 "查看当前规则"
+    render_menu_item 2 "查看监听 IPv6 的服务"
+    render_menu_item 3 "一键初始化 (放行 SSH/80/443)"
+    render_menu_item 4 "开放端口"
+    render_menu_item 5 "关闭端口"
+    render_menu_item 6 "紧急放行 (关闭 v6 防火墙)"
+    render_menu_item 7 "手动保存规则"
+    render_menu_item 0 "返回上级"
+    render_divider
+    read -p "  请输入序号: " choice
+
+    case $choice in
+      1)
+        ip6_view_rules
+        ;;
+      2)
+        ip6_view_listening
+        ;;
+      3)
+        ip6_init_firewall
+        ;;
+      4)
+        ip6_open_port
+        ;;
+      5)
+        ip6_close_port
+        ;;
+      6)
+        ip6_emergency_disable
+        ;;
+      7)
+        ip6_manual_save
+        ;;
+      0)
+        return
+        ;;
+      *)
+        notify_invalid_choice
+        ;;
+    esac
+  done
+}
+
+ip6_view_rules(){
+  local input_policy output_policy forward_policy opened
+
+  input_policy=$(ip6_get_input_policy)
+  output_policy=$(ip6tables -L OUTPUT -n 2>/dev/null | head -n1 | awk '{print $4}')
+  forward_policy=$(ip6tables -L FORWARD -n 2>/dev/null | head -n1 | awk '{print $4}')
+
+  echo ""
+  echo -e "  ${B}${C}默认策略${N}"
+  echo -e "  INPUT   : ${C}${input_policy}${N}  ${D}(别人主动连你)${N}"
+  echo -e "  OUTPUT  : ${C}${output_policy}${N}  ${D}(你主动出去连别人)${N}"
+  echo -e "  FORWARD : ${C}${forward_policy}${N}  ${D}(转发, Docker 用, 脚本不动)${N}"
+  echo ""
+
+  echo -e "  ${B}${C}已开放的入站端口${N}"
+  opened=$(ip6tables-save 2>/dev/null | awk '
+    /^-A INPUT/ {
+      proto=""; port=""
+      for (i = 1; i <= NF; i++) {
+        if ($i == "-p") proto = $(i + 1)
+        if ($i == "--dport") port = $(i + 1)
+      }
+      if (port != "") printf "  %s  %s\n", toupper(proto), port
+    }' | sort -u)
+
+  if [ -z "$opened" ]; then
+    echo -e "  ${D}(无)${N}"
+  else
+    echo "$opened"
+  fi
+  echo ""
+
+  echo -e "  ${B}${C}完整 INPUT 规则${N}"
+  ip6tables -L INPUT -n -v --line-numbers
+  pause_screen
+}
+
+ip6_view_listening(){
+  echo ""
+  echo -e "  ${B}${C}监听 IPv6 的服务${N}"
+  render_divider
+  echo -e "  ${Y}TCP${N}"
+  if ! ss -6tlnp 2>/dev/null; then
+    echo -e "  ${R}ss 不可用${N}"
+  fi
+  echo ""
+  echo -e "  ${Y}UDP${N}"
+  if ! ss -6ulnp 2>/dev/null; then
+    echo -e "  ${R}ss 不可用${N}"
+  fi
+  echo ""
+  echo -e "  ${D}提示：监听 [::] 表示同时接受 IPv4 (经映射) 和 IPv6 连接${N}"
+  pause_screen
+}
+
+ip6_init_firewall(){
+  local ssh_port confirm
+
+  ssh_port=$(ip6_detect_ssh_port)
+
+  echo ""
+  echo -e "  ${B}${C}一键初始化${N}"
+  render_divider
+  echo "  本次会执行："
+  echo "    1) 清空当前 IPv6 INPUT 规则"
+  echo "    2) 放行回环 lo"
+  echo "    3) 放行已建立的连接 (ESTABLISHED, RELATED)"
+  echo "    4) 放行 ICMPv6 (邻居发现等必需)"
+  echo -e "    5) 放行 SSH 端口: ${C}${ssh_port}${N}/tcp  ${D}(自动检测)${N}"
+  echo "    6) 放行 80/tcp"
+  echo "    7) 放行 443/tcp"
+  echo "    8) INPUT 默认策略 = DROP"
+  echo "    9) OUTPUT 保持 ACCEPT"
+  echo "   10) FORWARD 不动 (留给 Docker)"
+  echo ""
+
+  if ip6_check_current_ssh_v6; then
+    echo -e "  ${R}${B}警告：你当前 SSH 是 IPv6 进来的${N}"
+    echo -e "  ${Y}建议先用 IPv4 登录后再操作${N}"
+    echo ""
+  fi
+
+  read -p "  确认继续？(y/N): " confirm
+  if [ "$confirm" != "y" ] && [ "$confirm" != "Y" ]; then
+    echo -e "  已取消"
+    sleep 1
+    return 0
+  fi
+
+  if ! ip6_ensure_persistence; then
+    echo ""
+    echo -e "${R}持久化工具安装失败${N}"
+    pause_screen
+    return 1
+  fi
+
+  ip6tables -F INPUT
+  ip6tables -A INPUT -i lo -j ACCEPT
+  ip6tables -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+  ip6tables -A INPUT -p ipv6-icmp -j ACCEPT
+  ip6tables -A INPUT -p tcp --dport "$ssh_port" -j ACCEPT
+  ip6tables -A INPUT -p tcp --dport 80 -j ACCEPT
+  ip6tables -A INPUT -p tcp --dport 443 -j ACCEPT
+  ip6tables -P INPUT DROP
+  ip6tables -P OUTPUT ACCEPT
+
+  if ! ip6_save_rules; then
+    echo -e "${Y}规则已生效，但持久化失败，重启后可能丢失${N}"
+  fi
+
+  echo ""
+  echo -e "${G}IPv6 防火墙已启用${N}"
+  pause_screen
+}
+
+ip6_open_port(){
+  local proto_choice protos="" port proto changed=0
+
+  echo ""
+  echo -e "  ${B}${C}开放端口${N}"
+  render_divider
+  render_menu_item 1 "TCP"
+  render_menu_item 2 "UDP"
+  render_menu_item 3 "TCP + UDP (都开)"
+  render_menu_item 0 "返回"
+  render_divider
+  read -p "  选择协议: " proto_choice
+
+  case "$proto_choice" in
+    1) protos="tcp" ;;
+    2) protos="udp" ;;
+    3) protos="tcp udp" ;;
+    0) return 0 ;;
+    *)
+      notify_invalid_choice
+      return 0
+      ;;
+  esac
+
+  read -p "  端口号 (1-65535): " port
+  if ! validate_port "$port"; then
+    echo -e "${R}端口必须是 1-65535 的数字${N}"
+    pause_screen
+    return 1
+  fi
+
+  for proto in $protos; do
+    if ip6tables -C INPUT -p "$proto" --dport "$port" -j ACCEPT 2>/dev/null; then
+      echo -e "  ${Y}${port}/${proto} 已放行，跳过${N}"
+    else
+      ip6tables -A INPUT -p "$proto" --dport "$port" -j ACCEPT
+      echo -e "  ${G}已放行 ${port}/${proto}${N}"
+      changed=1
+    fi
+  done
+
+  if [ "$changed" -eq 1 ]; then
+    if ! ip6_save_rules; then
+      echo -e "${Y}持久化失败${N}"
+    fi
+  fi
+  pause_screen
+}
+
+ip6_close_port(){
+  local port ssh_port confirm proto removed=0
+
+  echo ""
+  echo -e "  ${B}${C}关闭端口${N}"
+  render_divider
+  read -p "  要关闭的端口号 (1-65535): " port
+
+  if ! validate_port "$port"; then
+    echo -e "${R}端口必须是 1-65535 的数字${N}"
+    pause_screen
+    return 1
+  fi
+
+  ssh_port=$(ip6_detect_ssh_port)
+  if [ "$port" = "$ssh_port" ]; then
+    echo ""
+    echo -e "  ${R}${B}警告：${port} 是当前 SSH 端口${N}"
+    echo -e "  ${Y}关闭后将无法通过 IPv6 SSH（IPv4 不受影响）${N}"
+    read -p "  确认继续？(y/N): " confirm
+    if [ "$confirm" != "y" ] && [ "$confirm" != "Y" ]; then
+      echo -e "  已取消"
+      sleep 1
+      return 0
+    fi
+  fi
+
+  for proto in tcp udp; do
+    while ip6tables -C INPUT -p "$proto" --dport "$port" -j ACCEPT 2>/dev/null; do
+      ip6tables -D INPUT -p "$proto" --dport "$port" -j ACCEPT
+      echo -e "  ${G}已删除 ${port}/${proto}${N}"
+      removed=$((removed + 1))
+    done
+  done
+
+  if [ "$removed" -eq 0 ]; then
+    echo -e "  ${Y}端口 ${port} 没有放行规则${N}"
+  else
+    if ! ip6_save_rules; then
+      echo -e "${Y}持久化失败${N}"
+    fi
+  fi
+  pause_screen
+}
+
+ip6_emergency_disable(){
+  local confirm confirm2
+
+  echo ""
+  echo -e "  ${R}${B}紧急放行（关闭 v6 防火墙）${N}"
+  render_divider
+  echo "  执行后："
+  echo "    - 清空所有 IPv6 INPUT 规则"
+  echo "    - 默认策略改回 ACCEPT"
+  echo "    - v6 入站回到完全裸奔状态"
+  echo ""
+
+  read -p "  确认？(y/N): " confirm
+  if [ "$confirm" != "y" ] && [ "$confirm" != "Y" ]; then
+    echo -e "  已取消"
+    sleep 1
+    return 0
+  fi
+  read -p "  再次确认（输入大写 YES 继续）: " confirm2
+  if [ "$confirm2" != "YES" ]; then
+    echo -e "  已取消"
+    sleep 1
+    return 0
+  fi
+
+  ip6tables -P INPUT ACCEPT
+  ip6tables -F INPUT
+  if ! ip6_save_rules; then
+    echo -e "${Y}持久化失败${N}"
+  fi
+
+  echo ""
+  echo -e "${Y}已关闭 v6 防火墙${N}"
+  pause_screen
+}
+
+ip6_manual_save(){
+  echo ""
+  if ip6_save_rules; then
+    echo -e "${G}IPv6 规则已持久化${N}"
+  else
+    echo -e "${R}持久化失败${N}"
+  fi
+  pause_screen
 }
 
 create_regular_user(){
@@ -2389,9 +2795,9 @@ do_install(){
   TAG="${TAG:-reality}"
 
   echo -e "  监听模式："
-  echo "    1) 仅 IPv4 - 0.0.0.0（默认）"
-  echo "    2) IPv4 + IPv6 - ::"
-  echo "    3) IPv6 入站 + IPv4 出站"
+  echo "    1) 仅 IPv4 入站 + 仅 IPv4 出站 - 0.0.0.0（默认）"
+  echo "    2) 双栈入站 + 仅 IPv4 出站 - ::"
+  echo "    3) 双栈入站 + 仅 IPv4 出站（绑定本机 IPv4 源地址）"
   read -p "  请选择 (1): " LISTEN_CHOICE
   case "$LISTEN_CHOICE" in
     2)
@@ -2509,6 +2915,12 @@ do_install(){
     cat > "$CONFIG_PATH" << EOF
 {
   "log": {"disabled": false, "level": "warn", "timestamp": true},
+  "dns": {
+    "servers": [{
+      "type": "local",
+      "tag": "local"
+    }]
+  },
   "inbounds": [{
     "type": "vless",
     "tag": "vless-in",
@@ -2529,7 +2941,11 @@ do_install(){
   "outbounds": [{
     "type": "direct",
     "tag": "v4-out",
-    "inet4_bind_address": "$outbound_bind_ip"
+    "inet4_bind_address": "$outbound_bind_ip",
+    "domain_resolver": {
+      "server": "local",
+      "strategy": "ipv4_only"
+    }
   }],
   "route": {
     "final": "v4-out"
@@ -2540,6 +2956,12 @@ EOF
     cat > "$CONFIG_PATH" << EOF
 {
   "log": {"disabled": false, "level": "warn", "timestamp": true},
+  "dns": {
+    "servers": [{
+      "type": "local",
+      "tag": "local"
+    }]
+  },
   "inbounds": [{
     "type": "vless",
     "tag": "vless-in",
@@ -2557,7 +2979,13 @@ EOF
       }
     }
   }],
-  "outbounds": [{"type": "direct"}]
+  "outbounds": [{
+    "type": "direct",
+    "domain_resolver": {
+      "server": "local",
+      "strategy": "ipv4_only"
+    }
+  }]
 }
 EOF
   fi
@@ -2612,6 +3040,7 @@ EOF
   if [ -n "$outbound_bind_ip" ]; then
     echo -e "  出站 IPv4 : ${C}$outbound_bind_ip${N}"
   fi
+  echo -e "  出站策略  : ${C}仅 IPv4${N}"
   echo -e "  端口      : ${C}$PORT${N}"
   echo -e "  SNI       : ${C}$SNI${N}"
   echo ""
@@ -2665,8 +3094,9 @@ show_menu(){
     render_menu_item 3 "${singbox_action_label}"
     render_menu_item 4 "查看状态"
     render_menu_item 5 "外部服务"
-    render_menu_item 6 "卸载 sing-box"
-    render_menu_item 7 "更新脚本"
+    render_menu_item 6 "IPv6 防火墙管理"
+    render_menu_item 7 "卸载 sing-box"
+    render_menu_item 8 "更新脚本"
     render_menu_item 0 "退出"
     render_divider
     read -p "  请输入序号: " choice
@@ -2721,6 +3151,9 @@ show_menu(){
         show_external_services_menu
         ;;
       6)
+        show_ipv6_firewall_menu
+        ;;
+      7)
         echo ""
         read -p "  确认卸载 sing-box 并删除 ${COMMAND_NAME} 菜单入口？保留系统优化与 1Panel (y/N): " CONFIRM
         if [ "$CONFIRM" = "y" ] || [ "$CONFIRM" = "Y" ]; then
@@ -2739,7 +3172,7 @@ show_menu(){
         echo -e "  已取消"
         sleep 1
         ;;
-      7)
+      8)
         update_self_script
         ;;
       0)
