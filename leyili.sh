@@ -2774,6 +2774,7 @@ do_install(){
   local public_key=""
   local access_ip=""
   local link=""
+  local ipv6_link=""
   local public_ipv4=""
   local public_ipv6=""
   local outbound_bind_ip=""
@@ -3004,6 +3005,9 @@ EOF
   fi
 
   link=$(build_client_link "$UUID" "$access_ip" "$PORT" "$SNI" "$public_key" "$SHORT_ID" "$TAG" 2>/dev/null || true)
+  if [ "$install_mode" = "dualstack" ] && [ -n "$public_ipv6" ] && [ "$public_ipv6" != "$access_ip" ]; then
+    ipv6_link=$(build_client_link "$UUID" "$public_ipv6" "$PORT" "$SNI" "$public_key" "$SHORT_ID" "${TAG}-ipv6" 2>/dev/null || true)
+  fi
 
   write_proxy_info \
     "$UUID" \
@@ -3040,6 +3044,12 @@ EOF
   echo -e "  ${B}客户端链接：${N}"
   echo -e "  ${G}${link:-未生成}${N}"
   print_qrcode "${link:-}"
+  if [ -n "$ipv6_link" ]; then
+    echo ""
+    echo -e "  ${B}IPv6 客户端链接：${N}"
+    echo -e "  ${G}${ipv6_link}${N}"
+    print_qrcode "$ipv6_link"
+  fi
   echo ""
   echo -e "  信息已保存至 ${Y}$INFO_PATH${N}"
   echo -e "  输入 ${B}${COMMAND_NAME}${N} 进入管理菜单"
