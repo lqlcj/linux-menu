@@ -573,7 +573,7 @@ detect_primary_ipv6(){
 describe_install_mode(){
   case "$1" in
     ipv6-in-ipv4-out)
-      printf '%s' '双栈入站 + 仅 IPv4 出站'
+      printf '%s' '仅 IPv6 入站 + 仅 IPv4 出站'
       ;;
     dualstack)
       printf '%s' '双栈入站 + 仅 IPv4 出站'
@@ -710,8 +710,20 @@ load_proxy_context(){
       MENU_BIND_IPV4=$(sed -n 's/.*"inet4_bind_address":[[:space:]]*"\([^"]*\)".*/\1/p' "$CONFIG_PATH" | head -1)
     fi
 
-    if [ -z "$MENU_MODE" ] && grep -Eq '"final":[[:space:]]*"v4-out"' "$CONFIG_PATH"; then
-      MENU_MODE="ipv6-in-ipv4-out"
+    if [ -z "$MENU_MODE" ]; then
+      case "$MENU_LISTEN_ADDR" in
+        ::)
+          MENU_MODE="dualstack"
+          ;;
+        *:*)
+          MENU_MODE="ipv6-in-ipv4-out"
+          ;;
+        *)
+          if grep -Eq '"final":[[:space:]]*"v4-out"' "$CONFIG_PATH"; then
+            MENU_MODE="ipv6-in-ipv4-out"
+          fi
+          ;;
+      esac
     fi
   fi
 
@@ -2797,7 +2809,7 @@ do_install(){
   echo -e "  监听模式："
   echo "    1) 仅 IPv4 入站 + 仅 IPv4 出站 - 0.0.0.0（默认）"
   echo "    2) 双栈入站 + 仅 IPv4 出站 - ::"
-  echo "    3) 双栈入站 + 仅 IPv4 出站（绑定本机 IPv4 源地址）"
+  echo "    3) 仅 IPv6 入站 + 仅 IPv4 出站"
   read -p "  请选择 (1): " LISTEN_CHOICE
   case "$LISTEN_CHOICE" in
     2)
@@ -2805,7 +2817,7 @@ do_install(){
       install_mode="dualstack"
       ;;
     3)
-      LISTEN_ADDR="::"
+      LISTEN_ADDR=""
       install_mode="ipv6-in-ipv4-out"
       ;;
     *)
@@ -2815,19 +2827,11 @@ do_install(){
   esac
 
   if [ "$install_mode" = "ipv6-in-ipv4-out" ]; then
-    public_ipv4=$(detect_primary_ipv4)
     public_ipv6=$(detect_primary_ipv6)
 
     if [ -z "$public_ipv6" ]; then
       echo ""
-      echo -e "${R}未检测到可用的 IPv6 地址，无法使用“IPv6 入站 + IPv4 出站”模式${N}"
-      pause_screen
-      return 1
-    fi
-
-    if [ -z "$public_ipv4" ]; then
-      echo ""
-      echo -e "${R}未检测到可用的 IPv4 地址，无法强制 IPv4 出站${N}"
+      echo -e "${R}未检测到可用的 IPv6 地址，无法使用“仅 IPv6 入站 + 仅 IPv4 出站”模式${N}"
       pause_screen
       return 1
     fi
@@ -2870,16 +2874,10 @@ do_install(){
   case "$install_mode" in
     ipv6-in-ipv4-out)
       access_ip="$public_ipv6"
-      outbound_bind_ip="$public_ipv4"
+      LISTEN_ADDR="$public_ipv6"
       if [ -z "$access_ip" ]; then
         echo ""
-        echo -e "${R}未检测到可用的 IPv6 地址，无法使用“IPv6 入站 + IPv4 出站”模式${N}"
-        pause_screen
-        return 1
-      fi
-      if [ -z "$outbound_bind_ip" ]; then
-        echo ""
-        echo -e "${R}未检测到可用的 IPv4 地址，无法强制 IPv4 出站${N}"
+        echo -e "${R}未检测到可用的 IPv6 地址，无法使用“仅 IPv6 入站 + 仅 IPv4 出站”模式${N}"
         pause_screen
         return 1
       fi
@@ -2940,16 +2938,11 @@ do_install(){
   }],
   "outbounds": [{
     "type": "direct",
-    "tag": "v4-out",
-    "inet4_bind_address": "$outbound_bind_ip",
     "domain_resolver": {
       "server": "local",
       "strategy": "ipv4_only"
     }
-  }],
-  "route": {
-    "final": "v4-out"
-  }
+  }]
 }
 EOF
   else
