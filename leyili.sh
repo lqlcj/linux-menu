@@ -6,6 +6,7 @@ CONFIG_PATH="/etc/sing-box/config.json"
 INFO_PATH="/root/proxy-info.txt"
 NODES_DIR="/etc/sing-box/nodes"
 CERTS_DIR="/etc/sing-box/certs"
+CHAINS_DIR="/etc/sing-box/chains"
 APP_NAME="Leyili"
 COMMAND_NAME="sb"
 SCRIPT_PATH="/usr/local/bin/${COMMAND_NAME}"
@@ -18,8 +19,6 @@ SWAP_SIZE="2G"
 SWAP_SIZE_MB="2048"
 SWAP_SYSCTL_PATH="/etc/sysctl.d/99-swap-tuning.conf"
 SWAPPINESS_VALUE="10"
-ONEPANEL_INSTALL_URL="https://resource.fit2cloud.com/1panel/package/v2/quick_start.sh"
-NODEQUALITY_RUN_URL="https://run.NodeQuality.com"
 SYSTEM_TIMEZONE="Asia/Shanghai"
 BASIC_TOOLS_PACKAGES="curl wget git vim htop unzip net-tools"
 SSHD_CONFIG_PATH="/etc/ssh/sshd_config"
@@ -28,6 +27,8 @@ SSH_RANDOM_PORT_MIN="20000"
 SSH_RANDOM_PORT_MAX="65535"
 IP6_RULES_PATH_DEBIAN="/etc/iptables/rules.v6"
 IP6_RULES_PATH_RHEL="/etc/sysconfig/ip6tables"
+IP4_RULES_PATH_DEBIAN="/etc/iptables/rules.v4"
+IP4_RULES_PATH_RHEL="/etc/sysconfig/iptables"
 
 # ─── 颜色 ────────────────────────────────────────────
 G="\033[32m" Y="\033[33m" C="\033[36m" R="\033[31m" B="\033[1m" N="\033[0m"
@@ -181,6 +182,34 @@ deny_port_in_firewall(){
   esac
 }
 
+# 给用户打印"请自行放行端口"的提示，覆盖 IPv4(ufw/firewalld)、IPv6(本脚本菜单)、云安全组
+print_firewall_hint(){
+  local port="$1"
+  local proto="${2:-tcp}"
+  local label="${3:-}"
+  local backend
+  backend=$(detect_firewall_backend)
+
+  echo ""
+  echo -e "  ${Y}${B}请自行放行入站端口：${C}${port}/${proto}${N}${label:+  ${D}(${label})${N}}"
+  case "$backend" in
+    ufw)
+      echo -e "    ${L}·${N} ufw    : ${C}ufw allow ${port}/${proto}${N}"
+      ;;
+    firewalld)
+      echo -e "    ${L}·${N} firewalld : ${C}firewall-cmd --permanent --add-port=${port}/${proto} && firewall-cmd --reload${N}"
+      ;;
+    *)
+      echo -e "    ${L}·${N} 本机未启用 ufw/firewalld（如启用过 IPv6 防火墙菜单，请走下条）"
+      ;;
+  esac
+  if command -v ip6tables >/dev/null 2>&1; then
+    echo -e "    ${L}·${N} IPv6 防火墙菜单 : 主菜单 ${C}6) IPv6 防火墙管理 → 4) 开放端口${N}"
+  fi
+  echo -e "    ${L}·${N} 云厂商安全组    : ${D}阿里云 / 腾讯云 / AWS / Vultr 等控制台需自行加 ${port}/${proto} 入站规则${N}"
+  echo ""
+}
+
 ip6_get_input_policy(){
   ip6tables -L INPUT -n 2>/dev/null | head -n1 | awk '{print $4}'
 }
@@ -250,6 +279,54 @@ ip6_save_rules(){
     return 1
   fi
   return 0
+}
+
+# ─── IPv4 防火墙底层 helpers ──────────────────────────
+ip4_save_rules(){
+  local target="$IP4_RULES_PATH_DEBIAN"
+
+  if ! is_debian_family; then
+    target="$IP4_RULES_PATH_RHEL"
+  fi
+
+  mkdir -p "$(dirname "$target")"
+  if ! iptables-save > "$target"; then
+    return 1
+  fi
+  return 0
+}
+
+ip4_get_input_policy(){
+  iptables -L INPUT -n 2>/dev/null | head -n1 | awk '{print $4}'
+}
+
+ip4_check_current_ssh_v4(){
+  local ip=""
+  if [ -n "${SSH_CLIENT:-}" ]; then
+    ip=$(printf '%s' "$SSH_CLIENT" | awk '{print $1}')
+    case "$ip" in
+      *:*) return 1 ;;
+      *)   [ -n "$ip" ] && return 0 ;;
+    esac
+  fi
+  return 1
+}
+
+# 检查可能与 iptables 直接编辑冲突的管理工具
+ip4_detect_conflicts(){
+  local conflicts=""
+
+  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -qi "^Status: active"; then
+    conflicts="${conflicts}ufw "
+  fi
+  if command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active firewalld >/dev/null 2>&1; then
+    conflicts="${conflicts}firewalld "
+  fi
+  if [ -d /opt/1panel ] || systemctl list-unit-files 2>/dev/null | grep -q '^1panel'; then
+    conflicts="${conflicts}1Panel "
+  fi
+
+  printf '%s' "${conflicts% }"
 }
 
 register_sb_command(){
@@ -782,8 +859,13 @@ config_ensure_skeleton(){
   "inbounds": [],
   "outbounds": [{
     "type": "direct",
+    "tag": "direct-out",
     "domain_resolver": {"server": "local", "strategy": "ipv4_only"}
-  }]
+  }],
+  "route": {
+    "rules": [],
+    "final": "direct-out"
+  }
 }
 EOF
     return 0
@@ -791,13 +873,24 @@ EOF
 
   local tmp
   tmp=$(mktemp)
+  # 透明升级：
+  # 1) 若没 outbounds 或为空，建一条 tagged direct-out
+  # 2) 若 direct outbound 没 tag，加上 tag=direct-out
+  # 3) 确保 route 块存在，final 默认 direct-out
   if jq '
       .log = (.log // {"disabled": false, "level": "warn", "timestamp": true})
     | .dns = (.dns // {"servers": [{"type": "local", "tag": "local"}]})
     | .inbounds = (.inbounds // [])
     | .outbounds = (if ((.outbounds // []) | length) == 0
-                    then [{"type":"direct","domain_resolver":{"server":"local","strategy":"ipv4_only"}}]
-                    else .outbounds end)
+                    then [{"type":"direct","tag":"direct-out","domain_resolver":{"server":"local","strategy":"ipv4_only"}}]
+                    else (.outbounds | map(
+                        if .type == "direct" and (.tag // "") == ""
+                        then .tag = "direct-out"
+                        else . end))
+                    end)
+    | .route = (.route // {})
+    | .route.rules = (.route.rules // [])
+    | .route.final = (.route.final // "direct-out")
   ' "$CONFIG_PATH" > "$tmp" 2>/dev/null; then
     mv "$tmp" "$CONFIG_PATH"
     return 0
@@ -837,6 +930,124 @@ config_remove_inbound_by_tag(){
     return 1
   fi
   mv "$tmp" "$CONFIG_PATH"
+}
+
+config_add_outbound(){
+  local outbound="$1"
+  ensure_jq || return 1
+  config_ensure_skeleton || return 1
+  local tmp tag
+  tag=$(printf '%s' "$outbound" | jq -r '.tag // empty' 2>/dev/null)
+  if [ -z "$tag" ]; then
+    echo -e "${R}内部错误：outbound 缺少 tag${N}"
+    return 1
+  fi
+  tmp=$(mktemp)
+  if ! jq --argjson nb "$outbound" --arg tag "$tag" '
+    .outbounds = ((.outbounds // []) | map(select(.tag != $tag))) + [$nb]
+  ' "$CONFIG_PATH" > "$tmp" 2>/dev/null; then
+    rm -f "$tmp"
+    return 1
+  fi
+  mv "$tmp" "$CONFIG_PATH"
+}
+
+config_remove_outbound_by_tag(){
+  local tag="$1"
+  ensure_jq || return 1
+  [ -f "$CONFIG_PATH" ] || return 0
+  # 不允许移除 direct-out
+  if [ "$tag" = "direct-out" ]; then
+    return 0
+  fi
+  local tmp
+  tmp=$(mktemp)
+  if ! jq --arg tag "$tag" '.outbounds = ((.outbounds // []) | map(select(.tag != $tag)))' "$CONFIG_PATH" > "$tmp" 2>/dev/null; then
+    rm -f "$tmp"
+    return 1
+  fi
+  mv "$tmp" "$CONFIG_PATH"
+}
+
+# 把 inbound -> outbound 的 route 规则替换或追加
+config_set_inbound_chain(){
+  local inbound_tag="$1" outbound_tag="$2"
+  ensure_jq || return 1
+  config_ensure_skeleton || return 1
+  local tmp
+  tmp=$(mktemp)
+  if ! jq --arg ib "$inbound_tag" --arg ob "$outbound_tag" '
+    .route = (.route // {rules: [], final: "direct-out"})
+    | .route.rules = (
+        ((.route.rules // []) | map(
+          if (.inbound // []) | type == "array" and (. | index($ib))
+          then empty else . end
+        ))
+        + [{inbound: [$ib], outbound: $ob}]
+      )
+  ' "$CONFIG_PATH" > "$tmp" 2>/dev/null; then
+    rm -f "$tmp"
+    return 1
+  fi
+  mv "$tmp" "$CONFIG_PATH"
+}
+
+# 删除某 inbound 对应的所有 route 规则（恢复到走 final=direct-out）
+config_remove_inbound_chain(){
+  local inbound_tag="$1"
+  ensure_jq || return 1
+  [ -f "$CONFIG_PATH" ] || return 0
+  local tmp
+  tmp=$(mktemp)
+  if ! jq --arg ib "$inbound_tag" '
+    .route = (.route // {rules: [], final: "direct-out"})
+    | .route.rules = (
+        (.route.rules // []) | map(
+          if ((.inbound // []) | type == "array" and (. | index($ib)))
+          then empty else . end
+        )
+      )
+  ' "$CONFIG_PATH" > "$tmp" 2>/dev/null; then
+    rm -f "$tmp"
+    return 1
+  fi
+  mv "$tmp" "$CONFIG_PATH"
+}
+
+# 查询某 inbound 当前的出站 tag（没规则返回空）
+config_get_inbound_outbound(){
+  local inbound_tag="$1"
+  ensure_jq || return 1
+  [ -f "$CONFIG_PATH" ] || return 1
+  jq -r --arg ib "$inbound_tag" '
+    (.route.rules // [])
+    | map(select((.inbound // []) | type == "array" and (. | index($ib))))
+    | (.[0].outbound // "")
+  ' "$CONFIG_PATH" 2>/dev/null
+}
+
+# ─── chain.info 存储 ─────────────────────────────────
+ensure_chains_dir(){
+  mkdir -p "$CHAINS_DIR" 2>/dev/null || true
+}
+
+chain_info_path(){
+  printf '%s' "$CHAINS_DIR/$1.info"
+}
+
+chain_installed(){
+  [ -f "$(chain_info_path "$1")" ]
+}
+
+get_chain_value(){
+  local type="$1" key="$2" f
+  f=$(chain_info_path "$type")
+  [ -f "$f" ] || return 1
+  grep -m1 "^${key}=" "$f" | cut -d= -f2-
+}
+
+remove_chain_info(){
+  rm -f "$(chain_info_path "$1")"
 }
 
 config_check_and_restart(){
@@ -1050,7 +1261,7 @@ build_reality_link(){
 }
 
 build_hy2_link(){
-  # build_hy2_link <password> <ip> <port> <sni> <insecure 0|1> <obfs_type|""> <obfs_password|""> <tag>
+  # build_hy2_link <password> <ip> <port> <sni> <insecure 0|1> <obfs_type|""> <obfs_password|""> <tag> [hop_start] [hop_end]
   local password="$1"
   local ip="$2"
   local port="$3"
@@ -1059,6 +1270,8 @@ build_hy2_link(){
   local obfs_type="$6"
   local obfs_password="$7"
   local tag="${8:-hy2}"
+  local hop_start="${9:-}"
+  local hop_end="${10:-}"
 
   if [ -z "$password" ] || [ -z "$ip" ] || [ -z "$port" ]; then
     return 1
@@ -1070,8 +1283,246 @@ build_hy2_link(){
   if [ -n "$obfs_type" ]; then
     query="${query}&obfs=${obfs_type}&obfs-password=${obfs_password}"
   fi
-  printf 'hysteria2://%s@%s:%s?%s#%s\n' \
-    "$password" "$host" "$port" "$query" "$tag"
+
+  local server_part
+  if [ -n "$hop_start" ] && [ -n "$hop_end" ]; then
+    server_part="${host}:${port},${hop_start}-${hop_end}"
+  else
+    server_part="${host}:${port}"
+  fi
+  printf 'hysteria2://%s@%s?%s#%s\n' \
+    "$password" "$server_part" "$query" "$tag"
+}
+
+# ─── 链接解析（中转机用） ───────────────────────────
+url_decode(){
+  local data="${1//+/ }"
+  printf '%b' "${data//%/\\x}"
+}
+
+# 把 URL query 串拆成 KEY=VALUE 行（已 url-decode）
+parse_query_string(){
+  local q="$1" pair k v
+  IFS='&' read -ra pairs <<<"$q"
+  for pair in "${pairs[@]}"; do
+    k="${pair%%=*}"
+    v="${pair#*=}"
+    [ -z "$k" ] && continue
+    printf '%s=%s\n' "$k" "$(url_decode "$v")"
+  done
+}
+
+# 输入：vless:// 或 hysteria2:// 链接
+# 输出：KEY=VALUE 行（Type / Host / Port / Tag 是通用字段，其余协议特有）
+parse_node_link(){
+  local url="$1"
+  if [ -z "$url" ]; then return 1; fi
+
+  local proto rest userinfo hostport query frag host port
+  case "$url" in
+    vless://*)
+      proto="vless"
+      rest="${url#vless://}"
+      ;;
+    hysteria2://*)
+      proto="hy2"
+      rest="${url#hysteria2://}"
+      ;;
+    hy2://*)
+      proto="hy2"
+      rest="${url#hy2://}"
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+
+  # 拆 #fragment
+  if [[ "$rest" == *"#"* ]]; then
+    frag="${rest#*#}"
+    rest="${rest%%#*}"
+    frag=$(url_decode "$frag")
+  fi
+  # 拆 ?query
+  if [[ "$rest" == *"?"* ]]; then
+    query="${rest#*?}"
+    rest="${rest%%\?*}"
+  fi
+  # 拆 user@host:port
+  if [[ "$rest" == *"@"* ]]; then
+    userinfo="${rest%@*}"
+    hostport="${rest##*@}"
+    userinfo=$(url_decode "$userinfo")
+  else
+    hostport="$rest"
+  fi
+  # 拆 host:port，IPv6 用 [host]:port
+  case "$hostport" in
+    \[*\]:*)
+      host="${hostport#\[}"
+      host="${host%%\]:*}"
+      port="${hostport##*\]:}"
+      ;;
+    *:*)
+      host="${hostport%:*}"
+      port="${hostport##*:}"
+      ;;
+    *)
+      host="$hostport"
+      port=""
+      ;;
+  esac
+
+  if [ -z "$host" ] || [ -z "$port" ]; then
+    return 1
+  fi
+  if ! [[ "$port" =~ ^[0-9]+$ ]]; then
+    return 1
+  fi
+
+  # 通用输出
+  printf 'Tag=%s\n' "${frag:-target}"
+  printf 'Host=%s\n' "$host"
+  printf 'Port=%s\n' "$port"
+
+  if [ "$proto" = "vless" ]; then
+    printf 'Type=reality\n'
+    printf 'UUID=%s\n' "$userinfo"
+    # 解析 query
+    local kv
+    while IFS= read -r kv; do
+      [ -z "$kv" ] && continue
+      local k="${kv%%=*}" v="${kv#*=}"
+      case "$k" in
+        sni)        printf 'SNI=%s\n' "$v" ;;
+        pbk)        printf 'PublicKey=%s\n' "$v" ;;
+        sid)        printf 'ShortID=%s\n' "$v" ;;
+        flow)       printf 'Flow=%s\n' "$v" ;;
+        security)   printf 'Security=%s\n' "$v" ;;
+        type)       printf 'Network=%s\n' "$v" ;;
+        fp)         printf 'Fingerprint=%s\n' "$v" ;;
+      esac
+    done < <(parse_query_string "${query:-}")
+  else
+    printf 'Type=hy2\n'
+    printf 'Password=%s\n' "$userinfo"
+    local kv
+    while IFS= read -r kv; do
+      [ -z "$kv" ] && continue
+      local k="${kv%%=*}" v="${kv#*=}"
+      case "$k" in
+        sni)            printf 'SNI=%s\n' "$v" ;;
+        insecure)       printf 'Insecure=%s\n' "$v" ;;
+        obfs)           printf 'Obfs=%s\n' "$v" ;;
+        obfs-password)  printf 'ObfsPassword=%s\n' "$v" ;;
+      esac
+    done < <(parse_query_string "${query:-}")
+  fi
+
+  return 0
+}
+
+# 用解析出的字段（KEY=VALUE 行）+ 期望的 outbound tag，组装一个 sing-box outbound 对象 (JSON)。
+# 用法：build_chain_outbound_from_link <link> <outbound_tag>
+build_chain_outbound_from_link(){
+  local link="$1" outbound_tag="$2"
+  local fields type host port sni
+  fields=$(parse_node_link "$link") || return 1
+
+  type=$(printf '%s\n' "$fields" | sed -n 's/^Type=//p' | head -1)
+  host=$(printf '%s\n' "$fields" | sed -n 's/^Host=//p' | head -1)
+  port=$(printf '%s\n' "$fields" | sed -n 's/^Port=//p' | head -1)
+  sni=$(printf '%s\n' "$fields" | sed -n 's/^SNI=//p' | head -1)
+
+  if [ -z "$type" ] || [ -z "$host" ] || [ -z "$port" ]; then
+    return 1
+  fi
+
+  ensure_jq || return 1
+
+  case "$type" in
+    reality)
+      local uuid pubk sid flow
+      uuid=$(printf '%s\n' "$fields" | sed -n 's/^UUID=//p' | head -1)
+      pubk=$(printf '%s\n' "$fields" | sed -n 's/^PublicKey=//p' | head -1)
+      sid=$(printf '%s\n' "$fields" | sed -n 's/^ShortID=//p' | head -1)
+      flow=$(printf '%s\n' "$fields" | sed -n 's/^Flow=//p' | head -1)
+      flow="${flow:-xtls-rprx-vision}"
+      if [ -z "$uuid" ] || [ -z "$pubk" ] || [ -z "$sid" ] || [ -z "$sni" ]; then
+        return 1
+      fi
+      jq -n \
+        --arg tag "$outbound_tag" \
+        --arg server "$host" \
+        --argjson port "$port" \
+        --arg uuid "$uuid" \
+        --arg flow "$flow" \
+        --arg sni "$sni" \
+        --arg pbk "$pubk" \
+        --arg sid "$sid" '
+        {
+          type: "vless",
+          tag: $tag,
+          server: $server,
+          server_port: $port,
+          uuid: $uuid,
+          flow: $flow,
+          domain_strategy: "ipv4_only",
+          tls: {
+            enabled: true,
+            server_name: $sni,
+            utls: {enabled: true, fingerprint: "chrome"},
+            reality: {
+              enabled: true,
+              public_key: $pbk,
+              short_id: $sid
+            }
+          }
+        }'
+      ;;
+    hy2)
+      local password insecure obfs obfs_pw
+      password=$(printf '%s\n' "$fields" | sed -n 's/^Password=//p' | head -1)
+      insecure=$(printf '%s\n' "$fields" | sed -n 's/^Insecure=//p' | head -1)
+      insecure="${insecure:-0}"
+      obfs=$(printf '%s\n' "$fields" | sed -n 's/^Obfs=//p' | head -1)
+      obfs_pw=$(printf '%s\n' "$fields" | sed -n 's/^ObfsPassword=//p' | head -1)
+      if [ -z "$password" ] || [ -z "$sni" ]; then
+        return 1
+      fi
+      local insecure_bool="false"
+      [ "$insecure" = "1" ] && insecure_bool="true"
+      local obfs_json="null"
+      if [ -n "$obfs" ] && [ "$obfs" != "none" ] && [ -n "$obfs_pw" ]; then
+        obfs_json=$(jq -n --arg t "$obfs" --arg p "$obfs_pw" '{type: $t, password: $p}')
+      fi
+      jq -n \
+        --arg tag "$outbound_tag" \
+        --arg server "$host" \
+        --argjson port "$port" \
+        --arg password "$password" \
+        --arg sni "$sni" \
+        --argjson insecure "$insecure_bool" \
+        --argjson obfs "$obfs_json" '
+        ({
+          type: "hysteria2",
+          tag: $tag,
+          server: $server,
+          server_port: $port,
+          password: $password,
+          domain_strategy: "ipv4_only",
+          tls: {
+            enabled: true,
+            server_name: $sni,
+            insecure: $insecure,
+            alpn: ["h3"]
+          }
+        }) + (if $obfs == null then {} else {obfs: $obfs} end)'
+      ;;
+    *)
+      return 1
+      ;;
+  esac
 }
 
 # 由节点 info 文件构造链接（dispatcher）
@@ -1097,13 +1548,18 @@ build_link_for_node(){
       build_reality_link "$uuid" "$ip" "$port" "$sni" "$pubk" "$sid" "$tag"
       ;;
     hy2)
-      local password insecure obfs_type obfs_pw
+      local password insecure obfs_type obfs_pw hop_enabled hop_start hop_end
       password=$(get_node_value "$type" Password 2>/dev/null || true)
       insecure=$(get_node_value "$type" Insecure 2>/dev/null || echo 0)
       obfs_type=$(get_node_value "$type" Obfs 2>/dev/null || true)
       [ "$obfs_type" = "none" ] && obfs_type=""
       obfs_pw=$(get_node_value "$type" ObfsPassword 2>/dev/null || true)
-      build_hy2_link "$password" "$ip" "$port" "$sni" "$insecure" "$obfs_type" "$obfs_pw" "$tag"
+      hop_enabled=$(get_node_value "$type" PortHop 2>/dev/null || echo 0)
+      if [ "$hop_enabled" = "1" ]; then
+        hop_start=$(get_node_value "$type" PortHopStart 2>/dev/null || true)
+        hop_end=$(get_node_value "$type" PortHopEnd 2>/dev/null || true)
+      fi
+      build_hy2_link "$password" "$ip" "$port" "$sni" "$insecure" "$obfs_type" "$obfs_pw" "$tag" "${hop_start:-}" "${hop_end:-}"
       ;;
     *)
       return 1
@@ -1163,13 +1619,13 @@ show_status_menu(){
   while true; do
     render_section_header "查看状态"
     render_menu_item 1 "查看运行状态"
-    render_menu_item 2 "实时日志"
-    render_menu_item 3 "重启服务"
-    render_menu_item 4 "停止服务"
-    render_menu_item 5 "启动服务"
-    render_menu_item 6 "查看客户端链接"
-    render_menu_item 7 "节点二维码"
-    render_menu_item 8 "修改节点参数"
+    render_menu_item 2 "修改节点参数"
+    render_menu_item 3 "实时日志"
+    render_menu_item 4 "重启服务"
+    render_menu_item 5 "停止服务"
+    render_menu_item 6 "启动服务"
+    render_menu_item 7 "查看客户端链接"
+    render_menu_item 8 "节点二维码"
     render_menu_item 9 "查看配置"
     render_menu_item 10 "编辑配置"
     render_menu_item 11 "清理配置备份"
@@ -1183,10 +1639,13 @@ show_status_menu(){
         pause_screen
         ;;
       2)
+        modify_node_params
+        ;;
+      3)
         echo -e "${Y}按 Ctrl+C 退出日志${N}"
         journalctl -u sing-box -f || true
         ;;
-      3)
+      4)
         if systemctl restart sing-box; then
           echo -e "${G}服务已重启${N}"
         else
@@ -1194,7 +1653,7 @@ show_status_menu(){
         fi
         sleep 1
         ;;
-      4)
+      5)
         if systemctl stop sing-box; then
           echo -e "${Y}服务已停止${N}"
         else
@@ -1202,7 +1661,7 @@ show_status_menu(){
         fi
         sleep 1
         ;;
-      5)
+      6)
         if systemctl start sing-box; then
           echo -e "${G}服务已启动${N}"
         else
@@ -1210,14 +1669,11 @@ show_status_menu(){
         fi
         sleep 1
         ;;
-      6)
+      7)
         show_client_link
         ;;
-      7)
-        show_qrcode
-        ;;
       8)
-        modify_node_params
+        show_qrcode
         ;;
       9)
         view_singbox_config
@@ -1319,32 +1775,6 @@ show_admin_menu(){
         ;;
       6)
         configure_passwordless_sudo
-        ;;
-      0)
-        return
-        ;;
-      *)
-        notify_invalid_choice
-        ;;
-    esac
-  done
-}
-
-show_external_services_menu(){
-  while true; do
-    render_section_header "外部服务"
-    render_menu_item 1 "安装 1Panel"
-    render_menu_item 2 "NodeQuality 测评"
-    render_menu_item 0 "返回上级"
-    render_divider
-    read -p "  请输入序号: " choice
-
-    case $choice in
-      1)
-        install_1panel
-        ;;
-      2)
-        run_nodequality_benchmark
         ;;
       0)
         return
@@ -1491,6 +1921,9 @@ ip6_init_firewall(){
   echo "    9) OUTPUT 保持 ACCEPT"
   echo "   10) FORWARD 不动 (留给 Docker)"
   echo ""
+  echo -e "  ${D}注意：节点端口（Reality TCP / Hysteria2 UDP）不在此初始化范围内，${N}"
+  echo -e "  ${D}      请在初始化完成后到本菜单 ${C}4) 开放端口${N} ${D}里手动放行。${N}"
+  echo ""
 
   if ip6_check_current_ssh_v6; then
     echo -e "  ${R}${B}警告：你当前 SSH 是 IPv6 进来的${N}"
@@ -1581,11 +2014,29 @@ ip6_open_port(){
 }
 
 ip6_close_port(){
-  local port ssh_port confirm proto removed=0
+  local proto_choice protos="" port ssh_port confirm proto removed=0
 
   echo ""
   echo -e "  ${B}${C}关闭端口${N}"
   render_divider
+  render_menu_item 1 "TCP"
+  render_menu_item 2 "UDP"
+  render_menu_item 3 "TCP + UDP (都关)"
+  render_menu_item 0 "返回"
+  render_divider
+  read -p "  选择协议: " proto_choice
+
+  case "$proto_choice" in
+    1) protos="tcp" ;;
+    2) protos="udp" ;;
+    3) protos="tcp udp" ;;
+    0) return 0 ;;
+    *)
+      notify_invalid_choice
+      return 0
+      ;;
+  esac
+
   read -p "  要关闭的端口号 (1-65535): " port
 
   if ! validate_port "$port"; then
@@ -1595,9 +2046,9 @@ ip6_close_port(){
   fi
 
   ssh_port=$(ip6_detect_ssh_port)
-  if [ "$port" = "$ssh_port" ]; then
+  if [ "$port" = "$ssh_port" ] && printf '%s' "$protos" | grep -qw tcp; then
     echo ""
-    echo -e "  ${R}${B}警告：${port} 是当前 SSH 端口${N}"
+    echo -e "  ${R}${B}警告：${port}/tcp 是当前 SSH 端口${N}"
     echo -e "  ${Y}关闭后将无法通过 IPv6 SSH（IPv4 不受影响）${N}"
     read -p "  确认继续？(y/N): " confirm
     if [ "$confirm" != "y" ] && [ "$confirm" != "Y" ]; then
@@ -1607,7 +2058,7 @@ ip6_close_port(){
     fi
   fi
 
-  for proto in tcp udp; do
+  for proto in $protos; do
     while ip6tables -C INPUT -p "$proto" --dport "$port" -j ACCEPT 2>/dev/null; do
       ip6tables -D INPUT -p "$proto" --dport "$port" -j ACCEPT
       echo -e "  ${G}已删除 ${port}/${proto}${N}"
@@ -1616,7 +2067,7 @@ ip6_close_port(){
   done
 
   if [ "$removed" -eq 0 ]; then
-    echo -e "  ${Y}端口 ${port} 没有放行规则${N}"
+    echo -e "  ${Y}端口 ${port} 在所选协议下没有放行规则${N}"
   else
     if ! ip6_save_rules; then
       echo -e "${Y}持久化失败${N}"
@@ -1659,6 +2110,575 @@ ip6_emergency_disable(){
   echo ""
   echo -e "${Y}已关闭 v6 防火墙${N}"
   pause_screen
+}
+
+# ─── IPv4 防火墙菜单 ─────────────────────────────────
+show_ipv4_firewall_menu(){
+  local ssh_port conflicts
+
+  if ! require_root; then
+    return 1
+  fi
+
+  if ! command -v iptables >/dev/null 2>&1; then
+    echo ""
+    echo -e "${R}系统未安装 iptables，无法管理 IPv4 防火墙${N}"
+    pause_screen
+    return 1
+  fi
+
+  while true; do
+    ssh_port=$(ip6_detect_ssh_port)
+    conflicts=$(ip4_detect_conflicts)
+
+    render_section_header "IPv4 防火墙管理"
+    echo -e "  ${L}│${N}  SSH 端口  ${D}·${N}  ${C}${ssh_port}${N}"
+    if [ -n "$conflicts" ]; then
+      echo -e "  ${L}│${N}  ${R}${B}冲突警告${N}  ${D}·${N}  ${Y}检测到 ${C}${conflicts}${N}${Y} 在管理 IPv4 防火墙${N}"
+      echo -e "  ${L}│${N}  ${D}            本菜单直接改 iptables，可能与上述工具冲突或被覆盖${N}"
+    fi
+    echo -e "  ${L}│${N}  说明      ${D}·${N}  ${D}本菜单只动 IPv4，不影响 IPv6 / Docker FORWARD${N}"
+    render_divider
+    render_menu_item 1 "查看当前规则"
+    render_menu_item 2 "查看监听 IPv4 的服务"
+    render_menu_item 3 "一键初始化 (放行 SSH/80/443)"
+    render_menu_item 4 "开放端口"
+    render_menu_item 5 "关闭端口"
+    render_menu_item 6 "紧急放行 (关闭 v4 防火墙)"
+    render_menu_item 0 "返回上级"
+    render_divider
+    read -p "  请输入序号: " choice
+
+    case $choice in
+      1) ip4_view_rules ;;
+      2) ip4_view_listening ;;
+      3) ip4_init_firewall ;;
+      4) ip4_open_port ;;
+      5) ip4_close_port ;;
+      6) ip4_emergency_disable ;;
+      0) return ;;
+      *) notify_invalid_choice ;;
+    esac
+  done
+}
+
+ip4_view_rules(){
+  local input_policy output_policy forward_policy opened
+
+  input_policy=$(ip4_get_input_policy)
+  output_policy=$(iptables -L OUTPUT -n 2>/dev/null | head -n1 | awk '{print $4}')
+  forward_policy=$(iptables -L FORWARD -n 2>/dev/null | head -n1 | awk '{print $4}')
+
+  echo ""
+  echo -e "  ${B}${C}默认策略${N}"
+  echo -e "  INPUT   : ${C}${input_policy}${N}  ${D}(别人主动连你)${N}"
+  echo -e "  OUTPUT  : ${C}${output_policy}${N}  ${D}(你主动出去连别人)${N}"
+  echo -e "  FORWARD : ${C}${forward_policy}${N}  ${D}(转发, Docker 用, 脚本不动)${N}"
+  echo ""
+
+  echo -e "  ${B}${C}已开放的入站端口${N}"
+  opened=$(iptables-save 2>/dev/null | awk '
+    /^-A INPUT/ {
+      proto=""; port=""
+      for (i = 1; i <= NF; i++) {
+        if ($i == "-p") proto = $(i + 1)
+        if ($i == "--dport") port = $(i + 1)
+      }
+      if (port != "") printf "  %s  %s\n", toupper(proto), port
+    }' | sort -u)
+
+  if [ -z "$opened" ]; then
+    echo -e "  ${D}(无)${N}"
+  else
+    echo "$opened"
+  fi
+  echo ""
+
+  echo -e "  ${B}${C}完整 INPUT 规则${N}"
+  iptables -L INPUT -n -v --line-numbers
+  pause_screen
+}
+
+ip4_view_listening(){
+  echo ""
+  echo -e "  ${B}${C}监听 IPv4 的服务${N}"
+  render_divider
+  echo -e "  ${Y}TCP${N}"
+  if ! ss -4tlnp 2>/dev/null; then
+    echo -e "  ${R}ss 不可用${N}"
+  fi
+  echo ""
+  echo -e "  ${Y}UDP${N}"
+  if ! ss -4ulnp 2>/dev/null; then
+    echo -e "  ${R}ss 不可用${N}"
+  fi
+  echo ""
+  echo -e "  ${D}提示：监听 0.0.0.0 表示接受所有 IPv4 客户端${N}"
+  pause_screen
+}
+
+ip4_init_firewall(){
+  local ssh_port confirm conflicts
+
+  ssh_port=$(ip6_detect_ssh_port)
+  conflicts=$(ip4_detect_conflicts)
+
+  echo ""
+  echo -e "  ${B}${C}一键初始化${N}"
+  render_divider
+  echo "  本次会执行："
+  echo "    1) 清空当前 IPv4 INPUT 规则"
+  echo "    2) 放行回环 lo"
+  echo "    3) 放行已建立的连接 (ESTABLISHED, RELATED)"
+  echo "    4) 放行 ICMP (ping 等必需)"
+  echo -e "    5) 放行 SSH 端口: ${C}${ssh_port}${N}/tcp  ${D}(自动检测，错了就锁库！)${N}"
+  echo "    6) 放行 80/tcp"
+  echo "    7) 放行 443/tcp"
+  echo "    8) INPUT 默认策略 = DROP"
+  echo "    9) OUTPUT 保持 ACCEPT"
+  echo "   10) FORWARD 不动 (留给 Docker)"
+  echo ""
+  echo -e "  ${D}注意：节点端口（Reality TCP / Hysteria2 UDP）不在此初始化范围内，${N}"
+  echo -e "  ${D}      请在初始化完成后到本菜单 ${C}4) 开放端口${N} ${D}里手动放行。${N}"
+  echo ""
+
+  if [ -n "$conflicts" ]; then
+    echo -e "  ${R}${B}警告：检测到 ${conflicts} 在管理防火墙${N}"
+    echo -e "  ${Y}继续可能与上述工具冲突或被覆盖。如果你用 1Panel / ufw / firewalld 管 IPv4，${N}"
+    echo -e "  ${Y}建议在那边管，本菜单留给纯 iptables 用户。${N}"
+    echo ""
+  fi
+
+  if ip4_check_current_ssh_v4; then
+    echo -e "  ${R}${B}重要：你当前 SSH 是 IPv4 进来的${N}"
+    echo -e "  ${R}${B}如果上面检测的 SSH 端口 ${ssh_port} 不对，应用规则后你会立刻断开${N}"
+    echo -e "  ${Y}请先单独开个新会话测试 ssh root@<本机IP> -p ${ssh_port} 能不能连上${N}"
+    echo ""
+  fi
+
+  read -p "  确认继续？(y/N): " confirm
+  if [ "$confirm" != "y" ] && [ "$confirm" != "Y" ]; then
+    echo -e "  已取消"
+    sleep 1
+    return 0
+  fi
+
+  if ! ip6_ensure_persistence; then
+    echo ""
+    echo -e "${R}持久化工具安装失败${N}"
+    pause_screen
+    return 1
+  fi
+
+  iptables -F INPUT
+  iptables -A INPUT -i lo -j ACCEPT
+  iptables -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+  iptables -A INPUT -p icmp -j ACCEPT
+  iptables -A INPUT -p tcp --dport "$ssh_port" -j ACCEPT
+  iptables -A INPUT -p tcp --dport 80 -j ACCEPT
+  iptables -A INPUT -p tcp --dport 443 -j ACCEPT
+  iptables -P INPUT DROP
+  iptables -P OUTPUT ACCEPT
+
+  if ! ip4_save_rules; then
+    echo -e "${Y}规则已生效，但持久化失败，重启后可能丢失${N}"
+  fi
+
+  echo ""
+  echo -e "${G}IPv4 防火墙已启用${N}"
+  pause_screen
+}
+
+ip4_open_port(){
+  local proto_choice protos="" port proto changed=0
+
+  echo ""
+  echo -e "  ${B}${C}开放端口${N}"
+  render_divider
+  render_menu_item 1 "TCP"
+  render_menu_item 2 "UDP"
+  render_menu_item 3 "TCP + UDP (都开)"
+  render_menu_item 0 "返回"
+  render_divider
+  read -p "  选择协议: " proto_choice
+
+  case "$proto_choice" in
+    1) protos="tcp" ;;
+    2) protos="udp" ;;
+    3) protos="tcp udp" ;;
+    0) return 0 ;;
+    *)
+      notify_invalid_choice
+      return 0
+      ;;
+  esac
+
+  read -p "  端口号 (1-65535): " port
+  if ! validate_port "$port"; then
+    echo -e "${R}端口必须是 1-65535 的数字${N}"
+    pause_screen
+    return 1
+  fi
+
+  for proto in $protos; do
+    if iptables -C INPUT -p "$proto" --dport "$port" -j ACCEPT 2>/dev/null; then
+      echo -e "  ${Y}${port}/${proto} 已放行，跳过${N}"
+    else
+      iptables -A INPUT -p "$proto" --dport "$port" -j ACCEPT
+      echo -e "  ${G}已放行 ${port}/${proto}${N}"
+      changed=1
+    fi
+  done
+
+  if [ "$changed" -eq 1 ]; then
+    if ! ip4_save_rules; then
+      echo -e "${Y}持久化失败${N}"
+    fi
+  fi
+  pause_screen
+}
+
+ip4_close_port(){
+  local proto_choice protos="" port ssh_port confirm proto removed=0
+
+  echo ""
+  echo -e "  ${B}${C}关闭端口${N}"
+  render_divider
+  render_menu_item 1 "TCP"
+  render_menu_item 2 "UDP"
+  render_menu_item 3 "TCP + UDP (都关)"
+  render_menu_item 0 "返回"
+  render_divider
+  read -p "  选择协议: " proto_choice
+
+  case "$proto_choice" in
+    1) protos="tcp" ;;
+    2) protos="udp" ;;
+    3) protos="tcp udp" ;;
+    0) return 0 ;;
+    *)
+      notify_invalid_choice
+      return 0
+      ;;
+  esac
+
+  read -p "  要关闭的端口号 (1-65535): " port
+
+  if ! validate_port "$port"; then
+    echo -e "${R}端口必须是 1-65535 的数字${N}"
+    pause_screen
+    return 1
+  fi
+
+  ssh_port=$(ip6_detect_ssh_port)
+  if [ "$port" = "$ssh_port" ] && printf '%s' "$protos" | grep -qw tcp; then
+    echo ""
+    echo -e "  ${R}${B}严重警告：${port}/tcp 是当前 SSH 端口${N}"
+    echo -e "  ${R}${B}关闭后你的 IPv4 SSH 会立刻断开${N}"
+    read -p "  确认继续？输入大写 YES 才继续: " confirm
+    if [ "$confirm" != "YES" ]; then
+      echo -e "  已取消"
+      sleep 1
+      return 0
+    fi
+  fi
+
+  for proto in $protos; do
+    while iptables -C INPUT -p "$proto" --dport "$port" -j ACCEPT 2>/dev/null; do
+      iptables -D INPUT -p "$proto" --dport "$port" -j ACCEPT
+      echo -e "  ${G}已删除 ${port}/${proto}${N}"
+      removed=$((removed + 1))
+    done
+  done
+
+  if [ "$removed" -eq 0 ]; then
+    echo -e "  ${Y}端口 ${port} 在所选协议下没有放行规则${N}"
+  else
+    if ! ip4_save_rules; then
+      echo -e "${Y}持久化失败${N}"
+    fi
+  fi
+  pause_screen
+}
+
+ip4_emergency_disable(){
+  local confirm confirm2
+
+  echo ""
+  echo -e "  ${R}${B}紧急放行（关闭 v4 防火墙）${N}"
+  render_divider
+  echo "  执行后："
+  echo "    - 清空所有 IPv4 INPUT 规则"
+  echo "    - 默认策略改回 ACCEPT"
+  echo "    - v4 入站回到完全裸奔状态"
+  echo ""
+
+  read -p "  确认？(y/N): " confirm
+  if [ "$confirm" != "y" ] && [ "$confirm" != "Y" ]; then
+    echo -e "  已取消"
+    sleep 1
+    return 0
+  fi
+  read -p "  再次确认（输入大写 YES 继续）: " confirm2
+  if [ "$confirm2" != "YES" ]; then
+    echo -e "  已取消"
+    sleep 1
+    return 0
+  fi
+
+  iptables -P INPUT ACCEPT
+  iptables -F INPUT
+  if ! ip4_save_rules; then
+    echo -e "${Y}持久化失败${N}"
+  fi
+
+  echo ""
+  echo -e "${Y}已关闭 v4 防火墙（INPUT=ACCEPT 且规则清空）${N}"
+  pause_screen
+}
+
+# ─── Docker 管理（轻量补充，深度管理请用 1Panel） ────
+require_docker(){
+  if ! command -v docker >/dev/null 2>&1; then
+    echo ""
+    echo -e "${R}Docker 未安装${N}"
+    echo -e "${D}建议通过 1Panel 或官方脚本安装：${C}bash <(curl -fsSL https://get.docker.com)${N}"
+    pause_screen
+    return 1
+  fi
+  if ! docker info >/dev/null 2>&1; then
+    echo ""
+    echo -e "${R}Docker 守护进程未运行${N}"
+    echo -e "${D}尝试：${C}systemctl start docker${N}"
+    pause_screen
+    return 1
+  fi
+  return 0
+}
+
+# 选一个容器（含已停止），将容器 ID 输出到 stdout，UI 输出到 stderr
+select_docker_container(){
+  local prompt_label="${1:-请选择容器}"
+  local rows=()
+  local row id name status image input
+
+  while IFS= read -r row; do
+    [ -n "$row" ] && rows+=("$row")
+  done < <(docker ps -a --format '{{.ID}}'$'\t''{{.Names}}'$'\t''{{.Status}}'$'\t''{{.Image}}' 2>/dev/null)
+
+  if [ ${#rows[@]} -eq 0 ]; then
+    echo "" >&2
+    echo -e "  ${Y}没有任何容器${N}" >&2
+    return 1
+  fi
+
+  {
+    echo ""
+    echo -e "  ${B}${C}${prompt_label}${N}"
+    printf "    %-3s  %-12s  %-22s  %-26s  %s\n" "#" "ID" "NAME" "STATUS" "IMAGE"
+    local i=1 r
+    for r in "${rows[@]}"; do
+      IFS=$'\t' read -r id name status image <<<"$r"
+      printf "    %-3s  %-12s  %-22s  %-26s  %s\n" "$i" "${id:0:12}" "${name:0:22}" "${status:0:26}" "$image"
+      i=$((i + 1))
+    done
+  } >&2
+
+  read -p "  序号 (0=取消): " input >&2
+  if [ -z "$input" ] || [ "$input" = "0" ]; then
+    return 1
+  fi
+  if ! [[ "$input" =~ ^[0-9]+$ ]] || [ "$input" -lt 1 ] || [ "$input" -gt ${#rows[@]} ]; then
+    echo -e "${R}序号无效${N}" >&2
+    return 1
+  fi
+  IFS=$'\t' read -r id _ _ _ <<<"${rows[$((input - 1))]}"
+  printf '%s' "$id"
+  return 0
+}
+
+docker_list_containers(){
+  if ! require_docker; then return 1; fi
+  echo ""
+  echo -e "  ${B}${C}容器列表（含已停止）${N}"
+  render_divider
+  docker ps -a --format 'table {{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}' || true
+  pause_screen
+}
+
+docker_show_stats(){
+  if ! require_docker; then return 1; fi
+  echo ""
+  echo -e "${Y}按 Ctrl+C 退出实时监控${N}"
+  echo ""
+  docker stats || true
+}
+
+docker_show_disk(){
+  if ! require_docker; then return 1; fi
+  echo ""
+  echo -e "  ${B}${C}Docker 磁盘占用${N}"
+  render_divider
+  docker system df -v 2>/dev/null || docker system df || true
+  pause_screen
+}
+
+docker_prune(){
+  local confirm
+  if ! require_docker; then return 1; fi
+
+  echo ""
+  echo -e "  ${B}${C}清理无用资源${N}"
+  render_divider
+  echo "  执行 ${C}docker system prune -f${N} 后会清理："
+  echo "    - 已停止的容器"
+  echo "    - 没有任何容器使用的网络"
+  echo "    - 悬空 (dangling) 镜像"
+  echo "    - 构建缓存"
+  echo ""
+  echo -e "  ${D}不会清理：数据卷、运行中的容器、有 tag 的未使用镜像${N}"
+  echo ""
+  echo -e "${Y}当前占用：${N}"
+  docker system df 2>/dev/null || true
+  echo ""
+  read -p "  确认清理？(y/N): " confirm
+  if [ "$confirm" != "y" ] && [ "$confirm" != "Y" ]; then
+    echo -e "  已取消"
+    sleep 1
+    return 0
+  fi
+  docker system prune -f || true
+  pause_screen
+}
+
+docker_operate_container(){
+  local id name status choice
+
+  if ! require_docker; then return 1; fi
+
+  id=$(select_docker_container "选择要操作的容器") || return 0
+  if [ -z "$id" ]; then
+    return 0
+  fi
+
+  while true; do
+    name=$(docker inspect -f '{{.Name}}' "$id" 2>/dev/null | sed 's|^/||')
+    status=$(docker inspect -f '{{.State.Status}}' "$id" 2>/dev/null)
+
+    if [ -z "$name" ]; then
+      echo -e "${R}容器已不存在${N}"
+      pause_screen
+      return 0
+    fi
+
+    render_section_header "容器操作"
+    echo -e "  ${L}│${N}  容器  ${D}·${N}  ${C}${name}${N}  ${D}(${id:0:12})${N}"
+    echo -e "  ${L}│${N}  状态  ${D}·${N}  ${C}${status}${N}"
+    render_divider
+    render_menu_item 1 "查看实时日志 (tail -f)"
+    render_menu_item 2 "重启"
+    render_menu_item 3 "停止"
+    render_menu_item 4 "启动"
+    render_menu_item 5 "进入容器 shell"
+    render_menu_item 0 "返回"
+    render_divider
+    read -p "  请输入序号: " choice
+    case "$choice" in
+      1)
+        echo ""
+        echo -e "${Y}按 Ctrl+C 退出日志${N}"
+        echo ""
+        docker logs -f --tail 200 "$id" 2>&1 || true
+        ;;
+      2)
+        if docker restart "$id" >/dev/null 2>&1; then
+          echo -e "${G}已重启${N}"
+        else
+          echo -e "${R}重启失败${N}"
+        fi
+        sleep 1
+        ;;
+      3)
+        if docker stop "$id" >/dev/null 2>&1; then
+          echo -e "${G}已停止${N}"
+        else
+          echo -e "${R}停止失败${N}"
+        fi
+        sleep 1
+        ;;
+      4)
+        if docker start "$id" >/dev/null 2>&1; then
+          echo -e "${G}已启动${N}"
+        else
+          echo -e "${R}启动失败${N}"
+        fi
+        sleep 1
+        ;;
+      5)
+        echo ""
+        echo -e "${Y}进入容器，输入 ${C}exit${Y} 退出${N}"
+        echo ""
+        if ! docker exec -it "$id" /bin/bash 2>/dev/null; then
+          if ! docker exec -it "$id" /bin/sh; then
+            echo -e "${R}进入失败（容器内可能没有 sh / bash，或容器未运行）${N}"
+            pause_screen
+          fi
+        fi
+        ;;
+      0) return ;;
+      *) notify_invalid_choice ;;
+    esac
+  done
+}
+
+show_docker_menu(){
+  if ! require_root; then return 1; fi
+
+  while true; do
+    local docker_ver running_count total_count
+    if command -v docker >/dev/null 2>&1; then
+      docker_ver=$(docker --version 2>/dev/null | awk '{print $3}' | tr -d ',')
+      if docker info >/dev/null 2>&1; then
+        running_count=$(docker ps -q 2>/dev/null | wc -l | tr -d ' ')
+        total_count=$(docker ps -aq 2>/dev/null | wc -l | tr -d ' ')
+      else
+        running_count=""
+        total_count=""
+      fi
+    else
+      docker_ver=""
+    fi
+
+    render_section_header "Docker 管理"
+    if [ -z "$docker_ver" ]; then
+      echo -e "  ${L}│${N}  Docker  ${D}·${N}  ${Y}未安装${N}"
+      echo -e "  ${L}│${N}  ${D}            建议用 1Panel 安装 Docker，本菜单仅作日常补充${N}"
+    elif [ -z "$running_count" ]; then
+      echo -e "  ${L}│${N}  Docker  ${D}·${N}  ${C}v${docker_ver}${N}  ${R}(守护进程未运行)${N}"
+    else
+      echo -e "  ${L}│${N}  Docker  ${D}·${N}  ${C}v${docker_ver}${N}"
+      echo -e "  ${L}│${N}  容器    ${D}·${N}  ${G}${running_count}${N} 运行中 / ${C}${total_count}${N} 总计"
+    fi
+    echo -e "  ${L}│${N}  说明    ${D}·${N}  ${D}轻量补充，深度管理请用 1Panel${N}"
+    render_divider
+    render_menu_item 1 "容器列表"
+    render_menu_item 2 "实时资源 (docker stats)"
+    render_menu_item 3 "容器操作 (日志/重启/停止/启动/进入)"
+    render_menu_item 4 "磁盘占用 (docker system df)"
+    render_menu_item 5 "清理无用资源 (docker system prune)"
+    render_menu_item 0 "返回上级"
+    render_divider
+    read -p "  请输入序号: " choice
+    case "$choice" in
+      1) docker_list_containers ;;
+      2) docker_show_stats ;;
+      3) docker_operate_container ;;
+      4) docker_show_disk ;;
+      5) docker_prune ;;
+      0) return ;;
+      *) notify_invalid_choice ;;
+    esac
+  done
 }
 
 create_regular_user(){
@@ -2193,10 +3213,16 @@ render_node_detail(){
       echo -e "  SNI       : ${C}${sni:-未知}${N}"
       ;;
     hy2)
-      local pwd_v cert_src obfs_t
+      local pwd_v cert_src obfs_t up_v down_v hop_v hop_mode_v hop_start_v hop_end_v
       pwd_v=$(get_node_value "$type" Password 2>/dev/null || true)
       cert_src=$(get_node_value "$type" CertSource 2>/dev/null || true)
       obfs_t=$(get_node_value "$type" Obfs 2>/dev/null || echo none)
+      up_v=$(get_node_value "$type" UpMbps 2>/dev/null || true)
+      down_v=$(get_node_value "$type" DownMbps 2>/dev/null || true)
+      hop_v=$(get_node_value "$type" PortHop 2>/dev/null || echo 0)
+      hop_mode_v=$(get_node_value "$type" PortHopMode 2>/dev/null || true)
+      hop_start_v=$(get_node_value "$type" PortHopStart 2>/dev/null || true)
+      hop_end_v=$(get_node_value "$type" PortHopEnd 2>/dev/null || true)
       echo -e "  类型      : ${C}Hysteria2${N}  Tag : ${C}${tag}${N}"
       echo -e "  Password  : ${C}${pwd_v:-未知}${N}"
       echo -e "  证书      : ${C}${cert_src:-未知}${N}"
@@ -2205,6 +3231,16 @@ render_node_detail(){
       echo -e "  IP        : ${C}${ip:-未知}${N}"
       echo -e "  端口      : ${C}${port:-未知}${N} ${D}(UDP)${N}"
       echo -e "  SNI       : ${C}${sni:-未知}${N}"
+      if [ -n "$up_v" ] && [ -n "$down_v" ]; then
+        echo -e "  带宽限制  : ${C}上 ${up_v} / 下 ${down_v} Mbps${N}"
+      else
+        echo -e "  带宽限制  : ${Y}未限制${N} ${D}(建议设置)${N}"
+      fi
+      if [ "$hop_v" = "1" ] && [ -n "$hop_start_v" ] && [ -n "$hop_end_v" ]; then
+        echo -e "  端口跳跃  : ${C}${hop_start_v}-${hop_end_v}${N} ${D}(${hop_mode_v} 模式)${N}"
+      else
+        echo -e "  端口跳跃  : ${D}未启用${N}"
+      fi
       ;;
   esac
 }
@@ -2405,7 +3441,8 @@ modify_reality_params(){
   ipv6_new_link=$(build_dualstack_ipv6_link_for_node reality 2>/dev/null || true)
   [ -n "$new_link" ] && set_node_value reality Link "$new_link"
   if [ -n "$new_port" ] && [ "$new_port" != "$cur_port" ]; then
-    allow_port_in_firewall "$new_port" tcp
+    print_firewall_hint "$new_port" tcp "Reality 节点新端口"
+    echo -e "  ${D}旧端口 ${cur_port}/tcp 如已不再使用，请自行回收（参见上述路径反向操作）${N}"
   fi
   cleanup_old_backups "${CONFIG_PATH}.bak.*" 5
 
@@ -2996,41 +4033,6 @@ remove_swap(){
   pause_screen
 }
 
-run_external_script_and_exit(){
-  local label="$1"
-  local url="$2"
-
-  echo ""
-  echo -e "${Y}==> 当前 ${APP_NAME} 菜单将退出，并交给 ${label} 脚本...${N}"
-  exec bash -c '
-    label="$1"
-    url="$2"
-    tmp_script=$(mktemp)
-    trap '\''rm -f "$tmp_script"'\'' EXIT
-
-    echo "==> 下载 ${label} 脚本..."
-    if ! curl -fsSL "$url" -o "$tmp_script"; then
-      echo "${label} 脚本下载失败"
-      exit 1
-    fi
-
-    echo "==> 开始执行 ${label}..."
-    bash "$tmp_script"
-  ' _ "$label" "$url"
-
-  echo -e "${R}${label} 脚本启动失败${N}"
-  pause_screen
-  return 1
-}
-
-install_1panel(){
-  run_external_script_and_exit "1Panel 安装" "$ONEPANEL_INSTALL_URL"
-}
-
-run_nodequality_benchmark(){
-  run_external_script_and_exit "NodeQuality 测评" "$NODEQUALITY_RUN_URL"
-}
-
 # ─── 脚本自更新 / 配置管理 ────────────────────────────
 get_latest_singbox_version(){
   local ver=""
@@ -3432,7 +4434,7 @@ install_reality_node(){
     return 1
   fi
 
-  allow_port_in_firewall "$PORT" tcp
+  print_firewall_hint "$PORT" tcp "Reality 节点入站"
 
   link=$(build_reality_link "$UUID" "$access_ip" "$PORT" "$SNI" "$public_key" "$SHORT_ID" "$TAG" 2>/dev/null || true)
   if [ "$install_mode" = "dualstack" ] && [ -n "$public_ipv6" ] && [ "$public_ipv6" != "$access_ip" ]; then
@@ -3531,7 +4533,10 @@ uninstall_reality_node(){
     return 0
   fi
   config_remove_inbound_by_tag "reality-in" || true
+  config_remove_inbound_chain "reality-in" || true
+  config_remove_outbound_by_tag "chain-reality-out" || true
   remove_node_info reality
+  remove_chain_info reality
   post_uninstall_service_step
   echo -e "${G}Reality 节点已卸载${N}"
   pause_screen
@@ -3539,6 +4544,180 @@ uninstall_reality_node(){
 
 # 兼容入口：do_install 默认创建 Reality 节点
 do_install(){ install_reality_node; }
+
+# ─── 端口跳跃公共逻辑 ─────────────────────────────────
+PORT_HOP_NAT_CHAIN="LEYILI_HOP_NAT"
+PORT_HOP_RANGE_SIZE=999
+
+port_hop_compute_range(){
+  local port="$1" start end above below
+  above=$((65535 - port))
+  if [ "$port" -gt 1024 ]; then
+    below=$((port - 1024))
+  else
+    below=0
+  fi
+  # 优先放主端口上方；上方不够就放下方；都不够则选空间大的一侧
+  if [ "$above" -ge "$PORT_HOP_RANGE_SIZE" ]; then
+    start=$((port + 1))
+    end=$((port + PORT_HOP_RANGE_SIZE))
+  elif [ "$below" -ge "$PORT_HOP_RANGE_SIZE" ]; then
+    end=$((port - 1))
+    start=$((end - PORT_HOP_RANGE_SIZE))
+  elif [ "$above" -ge "$below" ] && [ "$above" -ge 50 ]; then
+    start=$((port + 1))
+    end=65535
+  elif [ "$below" -ge 50 ]; then
+    end=$((port - 1))
+    start=1024
+  else
+    # 极端情况（不会发生：port 在 1024 以内），仍输出可用范围
+    start=$((port + 1))
+    end=65535
+  fi
+  printf '%s %s' "$start" "$end"
+}
+
+port_hop_check_range_free(){
+  local start="$1" end="$2"
+  ss -ulnH 2>/dev/null | awk -v s="$start" -v e="$end" '
+    {n=split($4,a,":"); p=a[n]+0;
+     if (p>=s && p<=e) {found=1; exit}}
+    END {exit !found}'
+}
+
+port_hop_list_conflicts(){
+  local start="$1" end="$2"
+  ss -ulnH 2>/dev/null | awk -v s="$start" -v e="$end" '
+    {n=split($4,a,":"); p=a[n]+0;
+     if (p>=s && p<=e) print "  · 端口 " p " → " $NF}'
+}
+
+port_hop_apply_v4(){
+  local port="$1" start="$2" end="$3" listen="$4"
+  iptables -t nat -N "$PORT_HOP_NAT_CHAIN" 2>/dev/null || true
+  iptables -t nat -F "$PORT_HOP_NAT_CHAIN"
+  if [ -z "$listen" ] || [ "$listen" = "0.0.0.0" ]; then
+    iptables -t nat -A "$PORT_HOP_NAT_CHAIN" -p udp \
+      --dport "${start}:${end}" -j REDIRECT --to-ports "$port"
+  else
+    iptables -t nat -A "$PORT_HOP_NAT_CHAIN" -p udp \
+      --dport "${start}:${end}" -j DNAT --to-destination "${listen}:${port}"
+  fi
+  iptables -t nat -C PREROUTING -j "$PORT_HOP_NAT_CHAIN" 2>/dev/null \
+    || iptables -t nat -I PREROUTING 1 -j "$PORT_HOP_NAT_CHAIN"
+  iptables -C INPUT -p udp --dport "${start}:${end}" -j ACCEPT 2>/dev/null \
+    || iptables -A INPUT -p udp --dport "${start}:${end}" -j ACCEPT
+}
+
+port_hop_apply_v6(){
+  local port="$1" start="$2" end="$3" listen="$4"
+  if ! command -v ip6tables >/dev/null 2>&1; then
+    return 0
+  fi
+  ip6tables -t nat -N "$PORT_HOP_NAT_CHAIN" 2>/dev/null || true
+  ip6tables -t nat -F "$PORT_HOP_NAT_CHAIN"
+  if [ -z "$listen" ] || [ "$listen" = "::" ]; then
+    ip6tables -t nat -A "$PORT_HOP_NAT_CHAIN" -p udp \
+      --dport "${start}:${end}" -j REDIRECT --to-ports "$port"
+  else
+    ip6tables -t nat -A "$PORT_HOP_NAT_CHAIN" -p udp \
+      --dport "${start}:${end}" -j DNAT --to-destination "[${listen}]:${port}"
+  fi
+  ip6tables -t nat -C PREROUTING -j "$PORT_HOP_NAT_CHAIN" 2>/dev/null \
+    || ip6tables -t nat -I PREROUTING 1 -j "$PORT_HOP_NAT_CHAIN"
+  ip6tables -C INPUT -p udp --dport "${start}:${end}" -j ACCEPT 2>/dev/null \
+    || ip6tables -A INPUT -p udp --dport "${start}:${end}" -j ACCEPT
+}
+
+port_hop_remove_v4(){
+  local start="$1" end="$2"
+  iptables -t nat -F "$PORT_HOP_NAT_CHAIN" 2>/dev/null || true
+  iptables -t nat -D PREROUTING -j "$PORT_HOP_NAT_CHAIN" 2>/dev/null || true
+  iptables -t nat -X "$PORT_HOP_NAT_CHAIN" 2>/dev/null || true
+  while iptables -C INPUT -p udp --dport "${start}:${end}" -j ACCEPT 2>/dev/null; do
+    iptables -D INPUT -p udp --dport "${start}:${end}" -j ACCEPT
+  done
+}
+
+port_hop_remove_v6(){
+  local start="$1" end="$2"
+  if ! command -v ip6tables >/dev/null 2>&1; then
+    return 0
+  fi
+  ip6tables -t nat -F "$PORT_HOP_NAT_CHAIN" 2>/dev/null || true
+  ip6tables -t nat -D PREROUTING -j "$PORT_HOP_NAT_CHAIN" 2>/dev/null || true
+  ip6tables -t nat -X "$PORT_HOP_NAT_CHAIN" 2>/dev/null || true
+  while ip6tables -C INPUT -p udp --dport "${start}:${end}" -j ACCEPT 2>/dev/null; do
+    ip6tables -D INPUT -p udp --dport "${start}:${end}" -j ACCEPT
+  done
+}
+
+port_hop_apply(){
+  local port="$1" start="$2" end="$3" mode="$4"
+  local listen_v4="$5" listen_v6="$6"
+  case "$mode" in
+    ipv4)              port_hop_apply_v4 "$port" "$start" "$end" "$listen_v4" ;;
+    dualstack)         port_hop_apply_v4 "$port" "$start" "$end" "$listen_v4"
+                       port_hop_apply_v6 "$port" "$start" "$end" "$listen_v6" ;;
+    ipv6-in-ipv4-out)  port_hop_apply_v6 "$port" "$start" "$end" "$listen_v6" ;;
+  esac
+  case "$(detect_firewall_backend)" in
+    ufw)
+      ufw allow "${start}:${end}/udp" >/dev/null 2>&1 || true
+      ;;
+    firewalld)
+      firewall-cmd --permanent --add-port="${start}-${end}/udp" >/dev/null 2>&1 || true
+      firewall-cmd --reload >/dev/null 2>&1 || true
+      ;;
+  esac
+  ip4_save_rules >/dev/null 2>&1 || true
+  ip6_save_rules >/dev/null 2>&1 || true
+}
+
+port_hop_remove(){
+  local start="$1" end="$2" mode="$3"
+  case "$mode" in
+    ipv4|dualstack)              port_hop_remove_v4 "$start" "$end" ;;
+  esac
+  case "$mode" in
+    dualstack|ipv6-in-ipv4-out)  port_hop_remove_v6 "$start" "$end" ;;
+  esac
+  case "$(detect_firewall_backend)" in
+    ufw)
+      ufw delete allow "${start}:${end}/udp" >/dev/null 2>&1 || true
+      ;;
+    firewalld)
+      firewall-cmd --permanent --remove-port="${start}-${end}/udp" >/dev/null 2>&1 || true
+      firewall-cmd --reload >/dev/null 2>&1 || true
+      ;;
+  esac
+  ip4_save_rules >/dev/null 2>&1 || true
+  ip6_save_rules >/dev/null 2>&1 || true
+}
+
+port_hop_cleanup_all(){
+  iptables -t nat -F "$PORT_HOP_NAT_CHAIN" 2>/dev/null || true
+  iptables -t nat -D PREROUTING -j "$PORT_HOP_NAT_CHAIN" 2>/dev/null || true
+  iptables -t nat -X "$PORT_HOP_NAT_CHAIN" 2>/dev/null || true
+  if command -v ip6tables >/dev/null 2>&1; then
+    ip6tables -t nat -F "$PORT_HOP_NAT_CHAIN" 2>/dev/null || true
+    ip6tables -t nat -D PREROUTING -j "$PORT_HOP_NAT_CHAIN" 2>/dev/null || true
+    ip6tables -t nat -X "$PORT_HOP_NAT_CHAIN" 2>/dev/null || true
+  fi
+}
+
+# 根据 install_mode 推导端口跳跃所需的 v4 / v6 监听地址
+port_hop_listen_addrs_for_mode(){
+  local mode="$1" public_ipv6="$2"
+  local listen_v4="" listen_v6=""
+  case "$mode" in
+    ipv4)             listen_v4="0.0.0.0" ;;
+    dualstack)        listen_v4="0.0.0.0"; listen_v6="::" ;;
+    ipv6-in-ipv4-out) listen_v6="$public_ipv6" ;;
+  esac
+  printf '%s|%s' "$listen_v4" "$listen_v6"
+}
 
 # ─── Hysteria2 节点 ────────────────────────────────────
 generate_hy2_random_port(){
@@ -3586,6 +4765,10 @@ install_hy2_node(){
   local public_ipv4="" public_ipv6="" access_ip=""
   local link="" ipv6_link="" mode_label="" confirm
   local cert_paths cert_path key_path
+  local up_mbps=100 down_mbps=300 bw_choice
+  local hop_choice HOP_ENABLE=0 HOP_MODE="" HOP_START="" HOP_END=""
+  local range_input confirm_hop confirm_small force_hop
+  local listen_v4="" listen_v6=""
 
   if ! require_root; then return 1; fi
 
@@ -3685,6 +4868,87 @@ install_hy2_node(){
     *) obfs_enable=1 ;;
   esac
 
+  # 带宽限制（防 HY2 跑满线路被云厂商盯）
+  echo ""
+  echo -e "  ${B}带宽限制${N}（防 HY2 跑满线路被云厂商盯，不影响日常使用）："
+  echo "    1) 保守    上 30  / 下 80  Mbps  - 小机器 / 共享带宽限速重的"
+  echo "    2) 推荐    上 100 / 下 300 Mbps  - 99% 情况，闭眼选（默认）"
+  echo "    3) 大带宽  上 300 / 下 800 Mbps  - 测速过、确认有大带宽"
+  echo "    4) 自定义"
+  echo "    5) 不限制（不推荐，可能触发云厂商告警）"
+  read -p "  请选择 (2): " bw_choice
+  case "$bw_choice" in
+    1) up_mbps=30;  down_mbps=80 ;;
+    3) up_mbps=300; down_mbps=800 ;;
+    4)
+      while true; do
+        read -p "  上行 Mbps (正整数): " up_mbps
+        if [ -n "$up_mbps" ] && [ "$up_mbps" -gt 0 ] 2>/dev/null; then break; fi
+        echo -e "${R}必须为正整数${N}"
+      done
+      while true; do
+        read -p "  下行 Mbps (正整数): " down_mbps
+        if [ -n "$down_mbps" ] && [ "$down_mbps" -gt 0 ] 2>/dev/null; then break; fi
+        echo -e "${R}必须为正整数${N}"
+      done
+      ;;
+    5) up_mbps=0; down_mbps=0 ;;
+    *) up_mbps=100; down_mbps=300 ;;
+  esac
+
+  # 端口跳跃（进阶选项）
+  echo ""
+  echo -e "  ${B}端口跳跃${N} (port hopping) — 进阶选项："
+  echo -e "    ${D}作用：客户端在多个端口间随机跳跃，封一个端口没用，对抗成本提升 100 倍${N}"
+  echo -e "    ${D}代价：消耗大量端口，部分云厂商可能告警，可能与 Docker / 其他服务冲突${N}"
+  echo "    1) 不启用（默认，推荐小白）"
+  echo "    2) 启用 - 自动选择范围（主端口 +1 到 +999）"
+  echo "    3) 启用 - 自定义范围（避开 Docker / 其他服务）"
+  read -p "  请选择 (1): " hop_choice
+  case "$hop_choice" in
+    2)
+      HOP_ENABLE=1
+      HOP_MODE="auto"
+      read HOP_START HOP_END < <(port_hop_compute_range "$PORT")
+      echo -e "  自动选择：${C}${HOP_START}-${HOP_END}${N} ${D}（共 $((HOP_END-HOP_START+1)) 个端口）${N}"
+      echo -e "  ${Y}注意：会自动配置 iptables NAT 规则并占用整个范围${N}"
+      read -p "  确认启用？(y/N): " confirm_hop
+      if [ "$confirm_hop" != "y" ] && [ "$confirm_hop" != "Y" ]; then
+        HOP_ENABLE=0; HOP_MODE=""; HOP_START=""; HOP_END=""
+      fi
+      ;;
+    3)
+      HOP_ENABLE=1
+      HOP_MODE="custom"
+      echo -e "  ${D}建议范围至少 100 个端口，越大抗封效果越好${N}"
+      echo -e "  ${D}格式示例：30000-31000  (含两端，共 1001 个端口)${N}"
+      echo -e "  ${D}建议避开：22 (SSH)、80/443 (Web)、Docker 已用端口${N}"
+      while true; do
+        read -p "  端口范围 (起始-结束): " range_input
+        HOP_START=$(echo "$range_input" | awk -F- '{print $1}' | tr -dc '0-9')
+        HOP_END=$(echo "$range_input" | awk -F- '{print $2}' | tr -dc '0-9')
+        if [ -z "$HOP_START" ] || [ -z "$HOP_END" ]; then
+          echo -e "  ${R}格式错误，请按 起始-结束 格式输入${N}"; continue
+        fi
+        if [ "$HOP_START" -lt 1024 ] || [ "$HOP_END" -gt 65535 ]; then
+          echo -e "  ${R}端口必须在 1024-65535 之间${N}"; continue
+        fi
+        if [ "$HOP_START" -ge "$HOP_END" ]; then
+          echo -e "  ${R}起始端口必须小于结束端口${N}"; continue
+        fi
+        if [ "$PORT" -ge "$HOP_START" ] && [ "$PORT" -le "$HOP_END" ]; then
+          echo -e "  ${R}范围不能包含主端口 $PORT${N}"; continue
+        fi
+        if [ $((HOP_END - HOP_START)) -lt 50 ]; then
+          echo -e "  ${Y}警告：范围只有 $((HOP_END-HOP_START+1)) 个端口，抗封效果有限${N}"
+          read -p "  仍然使用？(y/N): " confirm_small
+          if [ "$confirm_small" != "y" ] && [ "$confirm_small" != "Y" ]; then continue; fi
+        fi
+        break
+      done
+      ;;
+  esac
+
   if ! is_singbox_installed; then
     echo ""
     echo -e "${Y}==> 安装 sing-box...${N}"
@@ -3762,11 +5026,21 @@ install_hy2_node(){
     obfs_json=$(jq -n --arg pw "$obfs_password" '{type: "salamander", password: $pw}')
   fi
 
+  # 构造 user 对象（带宽 > 0 时附带 up_mbps/down_mbps，否则省略字段）
+  local user_obj
+  if [ "$up_mbps" -gt 0 ] && [ "$down_mbps" -gt 0 ]; then
+    user_obj=$(jq -n --arg pw "$password" \
+      --argjson up "$up_mbps" --argjson down "$down_mbps" \
+      '{password: $pw, up_mbps: $up, down_mbps: $down}')
+  else
+    user_obj=$(jq -n --arg pw "$password" '{password: $pw}')
+  fi
+
   local inbound_json
   inbound_json=$(jq -n \
     --arg listen "$LISTEN_ADDR" \
     --argjson port "$PORT" \
-    --arg pw "$password" \
+    --argjson user "$user_obj" \
     --argjson tls "$tls_json" \
     --argjson obfs "$obfs_json" '
     {
@@ -3774,7 +5048,7 @@ install_hy2_node(){
       tag: "hy2-in",
       listen: $listen,
       listen_port: $port,
-      users: [{password: $pw}],
+      users: [$user],
       tls: $tls
     } + (if $obfs == null then {} else {obfs: $obfs} end)')
 
@@ -3792,9 +5066,34 @@ install_hy2_node(){
     return 1
   fi
 
-  allow_port_in_firewall "$PORT" udp
+  # 应用端口跳跃规则（启用时）
+  if [ "$HOP_ENABLE" = "1" ]; then
+    if port_hop_check_range_free "$HOP_START" "$HOP_END"; then
+      echo ""
+      echo -e "${Y}端口范围 ${HOP_START}-${HOP_END} 内已有其他 UDP 服务监听：${N}"
+      port_hop_list_conflicts "$HOP_START" "$HOP_END"
+      read -p "  仍然继续？冲突端口可能被 NAT 规则覆盖 (y/N): " force_hop
+      if [ "$force_hop" != "y" ] && [ "$force_hop" != "Y" ]; then
+        HOP_ENABLE=0; HOP_MODE=""; HOP_START=""; HOP_END=""
+        echo -e "  ${Y}已取消端口跳跃${N}"
+      fi
+    fi
+    if [ "$HOP_ENABLE" = "1" ]; then
+      local addrs_pair
+      addrs_pair=$(port_hop_listen_addrs_for_mode "$install_mode" "$public_ipv6")
+      listen_v4="${addrs_pair%|*}"
+      listen_v6="${addrs_pair#*|}"
+      port_hop_apply "$PORT" "$HOP_START" "$HOP_END" "$install_mode" "$listen_v4" "$listen_v6"
+      echo -e "  ${G}端口跳跃已启用：${HOP_START}-${HOP_END} (UDP)${N}"
+    fi
+  fi
+
+  print_firewall_hint "$PORT" udp "Hysteria2 节点入站"
+  if [ "$HOP_ENABLE" = "1" ]; then
+    echo -e "  ${D}端口跳跃范围 ${HOP_START}-${HOP_END}/udp 已自动放行${N}"
+  fi
   if [ "$cert_source" = "acme" ]; then
-    allow_port_in_firewall 80 tcp
+    print_firewall_hint 80 tcp "ACME 证书签发与续期，签发期间必须可外部访问"
   fi
 
   local insecure="0"
@@ -3802,13 +5101,14 @@ install_hy2_node(){
   local link_obfs_type=""
   [ "$obfs_enable" = "1" ] && link_obfs_type="salamander"
 
-  link=$(build_hy2_link "$password" "$access_ip" "$PORT" "$SNI" "$insecure" "$link_obfs_type" "${obfs_password:-}" "$TAG" 2>/dev/null || true)
+  link=$(build_hy2_link "$password" "$access_ip" "$PORT" "$SNI" "$insecure" "$link_obfs_type" "${obfs_password:-}" "$TAG" "$HOP_START" "$HOP_END" 2>/dev/null || true)
   if [ "$install_mode" = "dualstack" ] && [ -n "$public_ipv6" ] && [ "$public_ipv6" != "$access_ip" ]; then
-    ipv6_link=$(build_hy2_link "$password" "$public_ipv6" "$PORT" "$SNI" "$insecure" "$link_obfs_type" "${obfs_password:-}" "${TAG}-ipv6" 2>/dev/null || true)
+    ipv6_link=$(build_hy2_link "$password" "$public_ipv6" "$PORT" "$SNI" "$insecure" "$link_obfs_type" "${obfs_password:-}" "${TAG}-ipv6" "$HOP_START" "$HOP_END" 2>/dev/null || true)
   fi
 
   ensure_nodes_dir
-  cat > "$(node_info_path hy2)" <<EOF
+  {
+    cat <<EOF
 Type=hy2
 Tag=$TAG
 Mode=$install_mode
@@ -3824,8 +5124,19 @@ Obfs=${link_obfs_type:-none}
 ObfsPassword=${obfs_password:-}
 Insecure=$insecure
 IP=$access_ip
-Link=$link
 EOF
+    if [ "$up_mbps" -gt 0 ] && [ "$down_mbps" -gt 0 ]; then
+      echo "UpMbps=$up_mbps"
+      echo "DownMbps=$down_mbps"
+    fi
+    if [ "$HOP_ENABLE" = "1" ]; then
+      echo "PortHop=1"
+      echo "PortHopMode=$HOP_MODE"
+      echo "PortHopStart=$HOP_START"
+      echo "PortHopEnd=$HOP_END"
+    fi
+    echo "Link=$link"
+  } > "$(node_info_path hy2)"
 
   register_sb_command || true
 
@@ -3841,6 +5152,16 @@ EOF
   echo -e "  Password  : ${C}$password${N}"
   if [ "$obfs_enable" = "1" ]; then
     echo -e "  Obfs      : ${C}salamander${N}  ObfsPwd : ${C}$obfs_password${N}"
+  fi
+  if [ "$up_mbps" -gt 0 ] && [ "$down_mbps" -gt 0 ]; then
+    echo -e "  带宽限制  : ${C}上 ${up_mbps} / 下 ${down_mbps} Mbps${N}"
+  else
+    echo -e "  带宽限制  : ${Y}未限制${N} ${D}(可能触发云厂商告警)${N}"
+  fi
+  if [ "$HOP_ENABLE" = "1" ]; then
+    echo -e "  端口跳跃  : ${C}${HOP_START}-${HOP_END}${N} ${D}($HOP_MODE 模式, $((HOP_END-HOP_START+1)) 端口)${N}"
+  else
+    echo -e "  端口跳跃  : ${D}未启用${N}"
   fi
   echo -e "  出站策略  : ${C}仅 IPv4${N}"
   echo ""
@@ -3872,8 +5193,25 @@ uninstall_hy2_node(){
     echo -e "  已取消"
     return 0
   fi
+
+  # 清理端口跳跃规则（必须在 remove_node_info 之前，否则读不到 info）
+  local hop_enabled hop_start hop_end mode
+  hop_enabled=$(get_node_value hy2 PortHop 2>/dev/null || echo 0)
+  if [ "$hop_enabled" = "1" ]; then
+    hop_start=$(get_node_value hy2 PortHopStart 2>/dev/null || true)
+    hop_end=$(get_node_value hy2 PortHopEnd 2>/dev/null || true)
+    mode=$(get_node_value hy2 Mode 2>/dev/null || echo ipv4)
+    if [ -n "$hop_start" ] && [ -n "$hop_end" ]; then
+      port_hop_remove "$hop_start" "$hop_end" "$mode"
+      echo -e "  ${D}端口跳跃规则已清理 (${hop_start}-${hop_end})${N}"
+    fi
+  fi
+
   config_remove_inbound_by_tag "hy2-in" || true
+  config_remove_inbound_chain "hy2-in" || true
+  config_remove_outbound_by_tag "chain-hy2-out" || true
   remove_node_info hy2
+  remove_chain_info hy2
   rm -f "$CERTS_DIR/hy2.crt" "$CERTS_DIR/hy2.key" 2>/dev/null || true
   post_uninstall_service_step
   echo -e "${G}Hysteria2 节点已卸载${N}"
@@ -3883,8 +5221,12 @@ uninstall_hy2_node(){
 modify_hy2_params(){
   local new_port="" new_sni="" regen_pw="n"
   local cur_port cur_sni cur_pw cur_obfs cur_obfs_pw cur_cert_src cur_email
+  local cur_up cur_down cur_hop cur_hop_mode cur_hop_start cur_hop_end cur_mode
   local new_pw="" new_obfs_pw=""
   local backup_path="" confirm
+  local bw_choice bw_action="keep" new_up=0 new_down=0
+  local hop_choice new_hop=0 new_hop_mode="" new_hop_start="" new_hop_end=""
+  local range_input confirm_small
 
   if ! require_root; then return 1; fi
   if ! require_singbox_installed; then return 1; fi
@@ -3908,6 +5250,13 @@ modify_hy2_params(){
   cur_obfs_pw=$(get_node_value hy2 ObfsPassword 2>/dev/null || true)
   cur_cert_src=$(get_node_value hy2 CertSource 2>/dev/null || echo self)
   cur_email=$(get_node_value hy2 ACMEEmail 2>/dev/null || true)
+  cur_up=$(get_node_value hy2 UpMbps 2>/dev/null || true)
+  cur_down=$(get_node_value hy2 DownMbps 2>/dev/null || true)
+  cur_hop=$(get_node_value hy2 PortHop 2>/dev/null || echo 0)
+  cur_hop_mode=$(get_node_value hy2 PortHopMode 2>/dev/null || true)
+  cur_hop_start=$(get_node_value hy2 PortHopStart 2>/dev/null || true)
+  cur_hop_end=$(get_node_value hy2 PortHopEnd 2>/dev/null || true)
+  cur_mode=$(get_node_value hy2 Mode 2>/dev/null || echo ipv4)
 
   echo ""
   echo -e "  ${B}${C}修改 Hysteria2 节点参数${N}  ${D}直接回车保留当前值${N}"
@@ -3942,8 +5291,140 @@ modify_hy2_params(){
     fi
   fi
 
+  # 带宽限制修改
+  echo ""
+  if [ -n "$cur_up" ] && [ -n "$cur_down" ]; then
+    echo -e "  ${B}带宽限制${N} (当前: 上 ${C}${cur_up}${N} / 下 ${C}${cur_down}${N} Mbps)："
+  else
+    echo -e "  ${B}带宽限制${N} (当前: ${Y}未限制${N})："
+  fi
+  echo "    1) 保留当前设置（默认）"
+  echo "    2) 保守    上 30  / 下 80  Mbps"
+  echo "    3) 推荐    上 100 / 下 300 Mbps"
+  echo "    4) 大带宽  上 300 / 下 800 Mbps"
+  echo "    5) 自定义"
+  echo "    6) 取消限制"
+  read -p "  请选择 (1): " bw_choice
+  case "$bw_choice" in
+    2) bw_action="set"; new_up=30;  new_down=80 ;;
+    3) bw_action="set"; new_up=100; new_down=300 ;;
+    4) bw_action="set"; new_up=300; new_down=800 ;;
+    5)
+      bw_action="set"
+      while true; do
+        read -p "  上行 Mbps (正整数): " new_up
+        if [ -n "$new_up" ] && [ "$new_up" -gt 0 ] 2>/dev/null; then break; fi
+        echo -e "${R}必须为正整数${N}"
+      done
+      while true; do
+        read -p "  下行 Mbps (正整数): " new_down
+        if [ -n "$new_down" ] && [ "$new_down" -gt 0 ] 2>/dev/null; then break; fi
+        echo -e "${R}必须为正整数${N}"
+      done
+      ;;
+    6) bw_action="unset" ;;
+    *) bw_action="keep" ;;
+  esac
+
+  # 端口跳跃修改
+  echo ""
+  if [ "$cur_hop" = "1" ]; then
+    echo -e "  ${B}端口跳跃${N} (当前: ${C}${cur_hop_start}-${cur_hop_end}${N} / ${cur_hop_mode} 模式)："
+  else
+    echo -e "  ${B}端口跳跃${N} (当前: ${Y}未启用${N})："
+  fi
+  echo "    1) 保留当前设置（默认）"
+  echo "    2) 切换/启用 自动范围（基于新主端口）"
+  echo "    3) 切换/启用 自定义范围"
+  echo "    4) 关闭端口跳跃"
+  read -p "  请选择 (1): " hop_choice
+  case "$hop_choice" in
+    2)
+      new_hop=1
+      new_hop_mode="auto"
+      read new_hop_start new_hop_end < <(port_hop_compute_range "$new_port")
+      echo -e "  自动选择：${C}${new_hop_start}-${new_hop_end}${N}"
+      ;;
+    3)
+      new_hop=1
+      new_hop_mode="custom"
+      echo -e "  ${D}格式：起始-结束（如 30000-31000），范围不能含主端口 ${new_port}${N}"
+      while true; do
+        read -p "  端口范围 (起始-结束): " range_input
+        new_hop_start=$(echo "$range_input" | awk -F- '{print $1}' | tr -dc '0-9')
+        new_hop_end=$(echo "$range_input" | awk -F- '{print $2}' | tr -dc '0-9')
+        if [ -z "$new_hop_start" ] || [ -z "$new_hop_end" ]; then
+          echo -e "  ${R}格式错误${N}"; continue
+        fi
+        if [ "$new_hop_start" -lt 1024 ] || [ "$new_hop_end" -gt 65535 ]; then
+          echo -e "  ${R}端口必须在 1024-65535 之间${N}"; continue
+        fi
+        if [ "$new_hop_start" -ge "$new_hop_end" ]; then
+          echo -e "  ${R}起始端口必须小于结束端口${N}"; continue
+        fi
+        if [ "$new_port" -ge "$new_hop_start" ] && [ "$new_port" -le "$new_hop_end" ]; then
+          echo -e "  ${R}范围不能包含主端口 $new_port${N}"; continue
+        fi
+        if [ $((new_hop_end - new_hop_start)) -lt 50 ]; then
+          echo -e "  ${Y}警告：范围只有 $((new_hop_end-new_hop_start+1)) 个端口${N}"
+          read -p "  仍然使用？(y/N): " confirm_small
+          if [ "$confirm_small" != "y" ] && [ "$confirm_small" != "Y" ]; then continue; fi
+        fi
+        break
+      done
+      ;;
+    4)
+      new_hop=0
+      new_hop_mode=""
+      new_hop_start=""
+      new_hop_end=""
+      ;;
+    *)
+      # 保留当前设置：若主端口变了且原模式是 auto，则按新端口重算
+      new_hop="$cur_hop"
+      new_hop_mode="$cur_hop_mode"
+      new_hop_start="$cur_hop_start"
+      new_hop_end="$cur_hop_end"
+      if [ "$cur_hop" = "1" ] && [ "$new_port" != "$cur_port" ]; then
+        if [ "$cur_hop_mode" = "auto" ]; then
+          read new_hop_start new_hop_end < <(port_hop_compute_range "$new_port")
+          echo -e "  ${D}主端口已变，自动范围重算为 ${new_hop_start}-${new_hop_end}${N}"
+        else
+          # 自定义模式下主端口变了，校验老范围是否仍然合法
+          if [ "$new_port" -ge "$cur_hop_start" ] && [ "$new_port" -le "$cur_hop_end" ]; then
+            echo -e "  ${Y}新主端口落在原自定义范围内 (${cur_hop_start}-${cur_hop_end})${N}"
+            echo -e "  ${Y}请重新输入自定义范围${N}"
+            new_hop_mode="custom"
+            while true; do
+              read -p "  新端口范围 (起始-结束): " range_input
+              new_hop_start=$(echo "$range_input" | awk -F- '{print $1}' | tr -dc '0-9')
+              new_hop_end=$(echo "$range_input" | awk -F- '{print $2}' | tr -dc '0-9')
+              if [ -z "$new_hop_start" ] || [ -z "$new_hop_end" ] \
+                 || [ "$new_hop_start" -lt 1024 ] || [ "$new_hop_end" -gt 65535 ] \
+                 || [ "$new_hop_start" -ge "$new_hop_end" ] \
+                 || ([ "$new_port" -ge "$new_hop_start" ] && [ "$new_port" -le "$new_hop_end" ]); then
+                echo -e "  ${R}范围非法，请重输${N}"; continue
+              fi
+              break
+            done
+          fi
+        fi
+      fi
+      ;;
+  esac
+
   echo ""
   echo -e "  将写入：端口 ${C}$new_port${N}  SNI ${C}$new_sni${N}"
+  if [ "$bw_action" = "set" ]; then
+    echo -e "  带宽限制：${C}上 ${new_up} / 下 ${new_down} Mbps${N}"
+  elif [ "$bw_action" = "unset" ]; then
+    echo -e "  带宽限制：${Y}取消限制${N}"
+  fi
+  if [ "$new_hop" = "1" ]; then
+    echo -e "  端口跳跃：${C}${new_hop_start}-${new_hop_end}${N} (${new_hop_mode})"
+  elif [ "$cur_hop" = "1" ] && [ "$new_hop" != "1" ]; then
+    echo -e "  端口跳跃：${Y}关闭${N}"
+  fi
   read -p "  确认修改？(y/N): " confirm
   if [ "$confirm" != "y" ] && [ "$confirm" != "Y" ]; then
     echo -e "  已取消"
@@ -3975,12 +5456,18 @@ modify_hy2_params(){
        | .tls.server_name = $sni
        | (if $sni != "" and (.tls.acme | type) == "object" then .tls.acme.domain = [$sni] else . end)
        | (if $pw != "" then .users[0].password = $pw else . end)
-       | (if $opw != "" and (.obfs | type) == "object" then .obfs.password = $opw else . end))'
+       | (if $opw != "" and (.obfs | type) == "object" then .obfs.password = $opw else . end)
+       | (if $bw_action == "set"
+          then .users[0].up_mbps = ($up | tonumber) | .users[0].down_mbps = ($down | tonumber)
+          elif $bw_action == "unset"
+          then .users[0] |= del(.up_mbps, .down_mbps)
+          else . end))'
 
   local tmp_file
   tmp_file=$(mktemp)
   if ! jq --arg port "$new_port" --arg sni "$new_sni" \
        --arg pw "${new_pw:-}" --arg opw "${new_obfs_pw:-}" \
+       --arg bw_action "$bw_action" --arg up "$new_up" --arg down "$new_down" \
        "$jq_filter" "$CONFIG_PATH" > "$tmp_file"; then
     rm -f "$tmp_file"
     cp "$backup_path" "$CONFIG_PATH" 2>/dev/null || true
@@ -4005,10 +5492,58 @@ modify_hy2_params(){
     return 1
   fi
 
+  # 端口跳跃规则同步：先清旧的，再加新的
+  local need_remove_hop=0
+  if [ "$cur_hop" = "1" ] && [ -n "$cur_hop_start" ] && [ -n "$cur_hop_end" ]; then
+    # 旧的启用，且：新的禁用 / 范围变了 / 模式变了 / 主端口变了
+    if [ "$new_hop" != "1" ] \
+       || [ "$cur_hop_start" != "$new_hop_start" ] \
+       || [ "$cur_hop_end" != "$new_hop_end" ] \
+       || [ "$cur_port" != "$new_port" ]; then
+      need_remove_hop=1
+    fi
+  fi
+  if [ "$need_remove_hop" = "1" ]; then
+    port_hop_remove "$cur_hop_start" "$cur_hop_end" "$cur_mode"
+    echo -e "  ${D}旧端口跳跃规则已清理${N}"
+  fi
+  if [ "$new_hop" = "1" ] && [ -n "$new_hop_start" ] && [ -n "$new_hop_end" ]; then
+    local listen_v4="" listen_v6="" public_ipv6_now="" addrs_pair
+    public_ipv6_now=$(detect_primary_ipv6 2>/dev/null || true)
+    addrs_pair=$(port_hop_listen_addrs_for_mode "$cur_mode" "$public_ipv6_now")
+    listen_v4="${addrs_pair%|*}"
+    listen_v6="${addrs_pair#*|}"
+    port_hop_apply "$new_port" "$new_hop_start" "$new_hop_end" "$cur_mode" "$listen_v4" "$listen_v6"
+    echo -e "  ${G}新端口跳跃规则已应用：${new_hop_start}-${new_hop_end}${N}"
+  fi
+
+  # 写回 hy2.info
   set_node_value hy2 Port "$new_port"
   set_node_value hy2 SNI  "$new_sni"
   [ -n "$new_pw" ] && set_node_value hy2 Password "$new_pw"
   [ -n "$new_obfs_pw" ] && set_node_value hy2 ObfsPassword "$new_obfs_pw"
+  case "$bw_action" in
+    set)
+      set_node_value hy2 UpMbps "$new_up"
+      set_node_value hy2 DownMbps "$new_down"
+      ;;
+    unset)
+      # 清空（以空字符串覆盖；后续读取会判空）
+      set_node_value hy2 UpMbps ""
+      set_node_value hy2 DownMbps ""
+      ;;
+  esac
+  if [ "$new_hop" = "1" ]; then
+    set_node_value hy2 PortHop "1"
+    set_node_value hy2 PortHopMode "$new_hop_mode"
+    set_node_value hy2 PortHopStart "$new_hop_start"
+    set_node_value hy2 PortHopEnd "$new_hop_end"
+  else
+    set_node_value hy2 PortHop "0"
+    set_node_value hy2 PortHopMode ""
+    set_node_value hy2 PortHopStart ""
+    set_node_value hy2 PortHopEnd ""
+  fi
 
   local cur_ip cur_tag insecure obfs_type final_pw final_obfs_pw new_link ipv6_new_link
   cur_ip=$(get_node_value hy2 IP 2>/dev/null || true)
@@ -4018,11 +5553,17 @@ modify_hy2_params(){
   [ "$obfs_type" = "none" ] && obfs_type=""
   final_pw="${new_pw:-$cur_pw}"
   final_obfs_pw="${new_obfs_pw:-$cur_obfs_pw}"
-  new_link=$(build_hy2_link "$final_pw" "$cur_ip" "$new_port" "$new_sni" "$insecure" "$obfs_type" "$final_obfs_pw" "${cur_tag:-hy2}" 2>/dev/null || true)
+  local link_hop_start="" link_hop_end=""
+  if [ "$new_hop" = "1" ]; then
+    link_hop_start="$new_hop_start"
+    link_hop_end="$new_hop_end"
+  fi
+  new_link=$(build_hy2_link "$final_pw" "$cur_ip" "$new_port" "$new_sni" "$insecure" "$obfs_type" "$final_obfs_pw" "${cur_tag:-hy2}" "$link_hop_start" "$link_hop_end" 2>/dev/null || true)
   ipv6_new_link=$(build_dualstack_ipv6_link_for_node hy2 2>/dev/null || true)
   [ -n "$new_link" ] && set_node_value hy2 Link "$new_link"
   if [ -n "$new_port" ] && [ "$new_port" != "$cur_port" ]; then
-    allow_port_in_firewall "$new_port" udp
+    print_firewall_hint "$new_port" udp "Hysteria2 节点新端口"
+    echo -e "  ${D}旧端口 ${cur_port}/udp 如已不再使用，请自行回收（参见上述路径反向操作）${N}"
   fi
   cleanup_old_backups "${CONFIG_PATH}.bak.*" 5
 
@@ -4093,10 +5634,34 @@ uninstall_script_completely(){
           if [ "$cert_src" = "acme" ]; then
             deny_port_in_firewall 80 tcp
           fi
+          # 端口跳跃范围撤销 ufw / firewalld 规则
+          local hop_v hop_start_v hop_end_v
+          hop_v=$(get_node_value "$node" PortHop 2>/dev/null || echo 0)
+          if [ "$hop_v" = "1" ]; then
+            hop_start_v=$(get_node_value "$node" PortHopStart 2>/dev/null || true)
+            hop_end_v=$(get_node_value "$node" PortHopEnd 2>/dev/null || true)
+            if [ -n "$hop_start_v" ] && [ -n "$hop_end_v" ]; then
+              case "$(detect_firewall_backend)" in
+                ufw)
+                  ufw delete allow "${hop_start_v}:${hop_end_v}/udp" >/dev/null 2>&1 || true
+                  ;;
+                firewalld)
+                  firewall-cmd --permanent --remove-port="${hop_start_v}-${hop_end_v}/udp" >/dev/null 2>&1 || true
+                  firewall-cmd --reload >/dev/null 2>&1 || true
+                  ;;
+              esac
+            fi
+          fi
           ;;
       esac
     done < <(list_installed_nodes)
   fi
+
+  # 端口跳跃 iptables 链兜底清理
+  echo -e "${Y}==> 清理端口跳跃 iptables / ip6tables 规则...${N}"
+  port_hop_cleanup_all
+  ip4_save_rules >/dev/null 2>&1 || true
+  ip6_save_rules >/dev/null 2>&1 || true
 
   # 2. 停服 + 卸载 sing-box 软件包
   echo -e "${Y}==> 停止并禁用 sing-box 服务...${N}"
@@ -4192,7 +5757,19 @@ render_node_summary_line(){
   port=$(get_node_value "$type" Port 2>/dev/null || true)
   ip=$(get_node_value "$type" IP 2>/dev/null || true)
   mode_label=$(describe_install_mode "$(get_node_value "$type" Mode 2>/dev/null || echo ipv4)")
-  echo -e "  ${L}│${N}  ${label} ${D}·${N}  ${G}已安装${N}  端口 ${C}${port:-?}${N}  IP ${C}${ip:-?}${N}  ${D}${mode_label}${N}"
+  local extra=""
+  if [ "$type" = "hy2" ]; then
+    local hop_v
+    hop_v=$(get_node_value "$type" PortHop 2>/dev/null || echo 0)
+    [ "$hop_v" = "1" ] && extra="  ${C}+hop${N}"
+  fi
+  if chain_installed "$type"; then
+    local target_host target_port
+    target_host=$(get_chain_value "$type" TargetHost 2>/dev/null || true)
+    target_port=$(get_chain_value "$type" TargetPort 2>/dev/null || true)
+    extra="${extra}  ${Y}↳中转→${target_host:-?}:${target_port:-?}${N}"
+  fi
+  echo -e "  ${L}│${N}  ${label} ${D}·${N}  ${G}已安装${N}  端口 ${C}${port:-?}${N}  IP ${C}${ip:-?}${N}  ${D}${mode_label}${N}${extra}"
 }
 
 show_node_install_menu(){
@@ -4276,6 +5853,7 @@ show_node_manage_menu(){
     render_menu_item 1 "创建节点 (Reality / Hysteria2)"
     render_menu_item 2 "卸载单个节点"
     render_menu_item 3 "升级 sing-box 内核"
+    render_menu_item 4 "链式代理设置 (中转机)"
     render_menu_item 0 "返回上级"
     render_divider
     read -p "  请输入序号: " choice
@@ -4283,8 +5861,318 @@ show_node_manage_menu(){
       1) show_node_install_menu ;;
       2) show_node_uninstall_menu ;;
       3) upgrade_singbox_kernel ;;
+      4) show_chain_menu ;;
       0) return ;;
       *) notify_invalid_choice ;;
+    esac
+  done
+}
+
+# ─── 链式代理（中转机） ──────────────────────────────
+inbound_tag_for_type(){
+  case "$1" in
+    reality) printf 'reality-in' ;;
+    hy2)     printf 'hy2-in' ;;
+    *)       return 1 ;;
+  esac
+}
+
+# 返回 "直连" / "中转→host:port (type)" / 空（节点不存在）
+chain_describe(){
+  local type="$1"
+  if ! node_installed "$type"; then
+    printf ''
+    return
+  fi
+  if ! chain_installed "$type"; then
+    printf '直连'
+    return
+  fi
+  local target_host target_port target_type
+  target_host=$(get_chain_value "$type" TargetHost)
+  target_port=$(get_chain_value "$type" TargetPort)
+  target_type=$(get_chain_value "$type" TargetType)
+  printf '中转→%s:%s (%s)' "${target_host:-?}" "${target_port:-?}" "${target_type:-?}"
+}
+
+# 配置中转：解析链接 → 写 chain.info → 加 outbound → 加路由规则 → 重启
+chain_set(){
+  local inbound_type="$1" link="$2"
+  local inbound_tag outbound_tag
+  inbound_tag=$(inbound_tag_for_type "$inbound_type") || return 1
+  outbound_tag="chain-${inbound_type}-out"
+
+  if ! node_installed "$inbound_type"; then
+    echo -e "${R}本机未安装 ${inbound_type} 入站节点${N}"
+    return 1
+  fi
+
+  ensure_jq || return 1
+
+  # 先解析链接，校验有效
+  local fields target_type target_host target_port target_sni
+  fields=$(parse_node_link "$link") || {
+    echo -e "${R}无法解析链接，请检查格式${N}"
+    return 1
+  }
+  target_type=$(printf '%s\n' "$fields" | sed -n 's/^Type=//p' | head -1)
+  target_host=$(printf '%s\n' "$fields" | sed -n 's/^Host=//p' | head -1)
+  target_port=$(printf '%s\n' "$fields" | sed -n 's/^Port=//p' | head -1)
+  target_sni=$(printf '%s\n' "$fields" | sed -n 's/^SNI=//p' | head -1)
+
+  if [ -z "$target_type" ] || [ -z "$target_host" ] || [ -z "$target_port" ]; then
+    echo -e "${R}链接缺少必要字段${N}"
+    return 1
+  fi
+
+  # 自连环检查（粗略）
+  local my_v4 my_v6
+  my_v4=$(detect_primary_ipv4 2>/dev/null || true)
+  my_v6=$(detect_primary_ipv6 2>/dev/null || true)
+  if [ -n "$target_host" ] && { [ "$target_host" = "$my_v4" ] || [ "$target_host" = "$my_v6" ]; }; then
+    echo ""
+    echo -e "${R}${B}警告：落地机地址 ${target_host} 与本机 IP 相同${N}"
+    echo -e "${Y}这会形成路由回环，sing-box 启动会失败${N}"
+    local confirm_loop
+    read -p "  仍然继续？(y/N): " confirm_loop
+    if [ "$confirm_loop" != "y" ] && [ "$confirm_loop" != "Y" ]; then
+      echo -e "  已取消"
+      return 1
+    fi
+  fi
+
+  echo -e "${Y}==> 解析落地机信息...${N}"
+  echo -e "  类型 : ${C}${target_type}${N}"
+  echo -e "  地址 : ${C}${target_host}:${target_port}${N}"
+  echo -e "  SNI  : ${C}${target_sni:-未指定}${N}"
+
+  # 构造 outbound JSON
+  local outbound_json
+  outbound_json=$(build_chain_outbound_from_link "$link" "$outbound_tag") || {
+    echo -e "${R}构造 outbound 失败${N}"
+    return 1
+  }
+
+  # 备份配置
+  local backup_path
+  backup_path="${CONFIG_PATH}.bak.$(date +%Y%m%d%H%M%S)"
+  cp "$CONFIG_PATH" "$backup_path" 2>/dev/null || true
+
+  # 写 outbound + 路由规则
+  if ! config_add_outbound "$outbound_json"; then
+    echo -e "${R}写入 outbound 失败${N}"
+    cp "$backup_path" "$CONFIG_PATH" 2>/dev/null || true
+    return 1
+  fi
+  if ! config_set_inbound_chain "$inbound_tag" "$outbound_tag"; then
+    echo -e "${R}写入路由规则失败${N}"
+    cp "$backup_path" "$CONFIG_PATH" 2>/dev/null || true
+    return 1
+  fi
+
+  # 校验 + 重启
+  echo -e "${Y}==> 校验并重启 sing-box...${N}"
+  if ! sing-box check -c "$CONFIG_PATH" >/dev/null 2>&1; then
+    echo -e "${R}配置校验失败，已恢复备份${N}"
+    cp "$backup_path" "$CONFIG_PATH" 2>/dev/null || true
+    return 1
+  fi
+  if ! systemctl restart sing-box; then
+    echo -e "${R}sing-box 重启失败，已恢复备份${N}"
+    cp "$backup_path" "$CONFIG_PATH" 2>/dev/null || true
+    return 1
+  fi
+
+  # 持久化 chain.info
+  ensure_chains_dir
+  cat > "$(chain_info_path "$inbound_type")" <<EOF
+TargetType=${target_type}
+TargetHost=${target_host}
+TargetPort=${target_port}
+TargetSNI=${target_sni}
+TargetUUID=$(printf '%s\n' "$fields" | sed -n 's/^UUID=//p' | head -1)
+TargetPubKey=$(printf '%s\n' "$fields" | sed -n 's/^PublicKey=//p' | head -1)
+TargetShortID=$(printf '%s\n' "$fields" | sed -n 's/^ShortID=//p' | head -1)
+TargetPassword=$(printf '%s\n' "$fields" | sed -n 's/^Password=//p' | head -1)
+TargetInsecure=$(printf '%s\n' "$fields" | sed -n 's/^Insecure=//p' | head -1)
+TargetObfs=$(printf '%s\n' "$fields" | sed -n 's/^Obfs=//p' | head -1)
+TargetObfsPassword=$(printf '%s\n' "$fields" | sed -n 's/^ObfsPassword=//p' | head -1)
+EOF
+
+  set_node_value "$inbound_type" Chain "$outbound_tag"
+  cleanup_old_backups "${CONFIG_PATH}.bak.*" 5
+
+  echo ""
+  echo -e "${G}已配置：${inbound_type} 入站 → 中转到 ${target_host}:${target_port} (${target_type})${N}"
+  return 0
+}
+
+chain_unset(){
+  local inbound_type="$1"
+  local inbound_tag outbound_tag
+  inbound_tag=$(inbound_tag_for_type "$inbound_type") || return 1
+  outbound_tag="chain-${inbound_type}-out"
+
+  if ! chain_installed "$inbound_type"; then
+    echo -e "${Y}${inbound_type} 当前未配置中转${N}"
+    return 0
+  fi
+
+  local backup_path
+  backup_path="${CONFIG_PATH}.bak.$(date +%Y%m%d%H%M%S)"
+  cp "$CONFIG_PATH" "$backup_path" 2>/dev/null || true
+
+  config_remove_inbound_chain "$inbound_tag" || true
+  config_remove_outbound_by_tag "$outbound_tag" || true
+
+  echo -e "${Y}==> 校验并重启 sing-box...${N}"
+  if ! sing-box check -c "$CONFIG_PATH" >/dev/null 2>&1; then
+    echo -e "${R}配置校验失败，已恢复备份${N}"
+    cp "$backup_path" "$CONFIG_PATH" 2>/dev/null || true
+    return 1
+  fi
+  if ! systemctl restart sing-box; then
+    echo -e "${R}sing-box 重启失败，已恢复备份${N}"
+    cp "$backup_path" "$CONFIG_PATH" 2>/dev/null || true
+    return 1
+  fi
+
+  remove_chain_info "$inbound_type"
+  set_node_value "$inbound_type" Chain "direct"
+  cleanup_old_backups "${CONFIG_PATH}.bak.*" 5
+
+  echo -e "${G}已恢复：${inbound_type} 入站 → 直连${N}"
+}
+
+# 让用户在已装的 inbound 中挑一个返回类型字符串
+select_inbound_for_chain(){
+  local prompt_label="${1:-请选择入站节点}"
+  local arr=() n input i count
+  while IFS= read -r n; do
+    [ -n "$n" ] && arr+=("$n")
+  done < <(list_installed_nodes)
+  count=${#arr[@]}
+  if [ "$count" -eq 0 ]; then
+    return 1
+  fi
+  if [ "$count" -eq 1 ]; then
+    printf '%s' "${arr[0]}"
+    return 0
+  fi
+  {
+    echo ""
+    echo "  ${prompt_label}："
+    i=1
+    for n in "${arr[@]}"; do
+      local desc
+      desc=$(chain_describe "$n")
+      echo "    $i) $n  ${desc:+(当前: $desc)}"
+      i=$((i + 1))
+    done
+  } >&2
+  read -p "  请输入序号 (1): " input >&2
+  input="${input:-1}"
+  if [[ "$input" =~ ^[0-9]+$ ]] && [ "$input" -ge 1 ] && [ "$input" -le "$count" ]; then
+    printf '%s' "${arr[$((input - 1))]}"
+    return 0
+  fi
+  return 1
+}
+
+show_chain_menu(){
+  local target link confirm
+  if ! require_root; then return 1; fi
+  if ! require_singbox_installed; then return 1; fi
+
+  while true; do
+    render_section_header "链式代理设置（中转机）"
+
+    # ─── 教程提示 ───
+    echo -e "  ${B}${C}什么是链式代理？${N}"
+    echo -e "  ${D}客户端 → ${C}中转机 A${D} → ${C}落地机 B${D} → 互联网${N}"
+    echo -e "  ${D}用 A 的入站接客户端，A 把流量再转到 B 出网，外面看到的是 B 的 IP。${N}"
+    echo ""
+    echo -e "  ${B}${C}典型流程${N}（两台 VPS 都跑这个脚本）"
+    echo -e "  ${Y}①${N} 落地机 B：装节点 → 主菜单 ${C}4) 查看状态${N} → ${C}6) 查看客户端链接${N} → 复制"
+    echo -e "  ${Y}②${N} 中转机 A：装节点（客户端实际连的就是 A 的这个入站）"
+    echo -e "  ${Y}③${N} 中转机 A：${C}本菜单 → 1) 配置中转${N} → 选入站 → 粘贴 B 的链接"
+    echo -e "  ${Y}④${N} 客户端连 A，访问 ipify.org 应看到 B 的 IP，搞定"
+    echo ""
+    echo -e "  ${D}· 我是中转机？→ 1) 粘贴落地机链接${N}"
+    echo -e "  ${D}· 我是落地机？→ 啥都不用做，3) 把本机链接复制给中转机用即可${N}"
+    echo -e "  ${D}· 每个入站（Reality / HY2）可独立选直连或中转，互不影响${N}"
+    echo -e "  ${D}· 详细教程：HY2-节点搭建说明.md 第十一节${N}"
+    render_divider
+
+    if [ "$(count_installed_nodes)" -eq 0 ]; then
+      echo -e "  ${Y}本机尚未创建任何入站节点${N}"
+      echo -e "  ${D}请先回到「节点 / 内核管理 → 创建节点」装一个 Reality 或 Hysteria2，${N}"
+      echo -e "  ${D}它们会作为客户端连接的入口，再回来配链路${N}"
+      echo ""
+      pause_screen
+      return 0
+    fi
+
+    # ─── 当前状态：列每个已装入站的链路 ───
+    echo -e "  ${B}${C}本机入站链路状态${N}"
+    local n desc
+    while IFS= read -r n; do
+      [ -n "$n" ] || continue
+      desc=$(chain_describe "$n")
+      printf "  ${L}│${N}  %-10s ${D}·${N}  %s\n" "$n" "${desc:-未知}"
+    done < <(list_installed_nodes)
+    render_divider
+    render_menu_item 1 "配置中转 (选入站 → 粘贴落地机链接)"
+    render_menu_item 2 "取消中转 (选入站 → 恢复直连)"
+    render_menu_item 3 "导出本机入站链接（让别的中转机连本机）"
+    render_menu_item 0 "返回上级"
+    render_divider
+    read -p "  请输入序号: " choice
+    case "$choice" in
+      1)
+        target=$(select_inbound_for_chain "选要配中转的入站") || { echo -e "${R}选择无效${N}"; pause_screen; continue; }
+        echo ""
+        echo -e "  ${B}请粘贴落地机的客户端链接${N}"
+        echo -e "  ${D}（在落地机上跑 sb → 4) 查看状态 → 6) 查看客户端链接 复制）${N}"
+        echo -e "  ${D}支持格式：vless://...reality...   或   hysteria2://...${N}"
+        read -p "  链接: " link
+        link="${link%%[[:space:]]}"
+        if [ -z "$link" ]; then
+          echo -e "${Y}已取消${N}"
+          pause_screen
+          continue
+        fi
+        if chain_installed "$target"; then
+          echo -e "${Y}${target} 已配置中转，将覆盖${N}"
+          read -p "  继续？(y/N): " confirm
+          if [ "$confirm" != "y" ] && [ "$confirm" != "Y" ]; then
+            echo -e "  已取消"
+            pause_screen
+            continue
+          fi
+        fi
+        chain_set "$target" "$link" || true
+        pause_screen
+        ;;
+      2)
+        target=$(select_inbound_for_chain "选要取消中转的入站") || { echo -e "${R}选择无效${N}"; pause_screen; continue; }
+        if ! chain_installed "$target"; then
+          echo -e "${Y}${target} 当前是直连，无需取消${N}"
+          pause_screen
+          continue
+        fi
+        chain_unset "$target" || true
+        pause_screen
+        ;;
+      3)
+        show_client_link
+        ;;
+      0)
+        return
+        ;;
+      *)
+        notify_invalid_choice
+        ;;
     esac
   done
 }
@@ -4327,10 +6215,11 @@ show_menu(){
     render_menu_item 2 "系统基础设置"
     render_menu_item 3 "${main_action_label}"
     render_menu_item 4 "查看状态"
-    render_menu_item 5 "外部服务"
-    render_menu_item 6 "IPv6 防火墙管理"
-    render_menu_item 7 "卸载脚本"
-    render_menu_item 8 "更新脚本"
+    render_menu_item 5 "Docker 管理"
+    render_menu_item 6 "IPv4 防火墙管理"
+    render_menu_item 7 "IPv6 防火墙管理"
+    render_menu_item 8 "卸载脚本"
+    render_menu_item 9 "更新脚本"
     render_menu_item 0 "退出"
     render_divider
     read -p "  请输入序号: " choice
@@ -4353,15 +6242,18 @@ show_menu(){
         show_status_menu
         ;;
       5)
-        show_external_services_menu
+        show_docker_menu
         ;;
       6)
-        show_ipv6_firewall_menu
+        show_ipv4_firewall_menu
         ;;
       7)
-        uninstall_script_completely
+        show_ipv6_firewall_menu
         ;;
       8)
+        uninstall_script_completely
+        ;;
+      9)
         update_self_script
         ;;
       0)
