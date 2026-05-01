@@ -19,7 +19,11 @@
       "WebSearch",
       "WebFetch(domain:sing-box.sagernet.org)",
       "Read(//c/Users/leyili/.claude/plans//**)",
-      "Read(//c/Users/leyili/.claude//**)"
+      "Read(//c/Users/leyili/.claude//**)",
+      "Bash(bash -n C:/Users/leyili/Desktop/linux-menu/linux-menu/leyili.sh)",
+      "Bash(awk ' *)",
+      "Bash(awk -F'=' '/^[[:space:]]*net\\\\.core\\\\.rmem_max/ { gsub\\(/[[:space:]]/, \"\", $2\\); print $2; exit }')",
+      "Bash(awk '{ *)"
     ]
   }
 }

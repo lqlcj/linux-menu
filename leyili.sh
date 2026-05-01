@@ -237,6 +237,29 @@ ip6_get_input_policy(){
   ip6tables -L INPUT -n 2>/dev/null | head -n1 | awk '{print $4}'
 }
 
+ip6_list_opened_ports_compact(){
+  ip6tables-save 2>/dev/null | awk '
+    /^-A INPUT/ {
+      proto=""; port=""
+      for (i = 1; i <= NF; i++) {
+        if ($i == "-p")      proto = $(i + 1)
+        if ($i == "--dport") port  = $(i + 1)
+      }
+      if (port == "") next
+      if (proto == "tcp") {
+        if (!(port in tcp_seen)) { tcp_list = tcp_list (tcp_list ? ", " : "") port; tcp_seen[port]=1 }
+      } else if (proto == "udp") {
+        if (!(port in udp_seen)) { udp_list = udp_list (udp_list ? ", " : "") port; udp_seen[port]=1 }
+      }
+    }
+    END {
+      out = ""
+      if (tcp_list != "") out = "TCP " tcp_list
+      if (udp_list != "") out = out (out ? "  " : "") "UDP " udp_list
+      print out
+    }'
+}
+
 ip6_detect_ssh_port(){
   local port=""
 
@@ -1895,11 +1918,10 @@ show_status_menu(){
     render_menu_item 4 "重启服务"
     render_menu_item 5 "停止服务"
     render_menu_item 6 "启动服务"
-    render_menu_item 7 "查看客户端链接"
-    render_menu_item 8 "节点二维码"
-    render_menu_item 9 "查看配置"
-    render_menu_item 10 "编辑配置"
-    render_menu_item 11 "清理配置备份"
+    render_menu_item 7 "查看客户端链接 / 二维码"
+    render_menu_item 8 "查看配置"
+    render_menu_item 9 "编辑配置"
+    render_menu_item 10 "清理配置备份"
     render_menu_item 0 "返回上级"
     render_divider
     read -p "  请输入序号: " choice
@@ -1944,15 +1966,12 @@ show_status_menu(){
         show_client_link
         ;;
       8)
-        show_qrcode
-        ;;
-      9)
         view_singbox_config
         ;;
-      10)
+      9)
         edit_singbox_config
         ;;
-      11)
+      10)
         cleanup_config_backups
         ;;
       0)
@@ -2076,7 +2095,17 @@ show_ipv6_firewall_menu(){
 
     render_section_header "IPv6 防火墙管理"
     echo -e "  ${L}│${N}  SSH 端口  ${D}·${N}  ${C}${ssh_port}${N}"
-    echo -e "  ${L}│${N}  说明      ${D}·${N}  ${D}本菜单只动 IPv6，不影响 1Panel 管理的 IPv4${N}"
+
+    local input_policy opened_ports
+    input_policy=$(ip6_get_input_policy)
+    opened_ports=$(ip6_list_opened_ports_compact)
+    if [ -n "$opened_ports" ]; then
+      echo -e "  ${L}│${N}  已开放    ${D}·${N}  ${C}${opened_ports}${N}"
+    elif [ "$input_policy" = "ACCEPT" ]; then
+      echo -e "  ${L}│${N}  已开放    ${D}·${N}  ${Y}默认策略 ACCEPT${N}  ${D}(无显式规则, 全部入站放行)${N}"
+    else
+      echo -e "  ${L}│${N}  已开放    ${D}·${N}  ${D}(无)${N}"
+    fi
     render_divider
     render_menu_item 1 "查看当前规则"
     render_menu_item 2 "查看监听 IPv6 的服务"
@@ -3918,47 +3947,6 @@ print_qrcode(){
   echo -e "  ${B}扫码导入：${N}"
   echo ""
   qrencode -t ANSIUTF8 "$link"
-}
-
-show_qrcode(){
-  local target link ipv6_link
-
-  if ! require_singbox_installed; then return 1; fi
-  if [ "$(count_installed_nodes)" -eq 0 ]; then
-    echo ""
-    echo -e "${R}未发现节点，请先创建节点${N}"
-    pause_screen
-    return 1
-  fi
-
-  target=$(select_node_interactive "请选择要生成二维码的节点")
-  if [ -z "$target" ]; then
-    echo -e "${R}选择无效${N}"
-    pause_screen
-    return 1
-  fi
-
-  link=$(build_link_for_node "$target" 2>/dev/null || true)
-  ipv6_link=$(build_dualstack_ipv6_link_for_node "$target" 2>/dev/null || true)
-
-  if [ -z "$link" ]; then
-    echo ""
-    echo -e "${R}节点信息不完整，无法生成二维码${N}"
-    pause_screen
-    return 1
-  fi
-
-  echo ""
-  echo -e "  ${B}客户端链接：${N}"
-  echo -e "  ${G}$link${N}"
-  print_qrcode "$link"
-  if [ -n "$ipv6_link" ]; then
-    echo ""
-    echo -e "  ${B}IPv6 客户端链接：${N}"
-    echo -e "  ${G}$ipv6_link${N}"
-    print_qrcode "$ipv6_link"
-  fi
-  pause_screen
 }
 
 apply_tcp_tuning(){
@@ -6140,6 +6128,57 @@ render_node_summary_line(){
   echo -e "  ${L}│${N}  ${label} ${D}·${N}  ${G}已安装${N}  端口 ${C}${port:-?}${N}  IP ${C}${ip:-?}${N}  ${D}${mode_label}${N}${extra}"
 }
 
+render_tcp_tuning_summary_line(){
+  local label="TCP 调优  "
+  if [ ! -f "$TCP_TUNING_PATH" ]; then
+    echo -e "  ${L}│${N}  ${label} ${D}·${N}  ${D}未启用${N}"
+    return
+  fi
+  local rmem profile=""
+  rmem=$(awk -F'=' '/^[[:space:]]*net\.core\.rmem_max/ { gsub(/[[:space:]]/, "", $2); print $2; exit }' "$TCP_TUNING_PATH" 2>/dev/null)
+  case "$rmem" in
+    402653184) profile="美西" ;;
+    268435456) profile="日本" ;;
+  esac
+  local cc
+  cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "?")
+  if [ -n "$profile" ]; then
+    echo -e "  ${L}│${N}  ${label} ${D}·${N}  ${G}已启用${N}  ${C}${profile}${N}  ${D}cc=${cc}${N}"
+  else
+    echo -e "  ${L}│${N}  ${label} ${D}·${N}  ${G}已启用${N}  ${D}cc=${cc}${N}"
+  fi
+}
+
+render_initcwnd_summary_line(){
+  local label="initcwnd  "
+  if ! command -v ip >/dev/null 2>&1; then
+    echo -e "  ${L}│${N}  ${label} ${D}·${N}  ${D}未知 (ip 命令缺失)${N}"
+    return
+  fi
+  local route_line val persist
+  route_line=$(ip route show default 2>/dev/null | head -n1)
+  if [ -z "$route_line" ]; then
+    echo -e "  ${L}│${N}  ${label} ${D}·${N}  ${D}无默认路由${N}"
+    return
+  fi
+  val=$(printf '%s\n' "$route_line" | awk '{
+    for (i = 1; i <= NF; i++) {
+      if ($i == "initcwnd") { print $(i + 1); exit }
+    }
+  }')
+  if [ -z "$val" ]; then
+    echo -e "  ${L}│${N}  ${label} ${D}·${N}  ${D}未设置${N}"
+    return
+  fi
+  if [ -f "$INITCWND_SERVICE_PATH" ] \
+     && systemctl is-enabled "$(basename "$INITCWND_SERVICE_PATH")" >/dev/null 2>&1; then
+    persist="${D}(已持久化)${N}"
+  else
+    persist="${Y}(未持久化)${N}"
+  fi
+  echo -e "  ${L}│${N}  ${label} ${D}·${N}  ${C}${val}${N}  ${persist}"
+}
+
 show_node_install_menu(){
   while true; do
     render_section_header "创建节点"
@@ -6461,7 +6500,7 @@ show_chain_menu(){
     echo -e "  ${D}用 A 的入站接客户端，A 把流量再转到 B 出网，外面看到的是 B 的 IP。${N}"
     echo ""
     echo -e "  ${B}${C}典型流程${N}（两台 VPS 都跑这个脚本）"
-    echo -e "  ${Y}①${N} 落地机 B：装节点 → 主菜单 ${C}4) 查看状态${N} → ${C}6) 查看客户端链接${N} → 复制"
+    echo -e "  ${Y}①${N} 落地机 B：装节点 → 主菜单 ${C}4) 查看状态${N} → ${C}7) 查看客户端链接 / 二维码${N} → 复制"
     echo -e "  ${Y}②${N} 中转机 A：装节点（客户端实际连的就是 A 的这个入站）"
     echo -e "  ${Y}③${N} 中转机 A：${C}本菜单 → 1) 配置中转${N} → 选入站 → 粘贴 B 的链接"
     echo -e "  ${Y}④${N} 客户端连 A，访问 ipify.org 应看到 B 的 IP，搞定"
@@ -6501,7 +6540,7 @@ show_chain_menu(){
         target=$(select_inbound_for_chain "选要配中转的入站") || { echo -e "${R}选择无效${N}"; pause_screen; continue; }
         echo ""
         echo -e "  ${B}请粘贴落地机的客户端链接${N}"
-        echo -e "  ${D}（在落地机上跑 sb → 4) 查看状态 → 6) 查看客户端链接 复制）${N}"
+        echo -e "  ${D}（在落地机上跑 sb → 4) 查看状态 → 7) 查看客户端链接 / 二维码 复制）${N}"
         echo -e "  ${D}支持格式：vless://...reality...   或   hysteria2://...${N}"
         read -p "  链接: " link
         link="${link%%[[:space:]]}"
@@ -6578,6 +6617,8 @@ show_menu(){
     echo -e "  ${L}│${N}  状态      ${D}·${N}  $status_str"
     render_node_summary_line reality
     render_node_summary_line hy2
+    render_tcp_tuning_summary_line
+    render_initcwnd_summary_line
     render_divider
     render_menu_item 1 "管理员设置"
     render_menu_item 2 "系统基础设置"
