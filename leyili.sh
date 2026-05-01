@@ -1,7 +1,10 @@
 #!/bin/bash
 set -o pipefail
 
-INSTALL_URL="https://sing-box.app/deb-install.sh"
+SAGERNET_KEY_URL="https://sing-box.app/gpg.key"
+SAGERNET_KEYRING="/etc/apt/keyrings/sagernet.asc"
+SAGERNET_SOURCES="/etc/apt/sources.list.d/sagernet.sources"
+SAGERNET_REPO_URI="https://deb.sagernet.org/"
 CONFIG_PATH="/etc/sing-box/config.json"
 INFO_PATH="/root/proxy-info.txt"
 NODES_DIR="/etc/sing-box/nodes"
@@ -799,6 +802,99 @@ is_singbox_installed(){
   command -v sing-box >/dev/null 2>&1
 }
 
+ensure_sagernet_repo(){
+  local pkg need=()
+  for pkg in curl gnupg ca-certificates; do
+    command -v "$pkg" >/dev/null 2>&1 || dpkg -s "$pkg" >/dev/null 2>&1 || need+=("$pkg")
+  done
+  if [ "${#need[@]}" -gt 0 ]; then
+    DEBIAN_FRONTEND=noninteractive apt-get update -qq >/dev/null 2>&1 || true
+    if ! DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${need[@]}" >/dev/null 2>&1; then
+      echo -e "${R}依赖安装失败：${need[*]}${N}"
+      return 1
+    fi
+  fi
+
+  mkdir -p /etc/apt/keyrings || { echo -e "${R}无法创建 /etc/apt/keyrings${N}"; return 1; }
+
+  if [ ! -s "$SAGERNET_KEYRING" ]; then
+    if ! curl -fsSL --max-time 15 "$SAGERNET_KEY_URL" -o "$SAGERNET_KEYRING"; then
+      echo -e "${R}下载 SagerNet GPG key 失败：$SAGERNET_KEY_URL${N}"
+      rm -f "$SAGERNET_KEYRING"
+      return 1
+    fi
+    chmod a+r "$SAGERNET_KEYRING"
+  fi
+
+  if [ ! -f "$SAGERNET_SOURCES" ]; then
+    cat > "$SAGERNET_SOURCES" <<EOF
+Types: deb
+URIs: $SAGERNET_REPO_URI
+Suites: *
+Components: *
+Enabled: yes
+Signed-By: $SAGERNET_KEYRING
+EOF
+  fi
+
+  return 0
+}
+
+install_singbox(){
+  if ! ensure_sagernet_repo; then
+    return 1
+  fi
+
+  # 关键：在 apt-get install 之前预写干净骨架，dpkg 看到 conffile 已存在
+  # 配合 --force-confold 就不会落地 deb 自带的危险默认配置
+  # （含端口 8080、固定密码 Gn1JUS14bLUHgv1cWDDp4A== 的 shadowsocks 入站）
+  if ! config_ensure_skeleton; then
+    echo -e "${R}写入 sing-box 配置骨架失败${N}"
+    return 1
+  fi
+
+  if ! DEBIAN_FRONTEND=noninteractive apt-get update -qq; then
+    echo -e "${Y}apt-get update 出错，继续尝试安装...${N}"
+  fi
+
+  if ! DEBIAN_FRONTEND=noninteractive apt-get install -y \
+        -o Dpkg::Options::="--force-confdef" \
+        -o Dpkg::Options::="--force-confold" \
+        sing-box; then
+    echo -e "${R}apt-get install sing-box 失败${N}"
+    return 1
+  fi
+
+  if ! command -v sing-box >/dev/null 2>&1; then
+    echo -e "${R}sing-box 安装后仍找不到可执行文件${N}"
+    return 1
+  fi
+
+  # postinst 可能已拉起服务（虽然此时配置是空骨架，无监听）。停下来由业务流程后续 restart。
+  systemctl stop sing-box >/dev/null 2>&1 || true
+  return 0
+}
+
+upgrade_singbox(){
+  if ! ensure_sagernet_repo; then
+    return 1
+  fi
+
+  if ! DEBIAN_FRONTEND=noninteractive apt-get update -qq; then
+    echo -e "${Y}apt-get update 出错，继续尝试升级...${N}"
+  fi
+
+  if ! DEBIAN_FRONTEND=noninteractive apt-get install -y --only-upgrade \
+        -o Dpkg::Options::="--force-confdef" \
+        -o Dpkg::Options::="--force-confold" \
+        sing-box; then
+    echo -e "${R}apt-get install --only-upgrade sing-box 失败${N}"
+    return 1
+  fi
+
+  return 0
+}
+
 require_singbox_installed(){
   if is_singbox_installed; then
     return 0
@@ -985,7 +1081,7 @@ EOF
   if jq '
       .log = (.log // {"disabled": false, "level": "warn", "timestamp": true})
     | .dns = (.dns // {"servers": [{"type": "local", "tag": "local"}]})
-    | .inbounds = (.inbounds // [])
+    | .inbounds = ((.inbounds // []) | map(select(.tag == "reality-in" or .tag == "hy2-in")))
     | .outbounds = (if ((.outbounds // []) | length) == 0
                     then [{"type":"direct","tag":"direct-out","domain_resolver":{"server":"local","strategy":"ipv4_only"}}]
                     else (.outbounds | map(
@@ -4632,7 +4728,7 @@ install_reality_node(){
   if ! is_singbox_installed; then
     echo ""
     echo -e "${Y}==> 安装 sing-box...${N}"
-    if ! bash <(curl -fsSL "$INSTALL_URL"); then
+    if ! install_singbox; then
       echo ""
       echo -e "${R}sing-box 安装失败，请检查上方输出${N}"
       pause_screen
@@ -5254,7 +5350,7 @@ install_hy2_node(){
   if ! is_singbox_installed; then
     echo ""
     echo -e "${Y}==> 安装 sing-box...${N}"
-    if ! bash <(curl -fsSL "$INSTALL_URL"); then
+    if ! install_singbox; then
       echo ""
       echo -e "${R}sing-box 安装失败，请检查上方输出${N}"
       pause_screen
@@ -5974,6 +6070,10 @@ uninstall_script_completely(){
   echo -e "${Y}==> 清理 /etc/sing-box（节点信息 / 证书 / 配置 / 备份）...${N}"
   rm -rf /etc/sing-box
 
+  echo -e "${Y}==> 清理 SagerNet APT 仓库与签名 key...${N}"
+  rm -f "$SAGERNET_SOURCES" "$SAGERNET_KEYRING"
+  DEBIAN_FRONTEND=noninteractive apt-get update -qq >/dev/null 2>&1 || true
+
   # 3. 脚本痕迹
   echo -e "${Y}==> 清理脚本本体与 legacy 信息文件...${N}"
   rm -f "$INFO_PATH"
@@ -6079,7 +6179,7 @@ upgrade_singbox_kernel(){
     return 0
   fi
   echo -e "${Y}==> 升级内核（不覆盖配置）...${N}"
-  if ! bash <(curl -fsSL "$INSTALL_URL"); then
+  if ! upgrade_singbox; then
     echo ""
     echo -e "${R}sing-box 升级失败，请检查上方输出${N}"
     pause_screen
