@@ -1070,6 +1070,7 @@ config_ensure_skeleton(){
     "domain_resolver": "cloudflare"
   }],
   "route": {
+    "default_domain_resolver": "cloudflare",
     "rules": [
       {"port": 53, "action": "hijack-dns"}
     ],
@@ -1107,6 +1108,7 @@ EOF
                         else . end))
                     end)
     | .route = (.route // {})
+    | .route.default_domain_resolver = (.route.default_domain_resolver // "cloudflare")
     | .route.rules = (
         ((.route.rules // []) | map(select(.action != "hijack-dns" and (.port // null) != 53)))
         + [{"port": 53, "action": "hijack-dns"}]
