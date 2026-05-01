@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(bash -n \"C:\\\\Users\\\\leyili\\\\Desktop\\\\linux-menu\\\\linux-menu\\\\leyili.sh\")",
+      "Bash(bash -n \"C:/Users/leyili/Desktop/linux-menu/linux-menu/leyili.sh\")"
+    ]
+  }
+}

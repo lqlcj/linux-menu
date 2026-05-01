@@ -4,6 +4,8 @@ set -o pipefail
 INSTALL_URL="https://sing-box.app/deb-install.sh"
 CONFIG_PATH="/etc/sing-box/config.json"
 INFO_PATH="/root/proxy-info.txt"
+NODES_DIR="/etc/sing-box/nodes"
+CERTS_DIR="/etc/sing-box/certs"
 APP_NAME="Leyili"
 COMMAND_NAME="sb"
 SCRIPT_PATH="/usr/local/bin/${COMMAND_NAME}"
@@ -125,31 +127,36 @@ detect_firewall_backend(){
   printf '%s' "none"
 }
 
-allow_tcp_port_in_firewall(){
+allow_port_in_firewall(){
   local port="$1"
+  local proto="${2:-tcp}"
   local backend
   backend=$(detect_firewall_backend)
 
   case "$backend" in
     ufw)
-      if ufw allow "${port}/tcp" >/dev/null 2>&1; then
-        echo -e "  防火墙  : ${C}ufw 已放行 ${port}/tcp${N}"
+      if ufw allow "${port}/${proto}" >/dev/null 2>&1; then
+        echo -e "  防火墙  : ${C}ufw 已放行 ${port}/${proto}${N}"
       else
-        echo -e "  防火墙  : ${Y}ufw 放行失败，请手动执行 ufw allow ${port}/tcp${N}"
+        echo -e "  防火墙  : ${Y}ufw 放行失败，请手动执行 ufw allow ${port}/${proto}${N}"
       fi
       ;;
     firewalld)
-      if firewall-cmd --permanent --add-port="${port}/tcp" >/dev/null 2>&1 \
+      if firewall-cmd --permanent --add-port="${port}/${proto}" >/dev/null 2>&1 \
          && firewall-cmd --reload >/dev/null 2>&1; then
-        echo -e "  防火墙  : ${C}firewalld 已放行 ${port}/tcp${N}"
+        echo -e "  防火墙  : ${C}firewalld 已放行 ${port}/${proto}${N}"
       else
-        echo -e "  防火墙  : ${Y}firewalld 放行失败，请手动执行 firewall-cmd --permanent --add-port=${port}/tcp${N}"
+        echo -e "  防火墙  : ${Y}firewalld 放行失败，请手动执行 firewall-cmd --permanent --add-port=${port}/${proto}${N}"
       fi
       ;;
     *)
-      echo -e "  防火墙  : ${D}未启用 ufw/firewalld（如有外部安全组请自行放行 ${port}/tcp）${N}"
+      echo -e "  防火墙  : ${D}未启用 ufw/firewalld（如有外部安全组请自行放行 ${port}/${proto}）${N}"
       ;;
   esac
+}
+
+allow_tcp_port_in_firewall(){
+  allow_port_in_firewall "$1" tcp
 }
 
 ip6_get_input_policy(){
@@ -637,6 +644,248 @@ set_info_value(){
   mv "$tmp_file" "$INFO_PATH"
 }
 
+# ─── 节点存储 (per-node info file) ──────────────────
+ensure_nodes_dir(){
+  mkdir -p "$NODES_DIR" "$CERTS_DIR" 2>/dev/null || true
+}
+
+node_info_path(){
+  printf '%s' "$NODES_DIR/$1.info"
+}
+
+node_installed(){
+  [ -f "$(node_info_path "$1")" ]
+}
+
+list_installed_nodes(){
+  ensure_nodes_dir
+  local f base
+  for f in "$NODES_DIR"/*.info; do
+    [ -f "$f" ] || continue
+    base="${f##*/}"
+    printf '%s\n' "${base%.info}"
+  done
+}
+
+count_installed_nodes(){
+  local n
+  n=$(list_installed_nodes | wc -l)
+  printf '%s' "$(echo "$n" | tr -d ' \t\n\r')"
+}
+
+get_node_value(){
+  local type="$1" key="$2" f
+  f=$(node_info_path "$type")
+  [ -f "$f" ] || return 1
+  grep -m1 "^${key}=" "$f" | cut -d= -f2-
+}
+
+set_node_value(){
+  local type="$1" key="$2" value="$3" f tmp
+  f=$(node_info_path "$type")
+  ensure_nodes_dir
+  if [ ! -f "$f" ]; then
+    printf '%s=%s\n' "$key" "$value" > "$f"
+    return 0
+  fi
+  tmp=$(mktemp)
+  awk -v key="$key" -v value="$value" '
+    BEGIN { updated = 0 }
+    index($0, key "=") == 1 { print key "=" value; updated = 1; next }
+    { print }
+    END { if (!updated) print key "=" value }
+  ' "$f" > "$tmp"
+  mv "$tmp" "$f"
+}
+
+remove_node_info(){
+  rm -f "$(node_info_path "$1")"
+}
+
+# 在多节点情况下让用户选一个节点；仅 1 个时直接回显；0 个返回 1
+select_node_interactive(){
+  local prompt_label="${1:-选择节点}"
+  local nodes count input n i
+  local arr=()
+  while IFS= read -r n; do
+    [ -n "$n" ] && arr+=("$n")
+  done < <(list_installed_nodes)
+  count=${#arr[@]}
+  if [ "$count" -eq 0 ]; then
+    return 1
+  fi
+  if [ "$count" -eq 1 ]; then
+    printf '%s' "${arr[0]}"
+    return 0
+  fi
+  {
+    echo ""
+    echo "  ${prompt_label}："
+    i=1
+    for n in "${arr[@]}"; do
+      echo "    $i) $n"
+      i=$((i + 1))
+    done
+  } >&2
+  read -p "  请输入序号 (1): " input >&2
+  input="${input:-1}"
+  if [[ "$input" =~ ^[0-9]+$ ]] && [ "$input" -ge 1 ] && [ "$input" -le "$count" ]; then
+    printf '%s' "${arr[$((input - 1))]}"
+    return 0
+  fi
+  return 1
+}
+
+# ─── 配置文件 (jq 增量编辑) ─────────────────────────
+ensure_jq(){
+  if command -v jq >/dev/null 2>&1; then
+    return 0
+  fi
+  echo -e "${Y}==> 安装 jq...${N}"
+  if ! apt-get install -y jq 2>/dev/null; then
+    echo -e "${R}jq 安装失败，请手动执行：apt install jq${N}"
+    return 1
+  fi
+  return 0
+}
+
+config_ensure_skeleton(){
+  ensure_jq || return 1
+  mkdir -p /etc/sing-box
+  if [ ! -f "$CONFIG_PATH" ] || ! jq empty "$CONFIG_PATH" >/dev/null 2>&1; then
+    cat > "$CONFIG_PATH" <<'EOF'
+{
+  "log": {"disabled": false, "level": "warn", "timestamp": true},
+  "dns": {"servers": [{"type": "local", "tag": "local"}]},
+  "inbounds": [],
+  "outbounds": [{
+    "type": "direct",
+    "domain_resolver": {"server": "local", "strategy": "ipv4_only"}
+  }]
+}
+EOF
+    return 0
+  fi
+
+  local tmp
+  tmp=$(mktemp)
+  if jq '
+      .log = (.log // {"disabled": false, "level": "warn", "timestamp": true})
+    | .dns = (.dns // {"servers": [{"type": "local", "tag": "local"}]})
+    | .inbounds = (.inbounds // [])
+    | .outbounds = (if ((.outbounds // []) | length) == 0
+                    then [{"type":"direct","domain_resolver":{"server":"local","strategy":"ipv4_only"}}]
+                    else .outbounds end)
+  ' "$CONFIG_PATH" > "$tmp" 2>/dev/null; then
+    mv "$tmp" "$CONFIG_PATH"
+    return 0
+  fi
+  rm -f "$tmp"
+  return 1
+}
+
+config_add_inbound(){
+  local inbound="$1"
+  ensure_jq || return 1
+  config_ensure_skeleton || return 1
+  local tmp tag
+  tag=$(printf '%s' "$inbound" | jq -r '.tag // empty' 2>/dev/null)
+  if [ -z "$tag" ]; then
+    echo -e "${R}内部错误：inbound 缺少 tag${N}"
+    return 1
+  fi
+  tmp=$(mktemp)
+  if ! jq --argjson nb "$inbound" --arg tag "$tag" '
+    .inbounds = ((.inbounds // []) | map(select(.tag != $tag))) + [$nb]
+  ' "$CONFIG_PATH" > "$tmp" 2>/dev/null; then
+    rm -f "$tmp"
+    return 1
+  fi
+  mv "$tmp" "$CONFIG_PATH"
+}
+
+config_remove_inbound_by_tag(){
+  local tag="$1"
+  ensure_jq || return 1
+  [ -f "$CONFIG_PATH" ] || return 0
+  local tmp
+  tmp=$(mktemp)
+  if ! jq --arg tag "$tag" '.inbounds = ((.inbounds // []) | map(select(.tag != $tag)))' "$CONFIG_PATH" > "$tmp" 2>/dev/null; then
+    rm -f "$tmp"
+    return 1
+  fi
+  mv "$tmp" "$CONFIG_PATH"
+}
+
+config_check_and_restart(){
+  if ! sing-box check -c "$CONFIG_PATH"; then
+    return 1
+  fi
+  systemctl enable sing-box >/dev/null 2>&1 || true
+  if ! systemctl restart sing-box; then
+    return 1
+  fi
+  return 0
+}
+
+# 旧 /root/proxy-info.txt 迁移到 /etc/sing-box/nodes/reality.info
+migrate_legacy_info(){
+  # 旧配置里 reality inbound 的 tag 是 vless-in，统一重命名为 reality-in
+  if [ -f "$CONFIG_PATH" ] && command -v jq >/dev/null 2>&1; then
+    if jq -e '.inbounds // [] | map(select(.tag == "vless-in")) | length > 0' "$CONFIG_PATH" >/dev/null 2>&1; then
+      local tmp
+      tmp=$(mktemp)
+      if jq '(.inbounds[]? | select(.tag == "vless-in") | .tag) = "reality-in"' "$CONFIG_PATH" > "$tmp" 2>/dev/null; then
+        mv "$tmp" "$CONFIG_PATH"
+      else
+        rm -f "$tmp"
+      fi
+    fi
+  fi
+
+  if node_installed reality; then
+    return 0
+  fi
+  [ -f "$INFO_PATH" ] || return 0
+
+  local uuid pubk prik ip port sni sid tag listen link mode bind4
+  uuid=$(get_info_value UUID 2>/dev/null || true)
+  pubk=$(get_info_value PublicKey 2>/dev/null || true)
+  prik=$(get_info_value PrivateKey 2>/dev/null || true)
+  ip=$(get_info_value IP 2>/dev/null || true)
+  port=$(get_info_value Port 2>/dev/null || true)
+  sni=$(get_info_value SNI 2>/dev/null || true)
+  sid=$(get_info_value ShortID 2>/dev/null || true)
+  tag=$(get_info_value Tag 2>/dev/null || true)
+  listen=$(get_info_value ListenAddr 2>/dev/null || true)
+  link=$(get_info_value Link 2>/dev/null || true)
+  mode=$(get_info_value Mode 2>/dev/null || true)
+  bind4=$(get_info_value BindIPv4 2>/dev/null || true)
+
+  if [ -z "$uuid" ] && [ -z "$pubk" ]; then
+    return 0
+  fi
+
+  ensure_nodes_dir
+  local f
+  f=$(node_info_path reality)
+  cat > "$f" <<EOF
+Type=reality
+Tag=${tag:-reality}
+Mode=${mode:-ipv4}
+ListenAddr=${listen}
+Port=${port}
+SNI=${sni}
+UUID=${uuid}
+PublicKey=${pubk}
+PrivateKey=${prik}
+ShortID=${sid}
+IP=${ip}
+BindIPv4=${bind4}
+Link=${link}
+EOF
+}
+
 write_proxy_info(){
   local uuid="$1"
   local public_key="$2"
@@ -748,7 +997,18 @@ load_proxy_context(){
   fi
 }
 
-build_client_link(){
+# ─── 链接构造（按协议） ───────────────────────────────
+url_encode_host(){
+  # 给 IPv6 地址套 [] ，IPv4 / 域名原样返回
+  local ip="$1"
+  case "$ip" in
+    \[*\]) printf '%s' "$ip" ;;
+    *:*)   printf '[%s]' "$ip" ;;
+    *)     printf '%s' "$ip" ;;
+  esac
+}
+
+build_reality_link(){
   local uuid="$1"
   local ip="$2"
   local port="$3"
@@ -756,25 +1016,102 @@ build_client_link(){
   local public_key="$5"
   local short_id="$6"
   local tag="${7:-reality}"
-  local host="$ip"
 
   if [ -z "$uuid" ] || [ -z "$ip" ] || [ -z "$port" ] || [ -z "$sni" ] || [ -z "$public_key" ] || [ -z "$short_id" ]; then
     return 1
   fi
 
-  case "$ip" in
-    *:*)
-      case "$ip" in
-        \[*\]) ;;
-        *) host="[$ip]" ;;
-      esac
-      ;;
-  esac
-
+  local host
+  host=$(url_encode_host "$ip")
   printf 'vless://%s@%s:%s?encryption=none&flow=xtls-rprx-vision&security=reality&sni=%s&fp=chrome&pbk=%s&sid=%s&type=tcp#%s\n' \
     "$uuid" "$host" "$port" "$sni" "$public_key" "$short_id" "$tag"
 }
 
+build_hy2_link(){
+  # build_hy2_link <password> <ip> <port> <sni> <insecure 0|1> <obfs_type|""> <obfs_password|""> <tag>
+  local password="$1"
+  local ip="$2"
+  local port="$3"
+  local sni="$4"
+  local insecure="${5:-0}"
+  local obfs_type="$6"
+  local obfs_password="$7"
+  local tag="${8:-hy2}"
+
+  if [ -z "$password" ] || [ -z "$ip" ] || [ -z "$port" ]; then
+    return 1
+  fi
+
+  local host
+  host=$(url_encode_host "$ip")
+  local query="sni=${sni:-}&insecure=${insecure}"
+  if [ -n "$obfs_type" ]; then
+    query="${query}&obfs=${obfs_type}&obfs-password=${obfs_password}"
+  fi
+  printf 'hysteria2://%s@%s:%s?%s#%s\n' \
+    "$password" "$host" "$port" "$query" "$tag"
+}
+
+# 由节点 info 文件构造链接（dispatcher）
+build_link_for_node(){
+  local type="$1"
+  local ip_override="${2:-}"
+  local tag_override="${3:-}"
+
+  local node_type tag ip port sni
+  node_type=$(get_node_value "$type" Type 2>/dev/null || echo "$type")
+  tag=$(get_node_value "$type" Tag 2>/dev/null || echo "$type")
+  [ -n "$tag_override" ] && tag="$tag_override"
+  ip=${ip_override:-$(get_node_value "$type" IP 2>/dev/null || true)}
+  port=$(get_node_value "$type" Port 2>/dev/null || true)
+  sni=$(get_node_value "$type" SNI 2>/dev/null || true)
+
+  case "$node_type" in
+    reality)
+      local uuid pubk sid
+      uuid=$(get_node_value "$type" UUID 2>/dev/null || true)
+      pubk=$(get_node_value "$type" PublicKey 2>/dev/null || true)
+      sid=$(get_node_value "$type" ShortID 2>/dev/null || true)
+      build_reality_link "$uuid" "$ip" "$port" "$sni" "$pubk" "$sid" "$tag"
+      ;;
+    hy2)
+      local password insecure obfs_type obfs_pw
+      password=$(get_node_value "$type" Password 2>/dev/null || true)
+      insecure=$(get_node_value "$type" Insecure 2>/dev/null || echo 0)
+      obfs_type=$(get_node_value "$type" Obfs 2>/dev/null || true)
+      [ "$obfs_type" = "none" ] && obfs_type=""
+      obfs_pw=$(get_node_value "$type" ObfsPassword 2>/dev/null || true)
+      build_hy2_link "$password" "$ip" "$port" "$sni" "$insecure" "$obfs_type" "$obfs_pw" "$tag"
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+# 兼容旧调用（少数仍以 7 个参数调用 build_client_link 的地方）
+build_client_link(){
+  build_reality_link "$@"
+}
+
+# 双栈模式下，节点的 IPv6 副链接（如果与主 IP 不同）
+build_dualstack_ipv6_link_for_node(){
+  local type="$1"
+  local mode ipv6 main_ip tag
+  mode=$(get_node_value "$type" Mode 2>/dev/null || true)
+  if [ "$mode" != "dualstack" ]; then
+    return 1
+  fi
+  ipv6=$(detect_primary_ipv6)
+  main_ip=$(get_node_value "$type" IP 2>/dev/null || true)
+  if [ -z "$ipv6" ] || [ "$ipv6" = "$main_ip" ]; then
+    return 1
+  fi
+  tag=$(get_node_value "$type" Tag 2>/dev/null || echo "$type")
+  build_link_for_node "$type" "$ipv6" "${tag}-ipv6"
+}
+
+# 旧名兼容（仍被部分老代码调用，但新代码请用 build_dualstack_ipv6_link_for_node）
 build_dualstack_ipv6_link(){
   local uuid="$1"
   local port="$2"
@@ -793,7 +1130,7 @@ build_dualstack_ipv6_link(){
     return 1
   fi
 
-  build_client_link "$uuid" "$ipv6" "$port" "$sni" "$public_key" "$short_id" "${tag}-ipv6"
+  build_reality_link "$uuid" "$ipv6" "$port" "$sni" "$public_key" "$short_id" "${tag}-ipv6"
 }
 
 show_status_menu(){
@@ -1463,8 +1800,8 @@ configure_ssh_port(){
 
   if apply_sshd_setting "Port" "$ssh_port" "SSH 端口已更新并重启服务"; then
     cleanup_old_backups "${SSHD_CONFIG_PATH}.bak.*" 5
-    load_proxy_context
-    server_ip="${MENU_IP:-你的IP}"
+    server_ip=$(detect_primary_ipv4)
+    server_ip="${server_ip:-你的IP}"
     echo -e "  新登录方式: ${C}ssh 用户名@${server_ip} -p ${ssh_port}${N}"
     echo -e "  配置文件: ${C}$SSHD_CONFIG_PATH${N}"
     pause_screen
@@ -1809,42 +2146,81 @@ show_initcwnd_tuning_menu(){
   done
 }
 
+render_node_detail(){
+  local type="$1"
+  local node_type tag mode mode_label ip port sni
+  node_type=$(get_node_value "$type" Type 2>/dev/null || echo "$type")
+  tag=$(get_node_value "$type" Tag 2>/dev/null || echo "$type")
+  mode=$(get_node_value "$type" Mode 2>/dev/null || echo ipv4)
+  mode_label=$(describe_install_mode "$mode")
+  ip=$(get_node_value "$type" IP 2>/dev/null || true)
+  port=$(get_node_value "$type" Port 2>/dev/null || true)
+  sni=$(get_node_value "$type" SNI 2>/dev/null || true)
+
+  case "$node_type" in
+    reality)
+      local uuid pubk
+      uuid=$(get_node_value "$type" UUID 2>/dev/null || true)
+      pubk=$(get_node_value "$type" PublicKey 2>/dev/null || true)
+      echo -e "  类型      : ${C}Reality${N}  Tag : ${C}${tag}${N}"
+      echo -e "  UUID      : ${C}${uuid:-未知}${N}"
+      echo -e "  PublicKey : ${C}${pubk:-未知}${N}"
+      echo -e "  模式      : ${C}${mode_label}${N}"
+      echo -e "  IP        : ${C}${ip:-未知}${N}"
+      echo -e "  端口      : ${C}${port:-未知}${N} ${D}(TCP)${N}"
+      echo -e "  SNI       : ${C}${sni:-未知}${N}"
+      ;;
+    hy2)
+      local pwd_v cert_src obfs_t
+      pwd_v=$(get_node_value "$type" Password 2>/dev/null || true)
+      cert_src=$(get_node_value "$type" CertSource 2>/dev/null || true)
+      obfs_t=$(get_node_value "$type" Obfs 2>/dev/null || echo none)
+      echo -e "  类型      : ${C}Hysteria2${N}  Tag : ${C}${tag}${N}"
+      echo -e "  Password  : ${C}${pwd_v:-未知}${N}"
+      echo -e "  证书      : ${C}${cert_src:-未知}${N}"
+      echo -e "  Obfs      : ${C}${obfs_t}${N}"
+      echo -e "  模式      : ${C}${mode_label}${N}"
+      echo -e "  IP        : ${C}${ip:-未知}${N}"
+      echo -e "  端口      : ${C}${port:-未知}${N} ${D}(UDP)${N}"
+      echo -e "  SNI       : ${C}${sni:-未知}${N}"
+      ;;
+  esac
+}
+
 show_client_link(){
-  local current_link=""
-  local ipv6_link=""
-  local mode_label=""
+  local target current_link ipv6_link
 
   echo ""
-  if [ ! -f "$INFO_PATH" ] && [ ! -f "$CONFIG_PATH" ]; then
-    echo -e "  ${R}未找到节点信息，请先安装 sing-box${N}"
+  if ! is_singbox_installed; then
+    echo -e "  ${R}sing-box 尚未安装${N}"
+    pause_screen
+    return 1
+  fi
+  if [ "$(count_installed_nodes)" -eq 0 ]; then
+    echo -e "  ${R}未发现节点，请先创建节点${N}"
     pause_screen
     return 1
   fi
 
-  load_proxy_context
-  current_link=$(build_client_link "$MENU_UUID" "$MENU_IP" "$MENU_PORT" "$MENU_SNI" "$MENU_PUBLIC_KEY" "$MENU_SHORT_ID" "$MENU_TAG" 2>/dev/null || true)
-  ipv6_link=$(build_dualstack_ipv6_link "$MENU_UUID" "$MENU_PORT" "$MENU_SNI" "$MENU_PUBLIC_KEY" "$MENU_SHORT_ID" "$MENU_TAG" 2>/dev/null || true)
+  target=$(select_node_interactive "请选择要查看的节点")
+  if [ -z "$target" ]; then
+    echo -e "${R}选择无效${N}"
+    pause_screen
+    return 1
+  fi
 
+  render_node_detail "$target"
+
+  current_link=$(build_link_for_node "$target" 2>/dev/null || true)
+  ipv6_link=$(build_dualstack_ipv6_link_for_node "$target" 2>/dev/null || true)
   if [ -n "$current_link" ]; then
-    set_info_value "Link" "$current_link"
-    MENU_LINK="$current_link"
+    set_node_value "$target" Link "$current_link"
   fi
 
-  mode_label=$(describe_install_mode "${MENU_MODE:-ipv4}")
-
-  echo -e "  UUID      : ${C}${MENU_UUID:-未知}${N}"
-  echo -e "  PublicKey : ${C}${MENU_PUBLIC_KEY:-未知}${N}"
-  echo -e "  模式      : ${C}${mode_label}${N}"
-  echo -e "  IP        : ${C}${MENU_IP:-未知}${N}"
-  echo -e "  端口      : ${C}${MENU_PORT:-未知}${N}"
-  echo -e "  SNI       : ${C}${MENU_SNI:-未知}${N}"
-  if [ -n "$MENU_BIND_IPV4" ]; then
-    echo -e "  出站 IPv4 : ${C}${MENU_BIND_IPV4}${N}"
-  fi
   echo ""
   echo -e "  ${B}客户端链接：${N}"
-  echo -e "  ${G}${current_link:-${MENU_LINK:-未找到}}${N}"
-  print_qrcode "${current_link:-$MENU_LINK}"
+  echo -e "  ${G}${current_link:-未生成}${N}"
+  print_qrcode "${current_link:-}"
   if [ -n "$ipv6_link" ]; then
     echo ""
     echo -e "  ${B}IPv6 客户端链接：${N}"
@@ -1854,18 +2230,19 @@ show_client_link(){
   pause_screen
 }
 
-modify_node_params(){
-  local new_port=""
-  local new_sni=""
-  local new_uuid=""
-  local regen_keypair="n"
+modify_reality_params(){
+  local new_port="" new_sni="" new_uuid="" regen_keypair="n"
   local new_pri="" new_pub="" keypair="" new_short_id=""
-  local cur_port cur_sni cur_uuid
-  local backup_path=""
+  local cur_port cur_sni cur_uuid backup_path="" confirm
 
   if ! require_root; then return 1; fi
   if ! require_singbox_installed; then return 1; fi
-
+  if ! node_installed reality; then
+    echo ""
+    echo -e "${R}未发现 Reality 节点信息${N}"
+    pause_screen
+    return 1
+  fi
   if [ ! -f "$CONFIG_PATH" ]; then
     echo ""
     echo -e "${R}未找到配置文件：$CONFIG_PATH${N}"
@@ -1873,55 +2250,43 @@ modify_node_params(){
     return 1
   fi
 
-  load_proxy_context
-  cur_port="${MENU_PORT:-}"
-  cur_sni="${MENU_SNI:-}"
-  cur_uuid="${MENU_UUID:-}"
+  cur_port=$(get_node_value reality Port 2>/dev/null || true)
+  cur_sni=$(get_node_value reality SNI 2>/dev/null || true)
+  cur_uuid=$(get_node_value reality UUID 2>/dev/null || true)
 
   echo ""
-  echo -e "  ${B}${C}修改节点参数${N}  ${D}直接回车保留当前值${N}"
+  echo -e "  ${B}${C}修改 Reality 节点参数${N}  ${D}直接回车保留当前值${N}"
   render_divider
 
-  # 端口
   while true; do
     read -p "  端口 (${cur_port:-当前未知}): " new_port
     new_port="${new_port:-$cur_port}"
-    if validate_port "$new_port"; then
-      break
-    fi
+    if validate_port "$new_port"; then break; fi
     echo -e "${R}端口必须是 1-65535 的数字${N}"
   done
 
-  # SNI
   while true; do
     read -p "  SNI 域名 (${cur_sni:-当前未知}): " new_sni
     new_sni="${new_sni:-$cur_sni}"
     new_sni=$(sanitize_sni "$new_sni")
-    if [ -n "$new_sni" ]; then
-      break
-    fi
+    if [ -n "$new_sni" ]; then break; fi
     echo -e "${R}SNI 不能为空${N}"
   done
 
-  # UUID
   read -p "  UUID (回车保留当前 / 输入 new 随机生成新 UUID): " new_uuid
   case "$new_uuid" in
     new|NEW)
       new_uuid=$(cat /proc/sys/kernel/random/uuid)
       echo -e "  ${D}新 UUID：$new_uuid${N}"
       ;;
-    "")
-      new_uuid="$cur_uuid"
-      ;;
+    "") new_uuid="$cur_uuid" ;;
   esac
-
   if [ -z "$new_uuid" ]; then
     echo -e "${R}UUID 无效${N}"
     pause_screen
     return 1
   fi
 
-  # 是否同时重新生成密钥对和 ShortID
   read -p "  同时重新生成 Reality 密钥对 + ShortID？(y/N): " regen_keypair
   if [ "$regen_keypair" = "y" ] || [ "$regen_keypair" = "Y" ]; then
     echo -e "${Y}==> 生成新密钥对...${N}"
@@ -1955,7 +2320,6 @@ modify_node_params(){
     return 0
   fi
 
-  # 备份
   backup_path="${CONFIG_PATH}.bak.$(date +%Y%m%d%H%M%S)"
   if ! cp "$CONFIG_PATH" "$backup_path"; then
     echo -e "${R}配置备份失败${N}"
@@ -1963,27 +2327,15 @@ modify_node_params(){
     return 1
   fi
 
-  # 用 jq 安全修改 JSON
-  if ! command -v jq >/dev/null 2>&1; then
-    echo -e "${Y}==> 安装 jq...${N}"
-    if ! apt-get install -y jq 2>/dev/null; then
-      echo -e "${R}jq 安装失败，请手动执行：apt install jq${N}"
-      pause_screen
-      return 1
-    fi
-  fi
+  ensure_jq || { pause_screen; return 1; }
 
-  local jq_filter='.inbounds[0].listen_port = ($port | tonumber)
-    | .inbounds[0].users[0].uuid = $uuid
-    | .inbounds[0].tls.server_name = $sni
-    | .inbounds[0].tls.reality.handshake.server = $sni'
-
-  if [ -n "$new_pri" ]; then
-    jq_filter="$jq_filter | .inbounds[0].tls.reality.private_key = \$pri"
-  fi
-  if [ -n "$new_short_id" ]; then
-    jq_filter="$jq_filter | .inbounds[0].tls.reality.short_id = [\$sid]"
-  fi
+  local jq_filter='(.inbounds[] | select(.tag == "reality-in"))
+    |= ( .listen_port = ($port | tonumber)
+       | .users[0].uuid = $uuid
+       | .tls.server_name = $sni
+       | .tls.reality.handshake.server = $sni
+       | (if $pri != "" then .tls.reality.private_key = $pri else . end)
+       | (if $sid != "" then .tls.reality.short_id = [$sid] else . end))'
 
   local tmp_file
   tmp_file=$(mktemp)
@@ -1998,7 +2350,6 @@ modify_node_params(){
   fi
   mv "$tmp_file" "$CONFIG_PATH"
 
-  # 校验
   if ! sing-box check -c "$CONFIG_PATH"; then
     cp "$backup_path" "$CONFIG_PATH" 2>/dev/null || true
     echo ""
@@ -2006,8 +2357,6 @@ modify_node_params(){
     pause_screen
     return 1
   fi
-
-  # 重启
   if ! systemctl restart sing-box; then
     cp "$backup_path" "$CONFIG_PATH" 2>/dev/null || true
     echo ""
@@ -2016,27 +2365,27 @@ modify_node_params(){
     return 1
   fi
 
-  # 同步 info 文件
-  load_proxy_context
-  local final_pub="${new_pub:-$MENU_PUBLIC_KEY}"
-  local final_short_id="${new_short_id:-$MENU_SHORT_ID}"
-  local new_link
-  local ipv6_new_link
-  new_link=$(build_client_link "$new_uuid" "$MENU_IP" "$new_port" "$new_sni" "$final_pub" "$final_short_id" "${MENU_TAG:-reality}" 2>/dev/null || true)
-  ipv6_new_link=$(build_dualstack_ipv6_link "$new_uuid" "$new_port" "$new_sni" "$final_pub" "$final_short_id" "${MENU_TAG:-reality}" 2>/dev/null || true)
-  set_info_value "Port" "$new_port"
-  set_info_value "SNI"  "$new_sni"
-  set_info_value "UUID" "$new_uuid"
+  set_node_value reality Port "$new_port"
+  set_node_value reality SNI "$new_sni"
+  set_node_value reality UUID "$new_uuid"
   if [ -n "$new_pub" ]; then
-    set_info_value "PublicKey"  "$new_pub"
-    set_info_value "PrivateKey" "$new_pri"
-    set_info_value "ShortID"    "$new_short_id"
+    set_node_value reality PublicKey "$new_pub"
+    set_node_value reality PrivateKey "$new_pri"
+    set_node_value reality ShortID "$new_short_id"
   fi
-  [ -n "$new_link" ] && set_info_value "Link" "$new_link"
+
+  local cur_ip cur_tag final_pub final_sid new_link ipv6_new_link
+  cur_ip=$(get_node_value reality IP 2>/dev/null || true)
+  cur_tag=$(get_node_value reality Tag 2>/dev/null || echo reality)
+  final_pub="${new_pub:-$(get_node_value reality PublicKey 2>/dev/null || true)}"
+  final_sid="${new_short_id:-$(get_node_value reality ShortID 2>/dev/null || true)}"
+  new_link=$(build_reality_link "$new_uuid" "$cur_ip" "$new_port" "$new_sni" "$final_pub" "$final_sid" "${cur_tag:-reality}" 2>/dev/null || true)
+  ipv6_new_link=$(build_dualstack_ipv6_link_for_node reality 2>/dev/null || true)
+  [ -n "$new_link" ] && set_node_value reality Link "$new_link"
   cleanup_old_backups "${CONFIG_PATH}.bak.*" 5
 
   echo ""
-  echo -e "${G}节点参数已更新并重启服务${N}"
+  echo -e "${G}Reality 节点参数已更新并重启服务${N}"
   echo -e "  备份文件：${D}$backup_path${N}"
   if [ -n "$new_link" ]; then
     echo ""
@@ -2051,6 +2400,37 @@ modify_node_params(){
     print_qrcode "$ipv6_new_link"
   fi
   pause_screen
+}
+
+# 节点参数修改 dispatcher（多节点时让用户选择）
+modify_node_params(){
+  if ! require_root; then return 1; fi
+  if ! require_singbox_installed; then return 1; fi
+  local count target
+  count=$(count_installed_nodes)
+  if [ "$count" -eq 0 ]; then
+    echo ""
+    echo -e "${R}未发现节点，请先创建节点${N}"
+    pause_screen
+    return 1
+  fi
+  target=$(select_node_interactive "请选择要修改的节点")
+  if [ -z "$target" ]; then
+    echo -e "${R}选择无效${N}"
+    pause_screen
+    return 1
+  fi
+  local node_type
+  node_type=$(get_node_value "$target" Type 2>/dev/null || echo "$target")
+  case "$node_type" in
+    reality) modify_reality_params ;;
+    hy2)     modify_hy2_params ;;
+    *)
+      echo -e "${R}未知节点类型: $node_type${N}"
+      pause_screen
+      return 1
+      ;;
+  esac
 }
 
 print_qrcode(){
@@ -2075,14 +2455,25 @@ print_qrcode(){
 }
 
 show_qrcode(){
-  local link=""
-  local ipv6_link=""
+  local target link ipv6_link
 
   if ! require_singbox_installed; then return 1; fi
+  if [ "$(count_installed_nodes)" -eq 0 ]; then
+    echo ""
+    echo -e "${R}未发现节点，请先创建节点${N}"
+    pause_screen
+    return 1
+  fi
 
-  load_proxy_context
-  link=$(build_client_link "$MENU_UUID" "$MENU_IP" "$MENU_PORT" "$MENU_SNI" "$MENU_PUBLIC_KEY" "$MENU_SHORT_ID" "${MENU_TAG:-reality}" 2>/dev/null || true)
-  ipv6_link=$(build_dualstack_ipv6_link "$MENU_UUID" "$MENU_PORT" "$MENU_SNI" "$MENU_PUBLIC_KEY" "$MENU_SHORT_ID" "${MENU_TAG:-reality}" 2>/dev/null || true)
+  target=$(select_node_interactive "请选择要生成二维码的节点")
+  if [ -z "$target" ]; then
+    echo -e "${R}选择无效${N}"
+    pause_screen
+    return 1
+  fi
+
+  link=$(build_link_for_node "$target" 2>/dev/null || true)
+  ipv6_link=$(build_dualstack_ipv6_link_for_node "$target" 2>/dev/null || true)
 
   if [ -z "$link" ]; then
     echo ""
@@ -2842,24 +3233,28 @@ cleanup_config_backups(){
 }
 
 # ─── 首次安装入口 ─────────────────────────────────────
-do_install(){
-  local port_input=""
-  local sni_input=""
-  local keypair=""
-  local private_key=""
-  local public_key=""
-  local access_ip=""
-  local link=""
-  local ipv6_link=""
-  local public_ipv4=""
-  local public_ipv6=""
-  local outbound_bind_ip=""
-  local install_mode="ipv4"
-  local mode_label=""
+install_reality_node(){
+  local port_input="" sni_input=""
+  local keypair="" private_key="" public_key=""
+  local access_ip="" link="" ipv6_link=""
+  local public_ipv4="" public_ipv6=""
+  local install_mode="ipv4" mode_label=""
+  local PORT SNI TAG LISTEN_CHOICE LISTEN_ADDR UUID SHORT_ID confirm
 
-  render_section_header "Leyili Sing-box 安装向导"
+  if ! require_root; then return 1; fi
+
+  render_section_header "创建 Reality 节点"
   echo -e "  ${Y}直接回车使用括号内默认值${N}"
   echo ""
+
+  if node_installed reality; then
+    echo -e "${Y}检测到已存在 Reality 节点，继续将覆盖原节点配置${N}"
+    read -p "  继续？(y/N): " confirm
+    if [ "$confirm" != "y" ] && [ "$confirm" != "Y" ]; then
+      echo -e "  已取消"
+      return 0
+    fi
+  fi
 
   while true; do
     read -p "  端口 (8443): " port_input
@@ -2889,23 +3284,13 @@ do_install(){
   echo "    3) 仅 IPv6 入站 + 仅 IPv4 出站"
   read -p "  请选择 (1): " LISTEN_CHOICE
   case "$LISTEN_CHOICE" in
-    2)
-      LISTEN_ADDR="::"
-      install_mode="dualstack"
-      ;;
-    3)
-      LISTEN_ADDR=""
-      install_mode="ipv6-in-ipv4-out"
-      ;;
-    *)
-      LISTEN_ADDR="0.0.0.0"
-      install_mode="ipv4"
-      ;;
+    2) LISTEN_ADDR="::"; install_mode="dualstack" ;;
+    3) LISTEN_ADDR=""; install_mode="ipv6-in-ipv4-out" ;;
+    *) LISTEN_ADDR="0.0.0.0"; install_mode="ipv4" ;;
   esac
 
   if [ "$install_mode" = "ipv6-in-ipv4-out" ]; then
     public_ipv6=$(detect_primary_ipv6)
-
     if [ -z "$public_ipv6" ]; then
       echo ""
       echo -e "${R}未检测到可用的 IPv6 地址，无法使用“仅 IPv6 入站 + 仅 IPv4 出站”模式${N}"
@@ -2914,13 +3299,15 @@ do_install(){
     fi
   fi
 
-  echo ""
-  echo -e "${Y}==> 安装 sing-box...${N}"
-  if ! bash <(curl -fsSL "$INSTALL_URL"); then
+  if ! is_singbox_installed; then
     echo ""
-    echo -e "${R}sing-box 安装失败，请检查上方输出${N}"
-    pause_screen
-    return 1
+    echo -e "${Y}==> 安装 sing-box...${N}"
+    if ! bash <(curl -fsSL "$INSTALL_URL"); then
+      echo ""
+      echo -e "${R}sing-box 安装失败，请检查上方输出${N}"
+      pause_screen
+      return 1
+    fi
   fi
 
   echo -e "${Y}==> 生成参数...${N}"
@@ -2941,12 +3328,8 @@ do_install(){
     return 1
   fi
 
-  if [ -z "$public_ipv4" ]; then
-    public_ipv4=$(detect_primary_ipv4)
-  fi
-  if [ -z "$public_ipv6" ]; then
-    public_ipv6=$(detect_primary_ipv6)
-  fi
+  public_ipv4=${public_ipv4:-$(detect_primary_ipv4)}
+  public_ipv6=${public_ipv6:-$(detect_primary_ipv6)}
 
   case "$install_mode" in
     ipv6-in-ipv4-out)
@@ -2954,16 +3337,13 @@ do_install(){
       LISTEN_ADDR="$public_ipv6"
       if [ -z "$access_ip" ]; then
         echo ""
-        echo -e "${R}未检测到可用的 IPv6 地址，无法使用“仅 IPv6 入站 + 仅 IPv4 出站”模式${N}"
+        echo -e "${R}未检测到可用的 IPv6 地址${N}"
         pause_screen
         return 1
       fi
       ;;
     dualstack)
-      access_ip="$public_ipv4"
-      if [ -z "$access_ip" ]; then
-        access_ip="$public_ipv6"
-      fi
+      access_ip="${public_ipv4:-$public_ipv6}"
       if [ -z "$access_ip" ]; then
         echo ""
         echo -e "${R}未检测到可用的 IPv4 / IPv6 地址${N}"
@@ -2985,134 +3365,80 @@ do_install(){
   mode_label=$(describe_install_mode "$install_mode")
 
   echo -e "${Y}==> 写入配置...${N}"
-  mkdir -p /etc/sing-box
-  if [ "$install_mode" = "ipv6-in-ipv4-out" ]; then
-    cat > "$CONFIG_PATH" << EOF
-{
-  "log": {"disabled": false, "level": "warn", "timestamp": true},
-  "dns": {
-    "servers": [{
-      "type": "local",
-      "tag": "local"
-    }]
-  },
-  "inbounds": [{
-    "type": "vless",
-    "tag": "vless-in",
-    "listen": "$LISTEN_ADDR",
-    "listen_port": $PORT,
-    "users": [{"uuid": "$UUID", "flow": "xtls-rprx-vision"}],
-    "tls": {
-      "enabled": true,
-      "server_name": "$SNI",
-      "reality": {
-        "enabled": true,
-        "handshake": {"server": "$SNI", "server_port": 443},
-        "private_key": "$private_key",
-        "short_id": ["$SHORT_ID"]
+  ensure_jq || { pause_screen; return 1; }
+
+  local inbound_json
+  inbound_json=$(jq -n \
+    --arg listen "$LISTEN_ADDR" \
+    --argjson port "$PORT" \
+    --arg uuid "$UUID" \
+    --arg sni "$SNI" \
+    --arg priv "$private_key" \
+    --arg sid "$SHORT_ID" '{
+      type: "vless",
+      tag: "reality-in",
+      listen: $listen,
+      listen_port: $port,
+      users: [{uuid: $uuid, flow: "xtls-rprx-vision"}],
+      tls: {
+        enabled: true,
+        server_name: $sni,
+        reality: {
+          enabled: true,
+          handshake: {server: $sni, server_port: 443},
+          private_key: $priv,
+          short_id: [$sid]
+        }
       }
-    }
-  }],
-  "outbounds": [{
-    "type": "direct",
-    "domain_resolver": {
-      "server": "local",
-      "strategy": "ipv4_only"
-    }
-  }]
-}
-EOF
-  else
-    cat > "$CONFIG_PATH" << EOF
-{
-  "log": {"disabled": false, "level": "warn", "timestamp": true},
-  "dns": {
-    "servers": [{
-      "type": "local",
-      "tag": "local"
-    }]
-  },
-  "inbounds": [{
-    "type": "vless",
-    "tag": "vless-in",
-    "listen": "$LISTEN_ADDR",
-    "listen_port": $PORT,
-    "users": [{"uuid": "$UUID", "flow": "xtls-rprx-vision"}],
-    "tls": {
-      "enabled": true,
-      "server_name": "$SNI",
-      "reality": {
-        "enabled": true,
-        "handshake": {"server": "$SNI", "server_port": 443},
-        "private_key": "$private_key",
-        "short_id": ["$SHORT_ID"]
-      }
-    }
-  }],
-  "outbounds": [{
-    "type": "direct",
-    "domain_resolver": {
-      "server": "local",
-      "strategy": "ipv4_only"
-    }
-  }]
-}
-EOF
-  fi
+    }')
 
-  echo -e "${Y}==> 校验配置...${N}"
-  if ! sing-box check -c "$CONFIG_PATH"; then
+  if ! config_add_inbound "$inbound_json"; then
+    echo -e "${R}写入 inbound 失败${N}"
     pause_screen
     return 1
   fi
 
-  echo -e "${Y}==> 启动服务...${N}"
-  if ! systemctl enable sing-box; then
+  echo -e "${Y}==> 校验并启动...${N}"
+  if ! config_check_and_restart; then
     echo ""
-    echo -e "${R}sing-box 开机自启设置失败${N}"
-    pause_screen
-    return 1
-  fi
-  if ! systemctl restart sing-box; then
-    echo ""
-    echo -e "${R}sing-box 启动失败${N}"
+    echo -e "${R}sing-box 校验或重启失败${N}"
     pause_screen
     return 1
   fi
 
-  link=$(build_client_link "$UUID" "$access_ip" "$PORT" "$SNI" "$public_key" "$SHORT_ID" "$TAG" 2>/dev/null || true)
+  allow_port_in_firewall "$PORT" tcp
+
+  link=$(build_reality_link "$UUID" "$access_ip" "$PORT" "$SNI" "$public_key" "$SHORT_ID" "$TAG" 2>/dev/null || true)
   if [ "$install_mode" = "dualstack" ] && [ -n "$public_ipv6" ] && [ "$public_ipv6" != "$access_ip" ]; then
-    ipv6_link=$(build_client_link "$UUID" "$public_ipv6" "$PORT" "$SNI" "$public_key" "$SHORT_ID" "${TAG}-ipv6" 2>/dev/null || true)
+    ipv6_link=$(build_reality_link "$UUID" "$public_ipv6" "$PORT" "$SNI" "$public_key" "$SHORT_ID" "${TAG}-ipv6" 2>/dev/null || true)
   fi
 
-  write_proxy_info \
-    "$UUID" \
-    "$public_key" \
-    "$private_key" \
-    "$access_ip" \
-    "$PORT" \
-    "$SNI" \
-    "$SHORT_ID" \
-    "$TAG" \
-    "$LISTEN_ADDR" \
-    "$link" \
-    "$install_mode" \
-    "$outbound_bind_ip"
+  ensure_nodes_dir
+  cat > "$(node_info_path reality)" <<EOF
+Type=reality
+Tag=$TAG
+Mode=$install_mode
+ListenAddr=$LISTEN_ADDR
+Port=$PORT
+SNI=$SNI
+UUID=$UUID
+PublicKey=$public_key
+PrivateKey=$private_key
+ShortID=$SHORT_ID
+IP=$access_ip
+Link=$link
+EOF
 
-  # 注册 sb 快捷命令
   register_sb_command || true
 
   echo ""
   echo -e "  ${G}╔══════════════════════════════════════════════════════╗${N}"
-  echo -e "  ${G}║${N}  ${B}${W}${APP_NAME}${N}  ${G}Sing-box 安装完成${N}                           ${G}║${N}"
+  echo -e "  ${G}║${N}  ${B}${W}${APP_NAME}${N}  ${G}Reality 节点创建完成${N}                       ${G}║${N}"
   echo -e "  ${G}╚══════════════════════════════════════════════════════╝${N}"
   echo -e "  模式      : ${C}$mode_label${N}"
   echo -e "  UUID      : ${C}$UUID${N}"
   echo -e "  PublicKey : ${C}$public_key${N}"
   echo -e "  入口 IP   : ${C}${access_ip:-未知}${N}"
-  if [ -n "$outbound_bind_ip" ]; then
-    echo -e "  出站 IPv4 : ${C}$outbound_bind_ip${N}"
-  fi
   echo -e "  出站策略  : ${C}仅 IPv4${N}"
   echo -e "  端口      : ${C}$PORT${N}"
   echo -e "  SNI       : ${C}$SNI${N}"
@@ -3127,21 +3453,664 @@ EOF
     print_qrcode "$ipv6_link"
   fi
   echo ""
-  echo -e "  信息已保存至 ${Y}$INFO_PATH${N}"
+  echo -e "  信息已保存至 ${Y}$(node_info_path reality)${N}"
   echo -e "  输入 ${B}${COMMAND_NAME}${N} 进入管理菜单"
   pause_screen
 }
 
+uninstall_reality_node(){
+  local confirm
+  if ! node_installed reality; then
+    echo -e "${Y}Reality 节点未安装${N}"
+    pause_screen
+    return 0
+  fi
+  echo ""
+  read -p "  确认卸载 Reality 节点？(y/N): " confirm
+  if [ "$confirm" != "y" ] && [ "$confirm" != "Y" ]; then
+    echo -e "  已取消"
+    return 0
+  fi
+  config_remove_inbound_by_tag "reality-in" || true
+  remove_node_info reality
+  if is_singbox_installed && [ -f "$CONFIG_PATH" ]; then
+    if sing-box check -c "$CONFIG_PATH" >/dev/null 2>&1; then
+      systemctl restart sing-box >/dev/null 2>&1 || true
+    fi
+  fi
+  echo -e "${G}Reality 节点已卸载${N}"
+  pause_screen
+}
+
+# 兼容入口：do_install 默认创建 Reality 节点
+do_install(){ install_reality_node; }
+
+# ─── Hysteria2 节点 ────────────────────────────────────
+generate_hy2_random_port(){
+  local p attempts=0
+  while [ $attempts -lt 30 ]; do
+    p=$(( (RANDOM << 15 | RANDOM) % 45535 + 20000 ))
+    if ! check_port_in_use "$p"; then
+      printf '%s' "$p"
+      return 0
+    fi
+    attempts=$((attempts + 1))
+  done
+  printf '%s' "$p"
+}
+
+generate_self_signed_cert_for_hy2(){
+  local sni="$1"
+  ensure_nodes_dir
+  local crt="$CERTS_DIR/hy2.crt"
+  local key="$CERTS_DIR/hy2.key"
+  if ! command -v openssl >/dev/null 2>&1; then
+    echo -e "${R}未找到 openssl${N}"
+    return 1
+  fi
+  if ! openssl ecparam -genkey -name prime256v1 -out "$key" 2>/dev/null; then
+    if ! openssl genrsa -out "$key" 2048 >/dev/null 2>&1; then
+      echo -e "${R}私钥生成失败${N}"
+      return 1
+    fi
+  fi
+  if ! openssl req -new -x509 -days 3650 -key "$key" -out "$crt" \
+       -subj "/CN=${sni}" >/dev/null 2>&1; then
+    echo -e "${R}自签证书生成失败${N}"
+    return 1
+  fi
+  chmod 600 "$key"
+  printf '%s\n%s' "$crt" "$key"
+}
+
+install_hy2_node(){
+  local port_input="" sni_input=""
+  local PORT SNI TAG LISTEN_CHOICE LISTEN_ADDR install_mode="ipv4"
+  local cert_choice cert_source="self" acme_email=""
+  local password obfs_password obfs_choice obfs_enable=1
+  local public_ipv4="" public_ipv6="" access_ip=""
+  local link="" ipv6_link="" mode_label="" confirm
+  local cert_paths cert_path key_path
+
+  if ! require_root; then return 1; fi
+
+  render_section_header "创建 Hysteria2 节点"
+  echo -e "  ${Y}直接回车使用括号内默认值${N}"
+  echo ""
+
+  if node_installed hy2; then
+    echo -e "${Y}检测到已存在 Hysteria2 节点，继续将覆盖原节点配置${N}"
+    read -p "  继续？(y/N): " confirm
+    if [ "$confirm" != "y" ] && [ "$confirm" != "Y" ]; then
+      echo -e "  已取消"
+      return 0
+    fi
+  fi
+
+  # 端口（默认随机高位 UDP）
+  local default_port
+  default_port=$(generate_hy2_random_port)
+  while true; do
+    read -p "  端口 (${default_port}, 回车随机): " port_input
+    PORT="${port_input:-$default_port}"
+    if validate_port "$PORT"; then
+      break
+    fi
+    echo -e "${R}端口必须是 1-65535 的数字${N}"
+  done
+
+  # 节点名
+  read -p "  节点名称 (hy2): " TAG
+  TAG="${TAG:-hy2}"
+
+  # 监听模式
+  echo -e "  监听模式："
+  echo "    1) 仅 IPv4 入站 + 仅 IPv4 出站 - 0.0.0.0（默认）"
+  echo "    2) 双栈入站 + 仅 IPv4 出站 - ::"
+  echo "    3) 仅 IPv6 入站 + 仅 IPv4 出站"
+  read -p "  请选择 (1): " LISTEN_CHOICE
+  case "$LISTEN_CHOICE" in
+    2) LISTEN_ADDR="::"; install_mode="dualstack" ;;
+    3) LISTEN_ADDR=""; install_mode="ipv6-in-ipv4-out" ;;
+    *) LISTEN_ADDR="0.0.0.0"; install_mode="ipv4" ;;
+  esac
+
+  if [ "$install_mode" = "ipv6-in-ipv4-out" ]; then
+    public_ipv6=$(detect_primary_ipv6)
+    if [ -z "$public_ipv6" ]; then
+      echo ""
+      echo -e "${R}未检测到可用的 IPv6 地址，无法使用“仅 IPv6 入站 + 仅 IPv4 出站”模式${N}"
+      pause_screen
+      return 1
+    fi
+  fi
+
+  # 证书来源
+  echo -e "  证书来源："
+  echo "    1) 自签证书（推荐，客户端 insecure=1）（默认）"
+  echo "    2) ACME 自动签发（需要真实域名 + 80 端口可用）"
+  read -p "  请选择 (1): " cert_choice
+  case "$cert_choice" in
+    2) cert_source="acme" ;;
+    *) cert_source="self" ;;
+  esac
+
+  # SNI / 域名
+  if [ "$cert_source" = "acme" ]; then
+    while true; do
+      read -p "  真实域名（已解析到本机）: " sni_input
+      sni_input="${sni_input:-}"
+      SNI=$(sanitize_sni "$sni_input")
+      if [ -n "$SNI" ]; then break; fi
+      echo -e "${R}ACME 模式必须提供真实域名${N}"
+    done
+    while true; do
+      read -p "  ACME 邮箱: " acme_email
+      if [ -n "$acme_email" ] && printf '%s' "$acme_email" | grep -q "@"; then break; fi
+      echo -e "${R}邮箱不能为空，且必须包含 @${N}"
+    done
+  else
+    while true; do
+      read -p "  伪装 SNI (bing.com): " sni_input
+      sni_input="${sni_input:-bing.com}"
+      SNI=$(sanitize_sni "$sni_input")
+      if [ -n "$SNI" ]; then break; fi
+      echo -e "${R}SNI 不能为空${N}"
+    done
+  fi
+
+  # obfs（默认启用 salamander）
+  echo -e "  obfs 混淆 (salamander)："
+  echo "    1) 启用，密码自动生成（默认）"
+  echo "    2) 不启用"
+  read -p "  请选择 (1): " obfs_choice
+  case "$obfs_choice" in
+    2) obfs_enable=0 ;;
+    *) obfs_enable=1 ;;
+  esac
+
+  if ! is_singbox_installed; then
+    echo ""
+    echo -e "${Y}==> 安装 sing-box...${N}"
+    if ! bash <(curl -fsSL "$INSTALL_URL"); then
+      echo ""
+      echo -e "${R}sing-box 安装失败，请检查上方输出${N}"
+      pause_screen
+      return 1
+    fi
+  fi
+
+  echo -e "${Y}==> 生成参数...${N}"
+  if ! command -v openssl >/dev/null 2>&1; then
+    echo -e "${R}缺少 openssl${N}"
+    pause_screen
+    return 1
+  fi
+  password=$(openssl rand -base64 16 | tr -d '=+/' | cut -c1-22)
+  if [ "$obfs_enable" = "1" ]; then
+    obfs_password=$(openssl rand -base64 16 | tr -d '=+/' | cut -c1-22)
+  fi
+
+  public_ipv4=${public_ipv4:-$(detect_primary_ipv4)}
+  public_ipv6=${public_ipv6:-$(detect_primary_ipv6)}
+
+  case "$install_mode" in
+    ipv6-in-ipv4-out)
+      access_ip="$public_ipv6"
+      LISTEN_ADDR="$public_ipv6"
+      [ -z "$access_ip" ] && { echo -e "${R}未检测到 IPv6${N}"; pause_screen; return 1; }
+      ;;
+    dualstack)
+      access_ip="${public_ipv4:-$public_ipv6}"
+      [ -z "$access_ip" ] && { echo -e "${R}未检测到 IPv4 / IPv6${N}"; pause_screen; return 1; }
+      ;;
+    *)
+      access_ip="$public_ipv4"
+      [ -z "$access_ip" ] && { echo -e "${R}未检测到 IPv4${N}"; pause_screen; return 1; }
+      ;;
+  esac
+
+  mode_label=$(describe_install_mode "$install_mode")
+
+  # 准备证书
+  if [ "$cert_source" = "self" ]; then
+    echo -e "${Y}==> 生成自签证书...${N}"
+    cert_paths=$(generate_self_signed_cert_for_hy2 "$SNI") || { pause_screen; return 1; }
+    cert_path=$(echo "$cert_paths" | sed -n '1p')
+    key_path=$(echo "$cert_paths" | sed -n '2p')
+  fi
+
+  echo -e "${Y}==> 写入配置...${N}"
+  ensure_jq || { pause_screen; return 1; }
+
+  local tls_json
+  if [ "$cert_source" = "acme" ]; then
+    tls_json=$(jq -n --arg sni "$SNI" --arg email "$acme_email" '{
+      enabled: true,
+      server_name: $sni,
+      alpn: ["h3"],
+      acme: {domain: [$sni], email: $email}
+    }')
+  else
+    tls_json=$(jq -n --arg sni "$SNI" --arg crt "$cert_path" --arg key "$key_path" '{
+      enabled: true,
+      server_name: $sni,
+      alpn: ["h3"],
+      certificate_path: $crt,
+      key_path: $key
+    }')
+  fi
+
+  local obfs_json="null"
+  if [ "$obfs_enable" = "1" ]; then
+    obfs_json=$(jq -n --arg pw "$obfs_password" '{type: "salamander", password: $pw}')
+  fi
+
+  local inbound_json
+  inbound_json=$(jq -n \
+    --arg listen "$LISTEN_ADDR" \
+    --argjson port "$PORT" \
+    --arg pw "$password" \
+    --argjson tls "$tls_json" \
+    --argjson obfs "$obfs_json" '
+    {
+      type: "hysteria2",
+      tag: "hy2-in",
+      listen: $listen,
+      listen_port: $port,
+      users: [{password: $pw}],
+      tls: $tls
+    } + (if $obfs == null then {} else {obfs: $obfs} end)')
+
+  if ! config_add_inbound "$inbound_json"; then
+    echo -e "${R}写入 inbound 失败${N}"
+    pause_screen
+    return 1
+  fi
+
+  echo -e "${Y}==> 校验并启动...${N}"
+  if ! config_check_and_restart; then
+    echo ""
+    echo -e "${R}sing-box 校验或重启失败${N}"
+    pause_screen
+    return 1
+  fi
+
+  allow_port_in_firewall "$PORT" udp
+  if [ "$cert_source" = "acme" ]; then
+    allow_port_in_firewall 80 tcp
+  fi
+
+  local insecure="0"
+  [ "$cert_source" = "self" ] && insecure="1"
+  local link_obfs_type=""
+  [ "$obfs_enable" = "1" ] && link_obfs_type="salamander"
+
+  link=$(build_hy2_link "$password" "$access_ip" "$PORT" "$SNI" "$insecure" "$link_obfs_type" "${obfs_password:-}" "$TAG" 2>/dev/null || true)
+  if [ "$install_mode" = "dualstack" ] && [ -n "$public_ipv6" ] && [ "$public_ipv6" != "$access_ip" ]; then
+    ipv6_link=$(build_hy2_link "$password" "$public_ipv6" "$PORT" "$SNI" "$insecure" "$link_obfs_type" "${obfs_password:-}" "${TAG}-ipv6" 2>/dev/null || true)
+  fi
+
+  ensure_nodes_dir
+  cat > "$(node_info_path hy2)" <<EOF
+Type=hy2
+Tag=$TAG
+Mode=$install_mode
+ListenAddr=$LISTEN_ADDR
+Port=$PORT
+SNI=$SNI
+CertSource=$cert_source
+ACMEEmail=$acme_email
+CertPath=${cert_path:-}
+KeyPath=${key_path:-}
+Password=$password
+Obfs=${link_obfs_type:-none}
+ObfsPassword=${obfs_password:-}
+Insecure=$insecure
+IP=$access_ip
+Link=$link
+EOF
+
+  register_sb_command || true
+
+  echo ""
+  echo -e "  ${G}╔══════════════════════════════════════════════════════╗${N}"
+  echo -e "  ${G}║${N}  ${B}${W}${APP_NAME}${N}  ${G}Hysteria2 节点创建完成${N}                     ${G}║${N}"
+  echo -e "  ${G}╚══════════════════════════════════════════════════════╝${N}"
+  echo -e "  模式      : ${C}$mode_label${N}"
+  echo -e "  端口      : ${C}$PORT${N} ${D}(UDP)${N}"
+  echo -e "  入口 IP   : ${C}${access_ip:-未知}${N}"
+  echo -e "  SNI       : ${C}$SNI${N}"
+  echo -e "  证书      : ${C}${cert_source}${N}$([ "$insecure" = "1" ] && echo "  ${Y}(客户端需 insecure=1)${N}")"
+  echo -e "  Password  : ${C}$password${N}"
+  if [ "$obfs_enable" = "1" ]; then
+    echo -e "  Obfs      : ${C}salamander${N}  ObfsPwd : ${C}$obfs_password${N}"
+  fi
+  echo -e "  出站策略  : ${C}仅 IPv4${N}"
+  echo ""
+  echo -e "  ${B}客户端链接：${N}"
+  echo -e "  ${G}${link:-未生成}${N}"
+  print_qrcode "${link:-}"
+  if [ -n "$ipv6_link" ]; then
+    echo ""
+    echo -e "  ${B}IPv6 客户端链接：${N}"
+    echo -e "  ${G}${ipv6_link}${N}"
+    print_qrcode "$ipv6_link"
+  fi
+  echo ""
+  echo -e "  信息已保存至 ${Y}$(node_info_path hy2)${N}"
+  echo -e "  输入 ${B}${COMMAND_NAME}${N} 进入管理菜单"
+  pause_screen
+}
+
+uninstall_hy2_node(){
+  local confirm
+  if ! node_installed hy2; then
+    echo -e "${Y}Hysteria2 节点未安装${N}"
+    pause_screen
+    return 0
+  fi
+  echo ""
+  read -p "  确认卸载 Hysteria2 节点？(y/N): " confirm
+  if [ "$confirm" != "y" ] && [ "$confirm" != "Y" ]; then
+    echo -e "  已取消"
+    return 0
+  fi
+  config_remove_inbound_by_tag "hy2-in" || true
+  remove_node_info hy2
+  rm -f "$CERTS_DIR/hy2.crt" "$CERTS_DIR/hy2.key" 2>/dev/null || true
+  if is_singbox_installed && [ -f "$CONFIG_PATH" ]; then
+    if sing-box check -c "$CONFIG_PATH" >/dev/null 2>&1; then
+      systemctl restart sing-box >/dev/null 2>&1 || true
+    fi
+  fi
+  echo -e "${G}Hysteria2 节点已卸载${N}"
+  pause_screen
+}
+
+modify_hy2_params(){
+  local new_port="" new_sni="" regen_pw="n"
+  local cur_port cur_sni cur_pw cur_obfs cur_obfs_pw cur_cert_src cur_email
+  local new_pw="" new_obfs_pw=""
+  local backup_path="" confirm
+
+  if ! require_root; then return 1; fi
+  if ! require_singbox_installed; then return 1; fi
+  if ! node_installed hy2; then
+    echo ""
+    echo -e "${R}未发现 Hysteria2 节点信息${N}"
+    pause_screen
+    return 1
+  fi
+  if [ ! -f "$CONFIG_PATH" ]; then
+    echo ""
+    echo -e "${R}未找到配置文件：$CONFIG_PATH${N}"
+    pause_screen
+    return 1
+  fi
+
+  cur_port=$(get_node_value hy2 Port 2>/dev/null || true)
+  cur_sni=$(get_node_value hy2 SNI 2>/dev/null || true)
+  cur_pw=$(get_node_value hy2 Password 2>/dev/null || true)
+  cur_obfs=$(get_node_value hy2 Obfs 2>/dev/null || true)
+  cur_obfs_pw=$(get_node_value hy2 ObfsPassword 2>/dev/null || true)
+  cur_cert_src=$(get_node_value hy2 CertSource 2>/dev/null || echo self)
+  cur_email=$(get_node_value hy2 ACMEEmail 2>/dev/null || true)
+
+  echo ""
+  echo -e "  ${B}${C}修改 Hysteria2 节点参数${N}  ${D}直接回车保留当前值${N}"
+  render_divider
+
+  while true; do
+    read -p "  端口 (${cur_port:-当前未知}): " new_port
+    new_port="${new_port:-$cur_port}"
+    if validate_port "$new_port"; then break; fi
+    echo -e "${R}端口必须是 1-65535 的数字${N}"
+  done
+
+  while true; do
+    read -p "  SNI (${cur_sni:-当前未知}): " new_sni
+    new_sni="${new_sni:-$cur_sni}"
+    new_sni=$(sanitize_sni "$new_sni")
+    if [ -n "$new_sni" ]; then break; fi
+    echo -e "${R}SNI 不能为空${N}"
+  done
+
+  read -p "  重新生成 Password？(y/N): " regen_pw
+  if [ "$regen_pw" = "y" ] || [ "$regen_pw" = "Y" ]; then
+    new_pw=$(openssl rand -base64 16 | tr -d '=+/' | cut -c1-22)
+    echo -e "  ${D}新 Password：$new_pw${N}"
+  fi
+
+  if [ "$cur_obfs" = "salamander" ]; then
+    read -p "  重新生成 obfs 密码？(y/N): " regen_obfs
+    if [ "$regen_obfs" = "y" ] || [ "$regen_obfs" = "Y" ]; then
+      new_obfs_pw=$(openssl rand -base64 16 | tr -d '=+/' | cut -c1-22)
+      echo -e "  ${D}新 obfs 密码：$new_obfs_pw${N}"
+    fi
+  fi
+
+  echo ""
+  echo -e "  将写入：端口 ${C}$new_port${N}  SNI ${C}$new_sni${N}"
+  read -p "  确认修改？(y/N): " confirm
+  if [ "$confirm" != "y" ] && [ "$confirm" != "Y" ]; then
+    echo -e "  已取消"
+    sleep 1
+    return 0
+  fi
+
+  backup_path="${CONFIG_PATH}.bak.$(date +%Y%m%d%H%M%S)"
+  if ! cp "$CONFIG_PATH" "$backup_path"; then
+    echo -e "${R}配置备份失败${N}"
+    pause_screen
+    return 1
+  fi
+
+  ensure_jq || { pause_screen; return 1; }
+
+  # 自签时若 SNI 改变，重签证书
+  if [ "$cur_cert_src" = "self" ] && [ "$new_sni" != "$cur_sni" ]; then
+    echo -e "${Y}==> SNI 变更，重新生成自签证书...${N}"
+    if ! generate_self_signed_cert_for_hy2 "$new_sni" >/dev/null; then
+      echo -e "${R}自签证书生成失败${N}"
+      pause_screen
+      return 1
+    fi
+  fi
+
+  local jq_filter='(.inbounds[] | select(.tag == "hy2-in"))
+    |= ( .listen_port = ($port | tonumber)
+       | .tls.server_name = $sni
+       | (if $sni != "" and (.tls.acme | type) == "object" then .tls.acme.domain = [$sni] else . end)
+       | (if $pw != "" then .users[0].password = $pw else . end)
+       | (if $opw != "" and (.obfs | type) == "object" then .obfs.password = $opw else . end))'
+
+  local tmp_file
+  tmp_file=$(mktemp)
+  if ! jq --arg port "$new_port" --arg sni "$new_sni" \
+       --arg pw "${new_pw:-}" --arg opw "${new_obfs_pw:-}" \
+       "$jq_filter" "$CONFIG_PATH" > "$tmp_file"; then
+    rm -f "$tmp_file"
+    cp "$backup_path" "$CONFIG_PATH" 2>/dev/null || true
+    echo -e "${R}配置写入失败，已恢复备份${N}"
+    pause_screen
+    return 1
+  fi
+  mv "$tmp_file" "$CONFIG_PATH"
+
+  if ! sing-box check -c "$CONFIG_PATH"; then
+    cp "$backup_path" "$CONFIG_PATH" 2>/dev/null || true
+    echo ""
+    echo -e "${R}配置校验失败，已恢复备份${N}"
+    pause_screen
+    return 1
+  fi
+  if ! systemctl restart sing-box; then
+    cp "$backup_path" "$CONFIG_PATH" 2>/dev/null || true
+    echo ""
+    echo -e "${R}服务重启失败，已恢复备份${N}"
+    pause_screen
+    return 1
+  fi
+
+  set_node_value hy2 Port "$new_port"
+  set_node_value hy2 SNI  "$new_sni"
+  [ -n "$new_pw" ] && set_node_value hy2 Password "$new_pw"
+  [ -n "$new_obfs_pw" ] && set_node_value hy2 ObfsPassword "$new_obfs_pw"
+
+  local cur_ip cur_tag insecure obfs_type final_pw final_obfs_pw new_link ipv6_new_link
+  cur_ip=$(get_node_value hy2 IP 2>/dev/null || true)
+  cur_tag=$(get_node_value hy2 Tag 2>/dev/null || echo hy2)
+  insecure=$(get_node_value hy2 Insecure 2>/dev/null || echo 0)
+  obfs_type=$(get_node_value hy2 Obfs 2>/dev/null || true)
+  [ "$obfs_type" = "none" ] && obfs_type=""
+  final_pw="${new_pw:-$cur_pw}"
+  final_obfs_pw="${new_obfs_pw:-$cur_obfs_pw}"
+  new_link=$(build_hy2_link "$final_pw" "$cur_ip" "$new_port" "$new_sni" "$insecure" "$obfs_type" "$final_obfs_pw" "${cur_tag:-hy2}" 2>/dev/null || true)
+  ipv6_new_link=$(build_dualstack_ipv6_link_for_node hy2 2>/dev/null || true)
+  [ -n "$new_link" ] && set_node_value hy2 Link "$new_link"
+  cleanup_old_backups "${CONFIG_PATH}.bak.*" 5
+
+  echo ""
+  echo -e "${G}Hysteria2 节点参数已更新并重启服务${N}"
+  echo -e "  备份文件：${D}$backup_path${N}"
+  if [ -n "$new_link" ]; then
+    echo ""
+    echo -e "  ${B}新客户端链接：${N}"
+    echo -e "  ${G}$new_link${N}"
+    print_qrcode "$new_link"
+  fi
+  if [ -n "$ipv6_new_link" ]; then
+    echo ""
+    echo -e "  ${B}新 IPv6 客户端链接：${N}"
+    echo -e "  ${G}$ipv6_new_link${N}"
+    print_qrcode "$ipv6_new_link"
+  fi
+  pause_screen
+}
+
 # ─── 管理菜单 ─────────────────────────────────────────
+render_node_summary_line(){
+  local type="$1"
+  local label
+  case "$type" in
+    reality) label="Reality   " ;;
+    hy2)     label="Hysteria2 " ;;
+    *)       label="$type     " ;;
+  esac
+  if ! node_installed "$type"; then
+    echo -e "  ${L}│${N}  ${label} ${D}·${N}  ${Y}未安装${N}"
+    return
+  fi
+  local port ip mode_label
+  port=$(get_node_value "$type" Port 2>/dev/null || true)
+  ip=$(get_node_value "$type" IP 2>/dev/null || true)
+  mode_label=$(describe_install_mode "$(get_node_value "$type" Mode 2>/dev/null || echo ipv4)")
+  echo -e "  ${L}│${N}  ${label} ${D}·${N}  ${G}已安装${N}  端口 ${C}${port:-?}${N}  IP ${C}${ip:-?}${N}  ${D}${mode_label}${N}"
+}
+
+show_node_install_menu(){
+  while true; do
+    render_section_header "创建节点"
+    render_menu_item 1 "创建 Reality 节点$(node_installed reality && echo "  ${D}(已安装，将覆盖)${N}")"
+    render_menu_item 2 "创建 Hysteria2 节点$(node_installed hy2 && echo "  ${D}(已安装，将覆盖)${N}")"
+    render_menu_item 0 "返回上级"
+    render_divider
+    read -p "  请输入序号: " choice
+    case $choice in
+      1) install_reality_node; return ;;
+      2) install_hy2_node; return ;;
+      0) return ;;
+      *) notify_invalid_choice ;;
+    esac
+  done
+}
+
+show_node_uninstall_menu(){
+  while true; do
+    render_section_header "卸载单个节点"
+    if node_installed reality; then
+      render_menu_item 1 "卸载 Reality 节点"
+    else
+      echo -e "  ${D}1) Reality 未安装${N}"
+    fi
+    if node_installed hy2; then
+      render_menu_item 2 "卸载 Hysteria2 节点"
+    else
+      echo -e "  ${D}2) Hysteria2 未安装${N}"
+    fi
+    render_menu_item 0 "返回上级"
+    render_divider
+    read -p "  请输入序号: " choice
+    case $choice in
+      1) node_installed reality && uninstall_reality_node; return ;;
+      2) node_installed hy2 && uninstall_hy2_node; return ;;
+      0) return ;;
+      *) notify_invalid_choice ;;
+    esac
+  done
+}
+
+upgrade_singbox_kernel(){
+  local cur_ver latest_ver confirm
+  cur_ver=$(get_current_singbox_version)
+  latest_ver=$(get_latest_singbox_version)
+  echo ""
+  echo -e "  当前版本: ${C}${cur_ver:-未知}${N}"
+  echo -e "  最新版本: ${C}${latest_ver:-获取失败}${N}"
+  if [ -n "$cur_ver" ] && [ -n "$latest_ver" ] && [ "$cur_ver" = "$latest_ver" ]; then
+    echo -e "${G}已是最新版本${N}"
+    sleep 1
+    return 0
+  fi
+  read -p "  确认升级 sing-box 内核？(y/N): " confirm
+  if [ "$confirm" != "y" ] && [ "$confirm" != "Y" ]; then
+    echo -e "  已取消"
+    sleep 1
+    return 0
+  fi
+  echo -e "${Y}==> 升级内核（不覆盖配置）...${N}"
+  if ! bash <(curl -fsSL "$INSTALL_URL"); then
+    echo ""
+    echo -e "${R}sing-box 升级失败，请检查上方输出${N}"
+    pause_screen
+  elif ! systemctl restart sing-box; then
+    echo ""
+    echo -e "${R}升级完成，但服务重启失败${N}"
+    pause_screen
+  else
+    echo -e "${G}升级完成${N}"
+    sleep 1
+  fi
+}
+
+show_node_manage_menu(){
+  while true; do
+    render_section_header "节点 / 内核管理"
+    render_menu_item 1 "创建节点 (Reality / Hysteria2)"
+    render_menu_item 2 "卸载单个节点"
+    render_menu_item 3 "升级 sing-box 内核"
+    render_menu_item 0 "返回上级"
+    render_divider
+    read -p "  请输入序号: " choice
+    case $choice in
+      1) show_node_install_menu ;;
+      2) show_node_uninstall_menu ;;
+      3) upgrade_singbox_kernel ;;
+      0) return ;;
+      *) notify_invalid_choice ;;
+    esac
+  done
+}
+
 show_menu(){
   local ver=""
   local status=""
   local status_str=""
-  local singbox_action_label=""
-  local mode_label=""
+  local main_action_label=""
 
   while true; do
-    load_proxy_context
+    migrate_legacy_info
 
     if is_singbox_installed; then
       ver=$(sing-box version 2>/dev/null | head -1 | awk '{print $3}' || echo "未知")
@@ -3151,26 +4120,26 @@ show_menu(){
       else
         status_str="${R}$status${N}"
       fi
-      singbox_action_label="升级 sing-box 内核"
-      mode_label=$(describe_install_mode "${MENU_MODE:-ipv4}")
+      if [ "$(count_installed_nodes)" -eq 0 ]; then
+        main_action_label="创建节点"
+      else
+        main_action_label="节点 / 内核管理"
+      fi
     else
       ver="未安装"
       status_str="${Y}未安装${N}"
-      singbox_action_label="安装 sing-box"
-      mode_label="未安装"
+      main_action_label="创建节点"
     fi
 
     render_section_header "管理菜单"
     echo -e "  ${L}│${N}  版本      ${D}·${N}  ${C}$ver${N}"
     echo -e "  ${L}│${N}  状态      ${D}·${N}  $status_str"
-    echo -e "  ${L}│${N}  模式      ${D}·${N}  ${C}$mode_label${N}"
-    echo -e "  ${L}│${N}  端口      ${D}·${N}  ${C}${MENU_PORT:-未知}${N}"
-    echo -e "  ${L}│${N}  域名      ${D}·${N}  ${C}${MENU_SNI:-未知}${N}"
-    echo -e "  ${L}│${N}  IP        ${D}·${N}  ${C}${MENU_IP:-未知}${N}"
+    render_node_summary_line reality
+    render_node_summary_line hy2
     render_divider
     render_menu_item 1 "管理员设置"
     render_menu_item 2 "系统基础设置"
-    render_menu_item 3 "${singbox_action_label}"
+    render_menu_item 3 "${main_action_label}"
     render_menu_item 4 "查看状态"
     render_menu_item 5 "外部服务"
     render_menu_item 6 "IPv6 防火墙管理"
@@ -3188,39 +4157,10 @@ show_menu(){
         show_system_menu
         ;;
       3)
-        if is_singbox_installed; then
-          local cur_ver latest_ver confirm
-          cur_ver=$(get_current_singbox_version)
-          latest_ver=$(get_latest_singbox_version)
-          echo ""
-          echo -e "  当前版本: ${C}${cur_ver:-未知}${N}"
-          echo -e "  最新版本: ${C}${latest_ver:-获取失败}${N}"
-          if [ -n "$cur_ver" ] && [ -n "$latest_ver" ] && [ "$cur_ver" = "$latest_ver" ]; then
-            echo -e "${G}已是最新版本${N}"
-            sleep 1
-            continue
-          fi
-          read -p "  确认升级 sing-box 内核？(y/N): " confirm
-          if [ "$confirm" != "y" ] && [ "$confirm" != "Y" ]; then
-            echo -e "  已取消"
-            sleep 1
-            continue
-          fi
-          echo -e "${Y}==> 升级内核（不覆盖配置）...${N}"
-          if ! bash <(curl -fsSL "$INSTALL_URL"); then
-            echo ""
-            echo -e "${R}sing-box 升级失败，请检查上方输出${N}"
-            pause_screen
-          elif ! systemctl restart sing-box; then
-            echo ""
-            echo -e "${R}升级完成，但服务重启失败${N}"
-            pause_screen
-          else
-            echo -e "${G}升级完成${N}"
-            sleep 1
-          fi
+        if ! is_singbox_installed || [ "$(count_installed_nodes)" -eq 0 ]; then
+          show_node_install_menu
         else
-          do_install
+          show_node_manage_menu
         fi
         ;;
       4)
