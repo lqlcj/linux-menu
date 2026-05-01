@@ -82,15 +82,35 @@ require_debian_family(){
 cleanup_old_backups(){
   local pattern="$1"
   local keep="${2:-5}"
-  local victim
+  local dir base victim
+  local -a victims=()
 
   if [ -z "$pattern" ]; then
     return 0
   fi
 
-  # shellcheck disable=SC2086
-  ls -1t $pattern 2>/dev/null | tail -n +$((keep + 1)) | while IFS= read -r victim; do
-    [ -n "$victim" ] && rm -f "$victim"
+  case "$keep" in
+    ''|*[!0-9]*) return 0 ;;
+  esac
+
+  # 用 find + null 分隔取代 ls 通配，正确处理含空格 / 特殊字符的路径
+  dir=$(dirname -- "$pattern")
+  base=$(basename -- "$pattern")
+  [ -d "$dir" ] || return 0
+
+  # 按 mtime 倒序收集，跳过最新 $keep 份后删除其余
+  while IFS= read -r -d '' victim; do
+    victims+=("${victim#*$'\t'}")
+  done < <(find "$dir" -maxdepth 1 -type f -name "$base" -printf '%T@\t%p\0' 2>/dev/null \
+           | LC_ALL=C sort -zrn 2>/dev/null)
+
+  if [ "${#victims[@]}" -le "$keep" ]; then
+    return 0
+  fi
+
+  local i
+  for ((i = keep; i < ${#victims[@]}; i++)); do
+    [ -n "${victims[i]}" ] && rm -f -- "${victims[i]}"
   done
 }
 
@@ -329,6 +349,51 @@ ip4_detect_conflicts(){
   printf '%s' "${conflicts% }"
 }
 
+# ─── 防火墙锁库兜底机制 ──────────────────────────────
+# 验证 sshd 真的在指定端口监听（不依赖 sshd 进程名 grep，更稳）
+verify_sshd_listening_on_port(){
+  local port="$1"
+  if [ -z "$port" ]; then return 1; fi
+  if ! command -v ss >/dev/null 2>&1; then
+    return 0  # 无 ss 工具时不阻塞调用方
+  fi
+  ss -tlnp 2>/dev/null \
+    | awk -v p=":${port}$" '$4 ~ p && $0 ~ /sshd/ {found=1} END {exit !found}'
+}
+
+# 安排一个延时回滚守护：seconds 秒后自动恢复 iptables/ip6tables 备份
+# 用法：rb_pid=$(schedule_iptables_rollback 180 /tmp/v4.bak /tmp/v6.bak)
+# 取消：cancel_rollback_pid "$rb_pid"
+schedule_iptables_rollback(){
+  local seconds="${1:-180}"
+  local backup_v4="${2:-}"
+  local backup_v6="${3:-}"
+  local cmd=""
+
+  if [ -n "$backup_v4" ] && [ -s "$backup_v4" ]; then
+    cmd="iptables-restore < '$backup_v4' 2>/dev/null; "
+  fi
+  if [ -n "$backup_v6" ] && [ -s "$backup_v6" ]; then
+    cmd="${cmd}ip6tables-restore < '$backup_v6' 2>/dev/null; "
+  fi
+  if [ -z "$cmd" ]; then
+    return 1
+  fi
+
+  # 用 setsid 让守护脱离会话，避免 SSH 断开被 SIGHUP 杀掉
+  setsid bash -c "sleep $seconds; $cmd rm -f '$backup_v4' '$backup_v6' 2>/dev/null" \
+    </dev/null >/dev/null 2>&1 &
+  local pid=$!
+  disown "$pid" 2>/dev/null || true
+  printf '%s' "$pid"
+}
+
+cancel_rollback_pid(){
+  local pid="$1"
+  [ -n "$pid" ] || return 0
+  kill "$pid" 2>/dev/null || true
+}
+
 register_sb_command(){
   local source_path=""
 
@@ -557,6 +622,8 @@ apply_sshd_setting(){
   local backup_path=""
   local sshd_bin=""
   local ssh_service=""
+  local effective_port=""
+  local listen_ok=0
 
   if ! require_root; then
     return 1
@@ -601,6 +668,20 @@ apply_sshd_setting(){
     return 1
   fi
 
+  # 修改 Port 时，用 sshd -T 校验"实际生效的端口"是新值（防止 Match 块或 include 文件覆盖）
+  if [ "$key" = "Port" ]; then
+    effective_port=$("$sshd_bin" -T -f "$SSHD_CONFIG_PATH" 2>/dev/null \
+                     | awk '$1 == "port" {print $2; exit}')
+    if [ -n "$effective_port" ] && [ "$effective_port" != "$value" ]; then
+      cp "$backup_path" "$SSHD_CONFIG_PATH" 2>/dev/null || true
+      echo ""
+      echo -e "${R}sshd -T 检测到实际生效端口为 ${effective_port}，与目标 ${value} 不一致${N}"
+      echo -e "${Y}可能存在 Match 块或 /etc/ssh/sshd_config.d/*.conf 覆盖，已恢复备份${N}"
+      pause_screen
+      return 1
+    fi
+  fi
+
   ssh_service=$(detect_ssh_service_name)
   if ! systemctl restart "$ssh_service"; then
     cp "$backup_path" "$SSHD_CONFIG_PATH" 2>/dev/null || true
@@ -612,9 +693,33 @@ apply_sshd_setting(){
     return 1
   fi
 
+  # 重启后等待 sshd 重新监听，验证新端口确实在监听（最多等 3 秒）
+  if [ "$key" = "Port" ] && command -v ss >/dev/null 2>&1; then
+    local i=0
+    while [ "$i" -lt 6 ]; do
+      if ss -tlnp 2>/dev/null | awk -v p=":${value}$" '$4 ~ p && $0 ~ /sshd/ {found=1} END {exit !found}'; then
+        listen_ok=1
+        break
+      fi
+      sleep 0.5
+      i=$((i + 1))
+    done
+    if [ "$listen_ok" -ne 1 ]; then
+      cp "$backup_path" "$SSHD_CONFIG_PATH" 2>/dev/null || true
+      systemctl restart "$ssh_service" >/dev/null 2>&1 || true
+      echo ""
+      echo -e "${R}sshd 已重启，但新端口 ${value} 未检测到监听，已回滚配置${N}"
+      pause_screen
+      return 1
+    fi
+  fi
+
   echo ""
   echo -e "${G}${success_message}${N}"
   echo -e "  备份文件: ${C}$backup_path${N}"
+  if [ "$key" = "Port" ]; then
+    echo -e "  ${Y}重要：${N}请立即开新终端验证新端口可登录，再关闭当前会话！"
+  fi
   return 0
 }
 
@@ -1163,35 +1268,82 @@ load_proxy_context(){
   MENU_MODE=$(get_info_value Mode 2>/dev/null || true)
   MENU_BIND_IPV4=$(get_info_value BindIPv4 2>/dev/null || true)
 
-  if [ -f "$CONFIG_PATH" ]; then
+  if [ -f "$CONFIG_PATH" ] && command -v jq >/dev/null 2>&1; then
+    # 用 jq 解析 reality-in inbound（多行/缩进/空格都能正确处理）
+    local jq_inbound='(.inbounds // [])
+      | map(select(.tag == "reality-in" or .type == "vless"))
+      | (.[0] // {})'
+
     if [ -z "$MENU_UUID" ]; then
-      MENU_UUID=$(sed -n 's/.*"uuid":[[:space:]]*"\([^"]*\)".*/\1/p' "$CONFIG_PATH" | head -1)
+      MENU_UUID=$(jq -r "${jq_inbound} | (.users[0].uuid // \"\")" "$CONFIG_PATH" 2>/dev/null)
     fi
 
     if [ -z "$MENU_PRIVATE_KEY" ]; then
-      MENU_PRIVATE_KEY=$(sed -n 's/.*"private_key":[[:space:]]*"\([^"]*\)".*/\1/p' "$CONFIG_PATH" | head -1)
+      MENU_PRIVATE_KEY=$(jq -r "${jq_inbound} | (.tls.reality.private_key // \"\")" "$CONFIG_PATH" 2>/dev/null)
     fi
 
     if [ -z "$MENU_PORT" ]; then
-      MENU_PORT=$(sed -n 's/.*"listen_port":[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$CONFIG_PATH" | head -1)
+      MENU_PORT=$(jq -r "${jq_inbound} | (.listen_port // empty)" "$CONFIG_PATH" 2>/dev/null)
     fi
 
     if [ -z "$MENU_SNI" ]; then
-      MENU_SNI=$(sed -n 's/.*"server_name":[[:space:]]*"\([^"]*\)".*/\1/p' "$CONFIG_PATH" | head -1)
+      MENU_SNI=$(jq -r "${jq_inbound} | (.tls.server_name // \"\")" "$CONFIG_PATH" 2>/dev/null)
     fi
 
     if [ -z "$MENU_SHORT_ID" ]; then
-      MENU_SHORT_ID=$(sed -n 's/.*"short_id":[[:space:]]*\["\([^"]*\)"\].*/\1/p' "$CONFIG_PATH" | head -1)
+      MENU_SHORT_ID=$(jq -r "${jq_inbound} | (.tls.reality.short_id[0] // \"\")" "$CONFIG_PATH" 2>/dev/null)
     fi
 
     if [ -z "$MENU_LISTEN_ADDR" ]; then
-      MENU_LISTEN_ADDR=$(sed -n 's/.*"listen":[[:space:]]*"\([^"]*\)".*/\1/p' "$CONFIG_PATH" | head -1)
+      MENU_LISTEN_ADDR=$(jq -r "${jq_inbound} | (.listen // \"\")" "$CONFIG_PATH" 2>/dev/null)
     fi
 
     if [ -z "$MENU_BIND_IPV4" ]; then
-      MENU_BIND_IPV4=$(sed -n 's/.*"inet4_bind_address":[[:space:]]*"\([^"]*\)".*/\1/p' "$CONFIG_PATH" | head -1)
+      MENU_BIND_IPV4=$(jq -r '
+        (.outbounds // [])
+        | map(select(.type == "direct"))
+        | (.[0].inet4_bind_address // "")
+      ' "$CONFIG_PATH" 2>/dev/null)
     fi
 
+    if [ -z "$MENU_MODE" ]; then
+      case "$MENU_LISTEN_ADDR" in
+        ::)
+          MENU_MODE="dualstack"
+          ;;
+        *:*)
+          MENU_MODE="ipv6-in-ipv4-out"
+          ;;
+        *)
+          local final_route
+          final_route=$(jq -r '.route.final // ""' "$CONFIG_PATH" 2>/dev/null)
+          [ "$final_route" = "v4-out" ] && MENU_MODE="ipv6-in-ipv4-out"
+          ;;
+      esac
+    fi
+  elif [ -f "$CONFIG_PATH" ]; then
+    # jq 不可用时，沿用旧的 sed 兜底（容错差但避免完全失效）
+    if [ -z "$MENU_UUID" ]; then
+      MENU_UUID=$(sed -n 's/.*"uuid":[[:space:]]*"\([^"]*\)".*/\1/p' "$CONFIG_PATH" | head -1)
+    fi
+    if [ -z "$MENU_PRIVATE_KEY" ]; then
+      MENU_PRIVATE_KEY=$(sed -n 's/.*"private_key":[[:space:]]*"\([^"]*\)".*/\1/p' "$CONFIG_PATH" | head -1)
+    fi
+    if [ -z "$MENU_PORT" ]; then
+      MENU_PORT=$(sed -n 's/.*"listen_port":[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$CONFIG_PATH" | head -1)
+    fi
+    if [ -z "$MENU_SNI" ]; then
+      MENU_SNI=$(sed -n 's/.*"server_name":[[:space:]]*"\([^"]*\)".*/\1/p' "$CONFIG_PATH" | head -1)
+    fi
+    if [ -z "$MENU_SHORT_ID" ]; then
+      MENU_SHORT_ID=$(sed -n 's/.*"short_id":[[:space:]]*\["\([^"]*\)"\].*/\1/p' "$CONFIG_PATH" | head -1)
+    fi
+    if [ -z "$MENU_LISTEN_ADDR" ]; then
+      MENU_LISTEN_ADDR=$(sed -n 's/.*"listen":[[:space:]]*"\([^"]*\)".*/\1/p' "$CONFIG_PATH" | head -1)
+    fi
+    if [ -z "$MENU_BIND_IPV4" ]; then
+      MENU_BIND_IPV4=$(sed -n 's/.*"inet4_bind_address":[[:space:]]*"\([^"]*\)".*/\1/p' "$CONFIG_PATH" | head -1)
+    fi
     if [ -z "$MENU_MODE" ]; then
       case "$MENU_LISTEN_ADDR" in
         ::)
@@ -1303,6 +1455,7 @@ url_decode(){
 # 把 URL query 串拆成 KEY=VALUE 行（已 url-decode）
 parse_query_string(){
   local q="$1" pair k v
+  local -a pairs=()
   IFS='&' read -ra pairs <<<"$q"
   for pair in "${pairs[@]}"; do
     k="${pair%%=*}"
@@ -1903,6 +2056,7 @@ ip6_view_listening(){
 
 ip6_init_firewall(){
   local ssh_port confirm
+  local backup_rules="" rb_choice="y" rb_pid="" rb_seconds=180
 
   ssh_port=$(ip6_detect_ssh_port)
 
@@ -1925,6 +2079,19 @@ ip6_init_firewall(){
   echo -e "  ${D}      请在初始化完成后到本菜单 ${C}4) 开放端口${N} ${D}里手动放行。${N}"
   echo ""
 
+  # 锁库前置检查：sshd 必须真的在 ssh_port 上监听
+  if ! verify_sshd_listening_on_port "$ssh_port"; then
+    echo -e "  ${R}${B}严重警告：sshd 未在 ${ssh_port}/tcp 上监听${N}"
+    echo -e "  ${Y}如果你当前是通过 IPv6 SSH 进来的，应用规则可能立即断开${N}"
+    echo ""
+    read -p "  仍要继续吗？输入大写 ${R}YES${N} 强制继续: " confirm
+    if [ "$confirm" != "YES" ]; then
+      echo -e "  已取消"
+      sleep 1
+      return 0
+    fi
+  fi
+
   if ip6_check_current_ssh_v6; then
     echo -e "  ${R}${B}警告：你当前 SSH 是 IPv6 进来的${N}"
     echo -e "  ${Y}建议先用 IPv4 登录后再操作${N}"
@@ -1938,9 +2105,25 @@ ip6_init_firewall(){
     return 0
   fi
 
+  # 兜底：是否启用延时自动回滚守护
+  echo ""
+  echo -e "  ${B}延时自动回滚守护（强烈建议启用）${N}"
+  echo -e "  ${D}启用后规则应用 ${rb_seconds}s 内若未手动取消，将自动恢复旧规则${N}"
+  read -p "  启用 ${rb_seconds}s 自动回滚守护？(Y/n): " rb_choice
+  if [ "$rb_choice" = "n" ] || [ "$rb_choice" = "N" ]; then
+    rb_choice="n"
+  else
+    rb_choice="y"
+    backup_rules=$(mktemp /tmp/leyili-ip6tables-rb.XXXXXX 2>/dev/null) || backup_rules=""
+    if [ -n "$backup_rules" ]; then
+      ip6tables-save > "$backup_rules" 2>/dev/null || { rm -f "$backup_rules"; backup_rules=""; }
+    fi
+  fi
+
   if ! ip6_ensure_persistence; then
     echo ""
     echo -e "${R}持久化工具安装失败${N}"
+    [ -n "$backup_rules" ] && rm -f "$backup_rules"
     pause_screen
     return 1
   fi
@@ -1955,12 +2138,38 @@ ip6_init_firewall(){
   ip6tables -P INPUT DROP
   ip6tables -P OUTPUT ACCEPT
 
+  # 自动恢复 hy2 节点端口跳跃放行（IPv6 侧）
+  local hop_v hop_start_v hop_end_v hy2_mode
+  if node_installed hy2; then
+    hop_v=$(get_node_value hy2 PortHop 2>/dev/null || echo 0)
+    if [ "$hop_v" = "1" ]; then
+      hop_start_v=$(get_node_value hy2 PortHopStart 2>/dev/null || true)
+      hop_end_v=$(get_node_value hy2 PortHopEnd 2>/dev/null || true)
+      hy2_mode=$(get_node_value hy2 Mode 2>/dev/null || echo ipv4)
+      # 仅在 dualstack / ipv6-in-ipv4-out 模式下需要 v6 放行
+      if [ -n "$hop_start_v" ] && [ -n "$hop_end_v" ] \
+         && { [ "$hy2_mode" = "dualstack" ] || [ "$hy2_mode" = "ipv6-in-ipv4-out" ]; }; then
+        ip6tables -A INPUT -p udp --dport "${hop_start_v}:${hop_end_v}" -j ACCEPT 2>/dev/null || true
+        echo -e "  ${G}已自动恢复 hy2 端口跳跃放行 (v6)：${hop_start_v}-${hop_end_v}/udp${N}"
+      fi
+    fi
+  fi
+
   if ! ip6_save_rules; then
     echo -e "${Y}规则已生效，但持久化失败，重启后可能丢失${N}"
   fi
 
   echo ""
   echo -e "${G}IPv6 防火墙已启用${N}"
+
+  if [ "$rb_choice" = "y" ] && [ -n "$backup_rules" ]; then
+    rb_pid=$(schedule_iptables_rollback "$rb_seconds" "" "$backup_rules")
+    if [ -n "$rb_pid" ]; then
+      echo -e "  ${Y}延时回滚守护已启动 (PID ${rb_pid})，${rb_seconds}s 后自动恢复旧规则${N}"
+      echo -e "  ${B}请尽快开新终端验证 SSH 仍可登录，然后执行：${N}"
+      echo -e "    ${C}kill ${rb_pid} && rm -f ${backup_rules}${N}  ${D}# 取消回滚${N}"
+    fi
+  fi
   pause_screen
 }
 
@@ -2219,6 +2428,7 @@ ip4_view_listening(){
 
 ip4_init_firewall(){
   local ssh_port confirm conflicts
+  local backup_rules="" rb_choice="y" rb_pid="" rb_seconds=180
 
   ssh_port=$(ip6_detect_ssh_port)
   conflicts=$(ip4_detect_conflicts)
@@ -2231,7 +2441,7 @@ ip4_init_firewall(){
   echo "    2) 放行回环 lo"
   echo "    3) 放行已建立的连接 (ESTABLISHED, RELATED)"
   echo "    4) 放行 ICMP (ping 等必需)"
-  echo -e "    5) 放行 SSH 端口: ${C}${ssh_port}${N}/tcp  ${D}(自动检测，错了就锁库！)${N}"
+  echo -e "    5) 放行 SSH 端口: ${C}${ssh_port}${N}/tcp  ${D}(自动检测)${N}"
   echo "    6) 放行 80/tcp"
   echo "    7) 放行 443/tcp"
   echo "    8) INPUT 默认策略 = DROP"
@@ -2241,6 +2451,21 @@ ip4_init_firewall(){
   echo -e "  ${D}注意：节点端口（Reality TCP / Hysteria2 UDP）不在此初始化范围内，${N}"
   echo -e "  ${D}      请在初始化完成后到本菜单 ${C}4) 开放端口${N} ${D}里手动放行。${N}"
   echo ""
+
+  # 锁库前置检查 1：sshd 必须真的在 ssh_port 监听
+  if ! verify_sshd_listening_on_port "$ssh_port"; then
+    echo -e "  ${R}${B}严重警告：sshd 未在 ${ssh_port}/tcp 上监听${N}"
+    echo -e "  ${Y}如果应用规则会立即锁死所有 SSH 连接。请确认：${N}"
+    echo -e "    1) sshd 服务是否运行：systemctl status ssh"
+    echo -e "    2) sshd 实际端口：ss -tlnp | grep sshd"
+    echo ""
+    read -p "  仍要继续吗？输入大写 ${R}YES${N} 强制继续: " confirm
+    if [ "$confirm" != "YES" ]; then
+      echo -e "  已取消"
+      sleep 1
+      return 0
+    fi
+  fi
 
   if [ -n "$conflicts" ]; then
     echo -e "  ${R}${B}警告：检测到 ${conflicts} 在管理防火墙${N}"
@@ -2263,9 +2488,26 @@ ip4_init_firewall(){
     return 0
   fi
 
+  # 兜底问询：是否启用延时自动回滚守护
+  echo ""
+  echo -e "  ${B}延时自动回滚守护（强烈建议启用）${N}"
+  echo -e "  ${D}若启用，规则应用后会启动后台守护，${rb_seconds} 秒内若你未手动取消，将自动恢复旧规则${N}"
+  echo -e "  ${D}规则生效后请立即开新终端验证 SSH 仍可登录，再回此菜单选「6) 紧急放行」之外的任意项即可取消守护${N}"
+  read -p "  启用 ${rb_seconds}s 自动回滚守护？(Y/n): " rb_choice
+  if [ "$rb_choice" = "n" ] || [ "$rb_choice" = "N" ]; then
+    rb_choice="n"
+  else
+    rb_choice="y"
+    backup_rules=$(mktemp /tmp/leyili-iptables-rb.XXXXXX 2>/dev/null) || backup_rules=""
+    if [ -n "$backup_rules" ]; then
+      iptables-save > "$backup_rules" 2>/dev/null || { rm -f "$backup_rules"; backup_rules=""; }
+    fi
+  fi
+
   if ! ip6_ensure_persistence; then
     echo ""
     echo -e "${R}持久化工具安装失败${N}"
+    [ -n "$backup_rules" ] && rm -f "$backup_rules"
     pause_screen
     return 1
   fi
@@ -2280,12 +2522,50 @@ ip4_init_firewall(){
   iptables -P INPUT DROP
   iptables -P OUTPUT ACCEPT
 
+  # 修复 #14：自动恢复已配置的 hy2 端口跳跃放行
+  local hop_v hop_start_v hop_end_v
+  if node_installed hy2; then
+    hop_v=$(get_node_value hy2 PortHop 2>/dev/null || echo 0)
+    if [ "$hop_v" = "1" ]; then
+      hop_start_v=$(get_node_value hy2 PortHopStart 2>/dev/null || true)
+      hop_end_v=$(get_node_value hy2 PortHopEnd 2>/dev/null || true)
+      if [ -n "$hop_start_v" ] && [ -n "$hop_end_v" ]; then
+        iptables -A INPUT -p udp --dport "${hop_start_v}:${hop_end_v}" -j ACCEPT 2>/dev/null || true
+        echo -e "  ${G}已自动恢复 hy2 端口跳跃放行：${hop_start_v}-${hop_end_v}/udp${N}"
+      fi
+    fi
+  fi
+
+  # 应用后再次校验 sshd 监听依然存在（防止备份/检测误差）
+  if ! verify_sshd_listening_on_port "$ssh_port"; then
+    if [ -n "$backup_rules" ]; then
+      iptables-restore < "$backup_rules" 2>/dev/null || true
+      rm -f "$backup_rules"
+      echo -e "${R}应用后 sshd 在 ${ssh_port} 上未监听，已自动回滚到旧规则${N}"
+    else
+      echo -e "${R}应用后 sshd 在 ${ssh_port} 上未监听，但你未启用回滚守护，请尽快人工处理${N}"
+    fi
+    pause_screen
+    return 1
+  fi
+
   if ! ip4_save_rules; then
     echo -e "${Y}规则已生效，但持久化失败，重启后可能丢失${N}"
   fi
 
   echo ""
   echo -e "${G}IPv4 防火墙已启用${N}"
+
+  # 启动延时回滚守护
+  if [ "$rb_choice" = "y" ] && [ -n "$backup_rules" ]; then
+    rb_pid=$(schedule_iptables_rollback "$rb_seconds" "$backup_rules" "")
+    if [ -n "$rb_pid" ]; then
+      echo -e "  ${Y}延时回滚守护已启动 (PID ${rb_pid})，${rb_seconds}s 后自动恢复旧规则${N}"
+      echo -e "  ${B}请在 ${rb_seconds} 秒内开新终端验证 SSH 可登录，然后执行：${N}"
+      echo -e "    ${C}kill ${rb_pid} && rm -f ${backup_rules}${N}  ${D}# 取消回滚${N}"
+      echo -e "  ${D}（也可以直接等待 ${rb_seconds}s 让规则被自动撤销）${N}"
+    fi
+  fi
   pause_screen
 }
 
@@ -3009,6 +3289,7 @@ remove_passwordless_sudo(){
 }
 
 update_system_packages(){
+  if ! require_root; then return 1; fi
   echo ""
   echo -e "${Y}==> 更新软件源...${N}"
   if ! apt update; then
@@ -3032,6 +3313,7 @@ update_system_packages(){
 }
 
 enable_auto_updates(){
+  if ! require_root; then return 1; fi
   echo ""
   echo -e "${Y}==> 检查 unattended-upgrades 是否已安装...${N}"
   if ! dpkg -s unattended-upgrades >/dev/null 2>&1; then
@@ -3098,6 +3380,7 @@ EOF
 }
 
 configure_system_time(){
+  if ! require_root; then return 1; fi
   echo ""
   echo -e "${Y}==> 设置时区为 ${SYSTEM_TIMEZONE}...${N}"
   if ! timedatectl set-timezone "$SYSTEM_TIMEZONE"; then
@@ -3121,6 +3404,7 @@ configure_system_time(){
 }
 
 install_basic_tools(){
+  if ! require_root; then return 1; fi
   echo ""
   echo -e "${Y}==> 安装基础工具...${N}"
   echo -e "  ${C}$BASIC_TOOLS_PACKAGES${N}"
@@ -3397,6 +3681,8 @@ modify_reality_params(){
 
   local tmp_file
   tmp_file=$(mktemp)
+  # 兜底：函数返回 / 信号中断时清理临时文件（已存在的 rm -f 路径仍保留，trap 仅作保险）
+  trap 'rm -f "$tmp_file"' RETURN INT TERM
   if ! jq --arg port "$new_port" --arg sni "$new_sni" --arg uuid "$new_uuid" \
        --arg pri "${new_pri:-}" --arg sid "${new_short_id:-}" \
        "$jq_filter" "$CONFIG_PATH" > "$tmp_file"; then
@@ -3561,6 +3847,8 @@ apply_tcp_tuning(){
   local profile="${1:-us-west}"
   local profile_label="美西"
 
+  if ! require_root; then return 1; fi
+
   if [ "$profile" = "japan" ]; then
     profile_label="日本"
   fi
@@ -3710,6 +3998,8 @@ remove_tcp_tuning(){
 apply_initcwnd_optimization(){
   local route_line route_spec ip_bin current_route
   local initcwnd_value="${1:-$INITCWND_VALUE}"
+
+  if ! require_root; then return 1; fi
 
   echo ""
 
@@ -3919,6 +4209,8 @@ show_network_optimization_status(){
 configure_swap(){
   local swap_active="false"
 
+  if ! require_root; then return 1; fi
+
   echo ""
   echo -e "  ${B}${C}当前内存 / SWAP 状态${N}"
   free -h
@@ -4067,6 +4359,7 @@ update_self_script(){
   echo ""
   echo -e "${Y}==> 下载最新脚本...${N}"
   tmp_file=$(mktemp)
+  trap 'rm -f "$tmp_file"' RETURN INT TERM
   if ! curl -fsSL --max-time 15 "$SELF_INSTALL_URL" -o "$tmp_file"; then
     rm -f "$tmp_file"
     echo -e "${R}下载失败，请检查网络或 SELF_INSTALL_URL${N}"
@@ -4286,11 +4579,20 @@ install_reality_node(){
   while true; do
     read -p "  端口 (8443): " port_input
     PORT="${port_input:-8443}"
-    if validate_port "$PORT"; then
-      PORT=$((10#$PORT))
-      break
+    if ! validate_port "$PORT"; then
+      echo -e "${R}端口必须是 1-65535 的数字${N}"
+      continue
     fi
-    echo -e "${R}端口必须是 1-65535 的数字${N}"
+    PORT=$((10#$PORT))
+    if check_port_in_use "$PORT"; then
+      echo -e "${R}端口 ${PORT} 已被其他服务占用${N}"
+      local force_port=""
+      read -p "  仍然使用此端口？(y/N): " force_port
+      if [ "$force_port" != "y" ] && [ "$force_port" != "Y" ]; then
+        continue
+      fi
+    fi
+    break
   done
 
   while true; do
@@ -4578,7 +4880,7 @@ port_hop_compute_range(){
   printf '%s %s' "$start" "$end"
 }
 
-port_hop_check_range_free(){
+port_hop_range_has_conflict(){
   local start="$1" end="$2"
   ss -ulnH 2>/dev/null | awk -v s="$start" -v e="$end" '
     {n=split($4,a,":"); p=a[n]+0;
@@ -5066,7 +5368,7 @@ install_hy2_node(){
 
   # 应用端口跳跃规则（启用时）
   if [ "$HOP_ENABLE" = "1" ]; then
-    if port_hop_check_range_free "$HOP_START" "$HOP_END"; then
+    if port_hop_range_has_conflict "$HOP_START" "$HOP_END"; then
       echo ""
       echo -e "${Y}端口范围 ${HOP_START}-${HOP_END} 内已有其他 UDP 服务监听：${N}"
       port_hop_list_conflicts "$HOP_START" "$HOP_END"
@@ -5464,6 +5766,7 @@ modify_hy2_params(){
 
   local tmp_file
   tmp_file=$(mktemp)
+  trap 'rm -f "$tmp_file"' RETURN INT TERM
   if ! jq --arg port "$new_port" --arg sni "$new_sni" \
        --arg pw "${new_pw:-}" --arg opw "${new_obfs_pw:-}" \
        --arg bw_action "$bw_action" --arg up "$new_up" --arg down "$new_down" \
@@ -5586,11 +5889,11 @@ modify_hy2_params(){
 
 # ─── 完整卸载脚本 ─────────────────────────────────────
 # 清理范围：节点 inbound、节点防火墙端口、sing-box 服务与软件包、
-#          /etc/sing-box（含 nodes/、certs/、备份）、TCP 优化、
-#          initcwnd 服务、SWAP（仅本脚本创建的 $SWAPFILE_PATH）、
+#          /etc/sing-box（含 nodes/、certs/、备份）、
 #          legacy /root/proxy-info.txt、/usr/local/bin/sb。
 # 不动：SSH 端口/sshd 配置、用户账户、sudoers、自动更新策略、
-#        IPv6 防火墙菜单规则、1Panel、apt 基础工具。
+#        IPv6 防火墙菜单规则、1Panel、apt 基础工具、
+#        TCP 网络优化、initcwnd 持久化服务、本脚本创建的 SWAP。
 uninstall_script_completely(){
   if ! require_root; then return 1; fi
 
@@ -5599,12 +5902,10 @@ uninstall_script_completely(){
   echo -e "  ${R}此操作将清除以下内容（不可恢复）：${N}"
   echo -e "    ${L}·${N} 所有 sing-box 节点（Reality / Hysteria2）及其防火墙端口"
   echo -e "    ${L}·${N} sing-box 服务、软件包与 ${C}/etc/sing-box${N} 整个目录"
-  echo -e "    ${L}·${N} TCP 网络优化（${C}${TCP_TUNING_PATH}${N}）"
-  echo -e "    ${L}·${N} initcwnd 持久化服务（${C}${INITCWND_SERVICE_PATH}${N}）"
-  echo -e "    ${L}·${N} 本脚本创建的 SWAP（${C}${SWAPFILE_PATH}${N}）"
   echo -e "    ${L}·${N} ${C}${INFO_PATH}${N} 与 ${C}${SCRIPT_PATH}${N}"
   echo ""
   echo -e "  ${D}保留：SSH 配置 / 用户账户 / sudoers / 自动更新 / IPv6 防火墙规则 / 1Panel${N}"
+  echo -e "  ${D}保留：TCP 网络优化 / initcwnd 持久化服务 / 本脚本创建的 SWAP${N}"
   echo ""
   read -p "  确认卸载？(y/N): " confirm
   if [ "$confirm" != "y" ] && [ "$confirm" != "Y" ]; then
@@ -5673,61 +5974,7 @@ uninstall_script_completely(){
   echo -e "${Y}==> 清理 /etc/sing-box（节点信息 / 证书 / 配置 / 备份）...${N}"
   rm -rf /etc/sing-box
 
-  # 3. TCP 优化
-  if [ -f "$TCP_TUNING_PATH" ]; then
-    echo -e "${Y}==> 移除 TCP 优化配置...${N}"
-    rm -f "$TCP_TUNING_PATH"
-    sysctl -w net.core.default_qdisc=pfifo_fast >/dev/null 2>&1 || true
-    sysctl -w net.ipv4.tcp_congestion_control=cubic >/dev/null 2>&1 || true
-    sysctl --system >/dev/null 2>&1 || true
-  fi
-
-  # 4. initcwnd 服务
-  local initcwnd_unit
-  initcwnd_unit=$(basename "$INITCWND_SERVICE_PATH")
-  if [ -f "$INITCWND_SERVICE_PATH" ] || systemctl cat "$initcwnd_unit" >/dev/null 2>&1; then
-    echo -e "${Y}==> 移除 initcwnd 持久化服务...${N}"
-    systemctl disable --now "$initcwnd_unit" >/dev/null 2>&1 || true
-    rm -f "$INITCWND_SERVICE_PATH"
-    systemctl daemon-reload >/dev/null 2>&1 || true
-    if command -v ip >/dev/null 2>&1; then
-      local route_line route_spec
-      route_line=$(ip route show default 2>/dev/null | head -1)
-      if [ -n "$route_line" ]; then
-        route_spec=$(printf '%s\n' "$route_line" | awk '{
-          sep=""
-          for (i = 1; i <= NF; i++) {
-            if ($i == "initcwnd" || $i == "initrwnd") { i++; next }
-            printf "%s%s", sep, $i
-            sep=" "
-          }
-        }')
-        # shellcheck disable=SC2086
-        ip route replace $route_spec >/dev/null 2>&1 || true
-      fi
-    fi
-  fi
-
-  # 5. SWAP（仅清理本脚本创建的 $SWAPFILE_PATH）
-  if [ -f "$SWAPFILE_PATH" ] || [ -f "$SWAP_SYSCTL_PATH" ] \
-     || grep -Eq "^[[:space:]]*${SWAPFILE_PATH}[[:space:]]" /etc/fstab 2>/dev/null; then
-    echo -e "${Y}==> 移除脚本创建的 SWAP...${N}"
-    if swapon --show=NAME --noheadings 2>/dev/null | grep -Fxq "$SWAPFILE_PATH"; then
-      swapoff "$SWAPFILE_PATH" >/dev/null 2>&1 || true
-    fi
-    rm -f "$SWAPFILE_PATH"
-    if grep -Eq "^[[:space:]]*${SWAPFILE_PATH}[[:space:]]" /etc/fstab 2>/dev/null; then
-      local tmp_file
-      tmp_file=$(mktemp)
-      awk -v p="$SWAPFILE_PATH" '$1 != p {print}' /etc/fstab > "$tmp_file" && mv "$tmp_file" /etc/fstab
-    fi
-    if [ -f "$SWAP_SYSCTL_PATH" ]; then
-      rm -f "$SWAP_SYSCTL_PATH"
-      sysctl --system >/dev/null 2>&1 || true
-    fi
-  fi
-
-  # 6. 脚本痕迹
+  # 3. 脚本痕迹
   echo -e "${Y}==> 清理脚本本体与 legacy 信息文件...${N}"
   rm -f "$INFO_PATH"
   rm -f "$SCRIPT_PATH"
