@@ -159,6 +159,28 @@ allow_tcp_port_in_firewall(){
   allow_port_in_firewall "$1" tcp
 }
 
+deny_port_in_firewall(){
+  local port="$1"
+  local proto="${2:-tcp}"
+  local backend
+  backend=$(detect_firewall_backend)
+
+  case "$backend" in
+    ufw)
+      ufw delete allow "${port}/${proto}" >/dev/null 2>&1 || true
+      echo -e "  防火墙  : ${D}ufw 撤销 ${port}/${proto}${N}"
+      ;;
+    firewalld)
+      firewall-cmd --permanent --remove-port="${port}/${proto}" >/dev/null 2>&1 || true
+      firewall-cmd --reload >/dev/null 2>&1 || true
+      echo -e "  防火墙  : ${D}firewalld 撤销 ${port}/${proto}${N}"
+      ;;
+    *)
+      :
+      ;;
+  esac
+}
+
 ip6_get_input_policy(){
   ip6tables -L INPUT -n 2>/dev/null | head -n1 | awk '{print $4}'
 }
@@ -4022,6 +4044,137 @@ modify_hy2_params(){
   pause_screen
 }
 
+# ─── 完整卸载脚本 ─────────────────────────────────────
+# 清理范围：节点 inbound、节点防火墙端口、sing-box 服务与软件包、
+#          /etc/sing-box（含 nodes/、certs/、备份）、TCP 优化、
+#          initcwnd 服务、SWAP（仅本脚本创建的 $SWAPFILE_PATH）、
+#          legacy /root/proxy-info.txt、/usr/local/bin/sb。
+# 不动：SSH 端口/sshd 配置、用户账户、sudoers、自动更新策略、
+#        IPv6 防火墙菜单规则、1Panel、apt 基础工具。
+uninstall_script_completely(){
+  if ! require_root; then return 1; fi
+
+  render_section_header "卸载脚本"
+  echo ""
+  echo -e "  ${R}此操作将清除以下内容（不可恢复）：${N}"
+  echo -e "    ${L}·${N} 所有 sing-box 节点（Reality / Hysteria2）及其防火墙端口"
+  echo -e "    ${L}·${N} sing-box 服务、软件包与 ${C}/etc/sing-box${N} 整个目录"
+  echo -e "    ${L}·${N} TCP 网络优化（${C}${TCP_TUNING_PATH}${N}）"
+  echo -e "    ${L}·${N} initcwnd 持久化服务（${C}${INITCWND_SERVICE_PATH}${N}）"
+  echo -e "    ${L}·${N} 本脚本创建的 SWAP（${C}${SWAPFILE_PATH}${N}）"
+  echo -e "    ${L}·${N} ${C}${INFO_PATH}${N} 与 ${C}${SCRIPT_PATH}${N}"
+  echo ""
+  echo -e "  ${D}保留：SSH 配置 / 用户账户 / sudoers / 自动更新 / IPv6 防火墙规则 / 1Panel${N}"
+  echo ""
+  read -p "  确认卸载？(y/N): " confirm
+  if [ "$confirm" != "y" ] && [ "$confirm" != "Y" ]; then
+    echo -e "  已取消"
+    sleep 1
+    return 0
+  fi
+
+  # 1. 节点防火墙端口（按 nodes/*.info 反查）
+  echo ""
+  echo -e "${Y}==> 撤销节点防火墙端口...${N}"
+  local node port type cert_src
+  if [ -d "$NODES_DIR" ]; then
+    while IFS= read -r node; do
+      [ -n "$node" ] || continue
+      type=$(get_node_value "$node" Type 2>/dev/null || echo "$node")
+      port=$(get_node_value "$node" Port 2>/dev/null || true)
+      case "$type" in
+        reality)
+          [ -n "$port" ] && deny_port_in_firewall "$port" tcp
+          ;;
+        hy2)
+          [ -n "$port" ] && deny_port_in_firewall "$port" udp
+          cert_src=$(get_node_value "$node" CertSource 2>/dev/null || true)
+          # ACME 模式安装时放行过 80/tcp，此处一并撤销
+          if [ "$cert_src" = "acme" ]; then
+            deny_port_in_firewall 80 tcp
+          fi
+          ;;
+      esac
+    done < <(list_installed_nodes)
+  fi
+
+  # 2. 停服 + 卸载 sing-box 软件包
+  echo -e "${Y}==> 停止并禁用 sing-box 服务...${N}"
+  systemctl stop sing-box >/dev/null 2>&1 || true
+  systemctl disable sing-box >/dev/null 2>&1 || true
+
+  echo -e "${Y}==> 卸载 sing-box 软件包...${N}"
+  apt-get remove --purge -y sing-box >/dev/null 2>&1 || true
+
+  echo -e "${Y}==> 清理 /etc/sing-box（节点信息 / 证书 / 配置 / 备份）...${N}"
+  rm -rf /etc/sing-box
+
+  # 3. TCP 优化
+  if [ -f "$TCP_TUNING_PATH" ]; then
+    echo -e "${Y}==> 移除 TCP 优化配置...${N}"
+    rm -f "$TCP_TUNING_PATH"
+    sysctl -w net.core.default_qdisc=pfifo_fast >/dev/null 2>&1 || true
+    sysctl -w net.ipv4.tcp_congestion_control=cubic >/dev/null 2>&1 || true
+    sysctl --system >/dev/null 2>&1 || true
+  fi
+
+  # 4. initcwnd 服务
+  local initcwnd_unit
+  initcwnd_unit=$(basename "$INITCWND_SERVICE_PATH")
+  if [ -f "$INITCWND_SERVICE_PATH" ] || systemctl cat "$initcwnd_unit" >/dev/null 2>&1; then
+    echo -e "${Y}==> 移除 initcwnd 持久化服务...${N}"
+    systemctl disable --now "$initcwnd_unit" >/dev/null 2>&1 || true
+    rm -f "$INITCWND_SERVICE_PATH"
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    if command -v ip >/dev/null 2>&1; then
+      local route_line route_spec
+      route_line=$(ip route show default 2>/dev/null | head -1)
+      if [ -n "$route_line" ]; then
+        route_spec=$(printf '%s\n' "$route_line" | awk '{
+          sep=""
+          for (i = 1; i <= NF; i++) {
+            if ($i == "initcwnd" || $i == "initrwnd") { i++; next }
+            printf "%s%s", sep, $i
+            sep=" "
+          }
+        }')
+        # shellcheck disable=SC2086
+        ip route replace $route_spec >/dev/null 2>&1 || true
+      fi
+    fi
+  fi
+
+  # 5. SWAP（仅清理本脚本创建的 $SWAPFILE_PATH）
+  if [ -f "$SWAPFILE_PATH" ] || [ -f "$SWAP_SYSCTL_PATH" ] \
+     || grep -Eq "^[[:space:]]*${SWAPFILE_PATH}[[:space:]]" /etc/fstab 2>/dev/null; then
+    echo -e "${Y}==> 移除脚本创建的 SWAP...${N}"
+    if swapon --show=NAME --noheadings 2>/dev/null | grep -Fxq "$SWAPFILE_PATH"; then
+      swapoff "$SWAPFILE_PATH" >/dev/null 2>&1 || true
+    fi
+    rm -f "$SWAPFILE_PATH"
+    if grep -Eq "^[[:space:]]*${SWAPFILE_PATH}[[:space:]]" /etc/fstab 2>/dev/null; then
+      local tmp_file
+      tmp_file=$(mktemp)
+      awk -v p="$SWAPFILE_PATH" '$1 != p {print}' /etc/fstab > "$tmp_file" && mv "$tmp_file" /etc/fstab
+    fi
+    if [ -f "$SWAP_SYSCTL_PATH" ]; then
+      rm -f "$SWAP_SYSCTL_PATH"
+      sysctl --system >/dev/null 2>&1 || true
+    fi
+  fi
+
+  # 6. 脚本痕迹
+  echo -e "${Y}==> 清理脚本本体与 legacy 信息文件...${N}"
+  rm -f "$INFO_PATH"
+  rm -f "$SCRIPT_PATH"
+
+  echo ""
+  echo -e "  ${G}╔══════════════════════════════════════════════════════╗${N}"
+  echo -e "  ${G}║${N}  ${B}${W}${APP_NAME}${N}  ${G}已彻底卸载${N}                                  ${G}║${N}"
+  echo -e "  ${G}╚══════════════════════════════════════════════════════╝${N}"
+  exit 0
+}
+
 # ─── 管理菜单 ─────────────────────────────────────────
 render_node_summary_line(){
   local type="$1"
@@ -4176,7 +4329,7 @@ show_menu(){
     render_menu_item 4 "查看状态"
     render_menu_item 5 "外部服务"
     render_menu_item 6 "IPv6 防火墙管理"
-    render_menu_item 7 "卸载 sing-box"
+    render_menu_item 7 "卸载脚本"
     render_menu_item 8 "更新脚本"
     render_menu_item 0 "退出"
     render_divider
@@ -4206,23 +4359,7 @@ show_menu(){
         show_ipv6_firewall_menu
         ;;
       7)
-        echo ""
-        read -p "  确认卸载 sing-box 并删除 ${COMMAND_NAME} 菜单入口？保留系统优化与 1Panel (y/N): " CONFIRM
-        if [ "$CONFIRM" = "y" ] || [ "$CONFIRM" = "Y" ]; then
-          echo -e "${Y}==> 停止并禁用服务...${N}"
-          systemctl stop sing-box 2>/dev/null || true
-          systemctl disable sing-box 2>/dev/null || true
-          echo -e "${Y}==> 卸载软件包...${N}"
-          apt-get remove --purge -y sing-box 2>/dev/null || true
-          echo -e "${Y}==> 清理文件...${N}"
-          rm -rf /etc/sing-box
-          rm -f "$INFO_PATH"
-          rm -f "$SCRIPT_PATH"
-          echo -e "${G}卸载完成${N}"
-          exit 0
-        fi
-        echo -e "  已取消"
-        sleep 1
+        uninstall_script_completely
         ;;
       8)
         update_self_script
