@@ -2,7 +2,11 @@
   "permissions": {
     "allow": [
       "Bash(bash -n \"C:\\\\Users\\\\leyili\\\\Desktop\\\\linux-menu\\\\linux-menu\\\\leyili.sh\")",
-      "Bash(bash -n \"C:/Users/leyili/Desktop/linux-menu/linux-menu/leyili.sh\")"
+      "Bash(bash -n \"C:/Users/leyili/Desktop/linux-menu/linux-menu/leyili.sh\")",
+      "Bash(bash -n /c/Users/leyili/Desktop/linux-menu/linux-menu/leyili.sh)",
+      "Bash(bash -n leyili.sh)",
+      "Bash(shellcheck --version)",
+      "Bash(grep -nE 'render_menu_item|case \\\\$choice' leyili.sh)"
     ]
   }
 }
