@@ -1056,15 +1056,23 @@ config_ensure_skeleton(){
     cat > "$CONFIG_PATH" <<'EOF'
 {
   "log": {"disabled": false, "level": "warn", "timestamp": true},
-  "dns": {"servers": [{"type": "local", "tag": "local"}]},
+  "dns": {
+    "servers": [
+      {"type": "udp", "tag": "cloudflare", "server": "1.1.1.1", "detour": "direct-out"},
+      {"type": "udp", "tag": "google", "server": "8.8.8.8", "detour": "direct-out"}
+    ],
+    "strategy": "ipv4_only"
+  },
   "inbounds": [],
   "outbounds": [{
     "type": "direct",
     "tag": "direct-out",
-    "domain_resolver": {"server": "local", "strategy": "ipv4_only"}
+    "domain_resolver": "cloudflare"
   }],
   "route": {
-    "rules": [],
+    "rules": [
+      {"port": 53, "action": "hijack-dns"}
+    ],
     "final": "direct-out"
   }
 }
@@ -1078,19 +1086,31 @@ EOF
   # 1) 若没 outbounds 或为空，建一条 tagged direct-out
   # 2) 若 direct outbound 没 tag，加上 tag=direct-out
   # 3) 确保 route 块存在，final 默认 direct-out
+  # 4) DNS 兜底：servers 列表为空时塞两条公共 V4 上游（Cloudflare + Google）
+  # 5) 路由兜底：保证有 hijack-dns:53 规则，避免客户端 DNS 走原路泄漏
   if jq '
       .log = (.log // {"disabled": false, "level": "warn", "timestamp": true})
-    | .dns = (.dns // {"servers": [{"type": "local", "tag": "local"}]})
+    | .dns = (.dns // {})
+    | .dns.servers = (if ((.dns.servers // []) | length) == 0
+                      then [
+                        {"type":"udp","tag":"cloudflare","server":"1.1.1.1","detour":"direct-out"},
+                        {"type":"udp","tag":"google","server":"8.8.8.8","detour":"direct-out"}
+                      ]
+                      else .dns.servers end)
+    | .dns.strategy = (.dns.strategy // "ipv4_only")
     | .inbounds = ((.inbounds // []) | map(select(.tag == "reality-in" or .tag == "hy2-in")))
     | .outbounds = (if ((.outbounds // []) | length) == 0
-                    then [{"type":"direct","tag":"direct-out","domain_resolver":{"server":"local","strategy":"ipv4_only"}}]
+                    then [{"type":"direct","tag":"direct-out","domain_resolver":"cloudflare"}]
                     else (.outbounds | map(
                         if .type == "direct" and (.tag // "") == ""
                         then .tag = "direct-out"
                         else . end))
                     end)
     | .route = (.route // {})
-    | .route.rules = (.route.rules // [])
+    | .route.rules = (
+        ((.route.rules // []) | map(select(.action != "hijack-dns" and (.port // null) != 53)))
+        + [{"port": 53, "action": "hijack-dns"}]
+      )
     | .route.final = (.route.final // "direct-out")
   ' "$CONFIG_PATH" > "$tmp" 2>/dev/null; then
     mv "$tmp" "$CONFIG_PATH"
