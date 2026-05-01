@@ -831,8 +831,8 @@ config_check_and_restart(){
 # 旧 /root/proxy-info.txt 迁移到 /etc/sing-box/nodes/reality.info
 migrate_legacy_info(){
   # 旧配置里 reality inbound 的 tag 是 vless-in，统一重命名为 reality-in
-  if [ -f "$CONFIG_PATH" ] && command -v jq >/dev/null 2>&1; then
-    if jq -e '.inbounds // [] | map(select(.tag == "vless-in")) | length > 0' "$CONFIG_PATH" >/dev/null 2>&1; then
+  if [ -f "$CONFIG_PATH" ] && grep -q '"vless-in"' "$CONFIG_PATH" 2>/dev/null; then
+    if command -v jq >/dev/null 2>&1; then
       local tmp
       tmp=$(mktemp)
       if jq '(.inbounds[]? | select(.tag == "vless-in") | .tag) = "reality-in"' "$CONFIG_PATH" > "$tmp" 2>/dev/null; then
@@ -2382,6 +2382,9 @@ modify_reality_params(){
   new_link=$(build_reality_link "$new_uuid" "$cur_ip" "$new_port" "$new_sni" "$final_pub" "$final_sid" "${cur_tag:-reality}" 2>/dev/null || true)
   ipv6_new_link=$(build_dualstack_ipv6_link_for_node reality 2>/dev/null || true)
   [ -n "$new_link" ] && set_node_value reality Link "$new_link"
+  if [ -n "$new_port" ] && [ "$new_port" != "$cur_port" ]; then
+    allow_port_in_firewall "$new_port" tcp
+  fi
   cleanup_old_backups "${CONFIG_PATH}.bak.*" 5
 
   echo ""
@@ -3260,6 +3263,7 @@ install_reality_node(){
     read -p "  端口 (8443): " port_input
     PORT="${port_input:-8443}"
     if validate_port "$PORT"; then
+      PORT=$((10#$PORT))
       break
     fi
     echo -e "${R}端口必须是 1-65535 的数字${N}"
@@ -3458,6 +3462,39 @@ EOF
   pause_screen
 }
 
+config_inbound_count(){
+  if [ ! -f "$CONFIG_PATH" ]; then
+    printf '0'
+    return
+  fi
+  if ! command -v jq >/dev/null 2>&1; then
+    printf '0'
+    return
+  fi
+  jq '(.inbounds // []) | length' "$CONFIG_PATH" 2>/dev/null || printf '0'
+}
+
+# 卸载某节点后调用：剩 0 个 inbound 则停服务，否则校验+重启
+post_uninstall_service_step(){
+  if ! is_singbox_installed; then
+    return 0
+  fi
+  if [ ! -f "$CONFIG_PATH" ]; then
+    return 0
+  fi
+  local remain
+  remain=$(config_inbound_count)
+  if [ "${remain:-0}" -eq 0 ]; then
+    echo -e "${Y}==> 已无任何节点，停止 sing-box 服务...${N}"
+    systemctl stop sing-box >/dev/null 2>&1 || true
+    systemctl disable sing-box >/dev/null 2>&1 || true
+    return 0
+  fi
+  if sing-box check -c "$CONFIG_PATH" >/dev/null 2>&1; then
+    systemctl restart sing-box >/dev/null 2>&1 || true
+  fi
+}
+
 uninstall_reality_node(){
   local confirm
   if ! node_installed reality; then
@@ -3473,11 +3510,7 @@ uninstall_reality_node(){
   fi
   config_remove_inbound_by_tag "reality-in" || true
   remove_node_info reality
-  if is_singbox_installed && [ -f "$CONFIG_PATH" ]; then
-    if sing-box check -c "$CONFIG_PATH" >/dev/null 2>&1; then
-      systemctl restart sing-box >/dev/null 2>&1 || true
-    fi
-  fi
+  post_uninstall_service_step
   echo -e "${G}Reality 节点已卸载${N}"
   pause_screen
 }
@@ -3554,6 +3587,7 @@ install_hy2_node(){
     read -p "  端口 (${default_port}, 回车随机): " port_input
     PORT="${port_input:-$default_port}"
     if validate_port "$PORT"; then
+      PORT=$((10#$PORT))
       break
     fi
     echo -e "${R}端口必须是 1-65535 的数字${N}"
@@ -3819,11 +3853,7 @@ uninstall_hy2_node(){
   config_remove_inbound_by_tag "hy2-in" || true
   remove_node_info hy2
   rm -f "$CERTS_DIR/hy2.crt" "$CERTS_DIR/hy2.key" 2>/dev/null || true
-  if is_singbox_installed && [ -f "$CONFIG_PATH" ]; then
-    if sing-box check -c "$CONFIG_PATH" >/dev/null 2>&1; then
-      systemctl restart sing-box >/dev/null 2>&1 || true
-    fi
-  fi
+  post_uninstall_service_step
   echo -e "${G}Hysteria2 节点已卸载${N}"
   pause_screen
 }
@@ -3969,6 +3999,9 @@ modify_hy2_params(){
   new_link=$(build_hy2_link "$final_pw" "$cur_ip" "$new_port" "$new_sni" "$insecure" "$obfs_type" "$final_obfs_pw" "${cur_tag:-hy2}" 2>/dev/null || true)
   ipv6_new_link=$(build_dualstack_ipv6_link_for_node hy2 2>/dev/null || true)
   [ -n "$new_link" ] && set_node_value hy2 Link "$new_link"
+  if [ -n "$new_port" ] && [ "$new_port" != "$cur_port" ]; then
+    allow_port_in_firewall "$new_port" udp
+  fi
   cleanup_old_backups "${CONFIG_PATH}.bak.*" 5
 
   echo ""
