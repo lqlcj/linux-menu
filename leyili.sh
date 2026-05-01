@@ -5026,15 +5026,9 @@ install_hy2_node(){
     obfs_json=$(jq -n --arg pw "$obfs_password" '{type: "salamander", password: $pw}')
   fi
 
-  # 构造 user 对象（带宽 > 0 时附带 up_mbps/down_mbps，否则省略字段）
+  # 构造 user 对象（Hysteria2 的 user 仅含 password；带宽限制 up_mbps/down_mbps 是 inbound 顶层字段）
   local user_obj
-  if [ "$up_mbps" -gt 0 ] && [ "$down_mbps" -gt 0 ]; then
-    user_obj=$(jq -n --arg pw "$password" \
-      --argjson up "$up_mbps" --argjson down "$down_mbps" \
-      '{password: $pw, up_mbps: $up, down_mbps: $down}')
-  else
-    user_obj=$(jq -n --arg pw "$password" '{password: $pw}')
-  fi
+  user_obj=$(jq -n --arg pw "$password" '{password: $pw}')
 
   local inbound_json
   inbound_json=$(jq -n \
@@ -5042,7 +5036,9 @@ install_hy2_node(){
     --argjson port "$PORT" \
     --argjson user "$user_obj" \
     --argjson tls "$tls_json" \
-    --argjson obfs "$obfs_json" '
+    --argjson obfs "$obfs_json" \
+    --argjson up "$up_mbps" \
+    --argjson down "$down_mbps" '
     {
       type: "hysteria2",
       tag: "hy2-in",
@@ -5050,7 +5046,9 @@ install_hy2_node(){
       listen_port: $port,
       users: [$user],
       tls: $tls
-    } + (if $obfs == null then {} else {obfs: $obfs} end)')
+    }
+    + (if $obfs == null then {} else {obfs: $obfs} end)
+    + (if $up > 0 and $down > 0 then {up_mbps: $up, down_mbps: $down} else {} end)')
 
   if ! config_add_inbound "$inbound_json"; then
     echo -e "${R}写入 inbound 失败${N}"
@@ -5457,10 +5455,11 @@ modify_hy2_params(){
        | (if $sni != "" and (.tls.acme | type) == "object" then .tls.acme.domain = [$sni] else . end)
        | (if $pw != "" then .users[0].password = $pw else . end)
        | (if $opw != "" and (.obfs | type) == "object" then .obfs.password = $opw else . end)
+       | .users[0] |= del(.up_mbps, .down_mbps)
        | (if $bw_action == "set"
-          then .users[0].up_mbps = ($up | tonumber) | .users[0].down_mbps = ($down | tonumber)
+          then .up_mbps = ($up | tonumber) | .down_mbps = ($down | tonumber)
           elif $bw_action == "unset"
-          then .users[0] |= del(.up_mbps, .down_mbps)
+          then del(.up_mbps, .down_mbps)
           else . end))'
 
   local tmp_file

@@ -6,7 +6,15 @@
       "Bash(bash -n /c/Users/leyili/Desktop/linux-menu/linux-menu/leyili.sh)",
       "Bash(bash -n leyili.sh)",
       "Bash(shellcheck --version)",
-      "Bash(grep -nE 'render_menu_item|case \\\\$choice' leyili.sh)"
+      "Bash(grep -nE 'render_menu_item|case \\\\$choice' leyili.sh)",
+      "Bash(command -v shellcheck)",
+      "Bash(where docker *)",
+      "Bash(where pacman *)",
+      "Bash(where wsl *)",
+      "Bash(wsl *)",
+      "Bash(grep -nE \"\\(eval |\\\\\\\\$\\\\\\\\\\(.*\\\\\\\\$.*\\\\\\\\\\)|rm -rf [^\\\\\"]|\\\\\\\\\\\\$[A-Z_]+/|chmod 777\\)\" \"C:\\\\Users\\\\leyili\\\\Desktop\\\\linux-menu\\\\linux-menu\\\\leyili.sh\")",
+      "Bash(grep *)",
+      "Bash(]+)"
     ]
   }
 }
