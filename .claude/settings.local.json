@@ -14,7 +14,12 @@
       "Bash(wsl *)",
       "Bash(grep -nE \"\\(eval |\\\\\\\\$\\\\\\\\\\(.*\\\\\\\\$.*\\\\\\\\\\)|rm -rf [^\\\\\"]|\\\\\\\\\\\\$[A-Z_]+/|chmod 777\\)\" \"C:\\\\Users\\\\leyili\\\\Desktop\\\\linux-menu\\\\linux-menu\\\\leyili.sh\")",
       "Bash(grep *)",
-      "Bash(]+)"
+      "Bash(]+)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "WebSearch",
+      "WebFetch(domain:sing-box.sagernet.org)",
+      "Read(//c/Users/leyili/.claude/plans//**)",
+      "Read(//c/Users/leyili/.claude//**)"
     ]
   }
 }
