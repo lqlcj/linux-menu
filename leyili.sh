@@ -6096,23 +6096,95 @@ uninstall_script_completely(){
   exit 0
 }
 
-# ─── 管理菜单 ─────────────────────────────────────────
-render_node_summary_line(){
-  local type="$1"
-  local label
+# ─── 管理菜单卡片 ─────────────────────────────────────
+# 卡片内宽（不含两侧 │ 边框）；外宽 = CARD_INNER_WIDTH + 2，与品牌横幅 56 同宽
+CARD_INNER_WIDTH=52
+
+# 计算字符串可见宽度（剥除 ANSI 颜色码）
+# 直接看 UTF-8 字节头：ASCII 与 2 字节字符按 1 列、3 字节 / 4 字节按 2 列。
+# 不依赖 wc -m 的 locale 行为，C / POSIX locale 下也能正确算 CJK 宽度。
+# 注意：● 与 box-drawing 字符 ─ ╭ ╮ ╰ ╯ │ 这些 "3 字节 UTF-8 但实际单倍宽"
+# 的字符会被高估 1，所以本框架不在被测内容里使用它们（边框由本框架自身绘制）。
+_card_visible(){
+  local s
+  s=$(printf '%b' "$1" | sed $'s/\x1b\\[[0-9;]*[a-zA-Z]//g')
+  printf '%s' "$s" | od -An -tu1 | awk '
+    BEGIN { n = 0 }
+    {
+      for (i = 1; i <= NF; i++) {
+        b = $i + 0
+        if (b < 128) n += 1
+        else if (b < 192) continue
+        else if (b < 224) n += 1
+        else if (b < 240) n += 2
+        else            n += 2
+      }
+    }
+    END { print n }
+  '
+}
+
+# 卡片空白行
+render_card_blank(){
+  echo -e "  ${L}│${N}$(printf '%*s' "$CARD_INNER_WIDTH" '')${L}│${N}"
+}
+
+# 卡片普通行（自动右侧补空格到内宽）
+render_card_line(){
+  local content="$1" visible pad
+  visible=$(_card_visible "$content")
+  pad=$((CARD_INNER_WIDTH - visible))
+  [ "$pad" -lt 0 ] && pad=0
+  echo -e "  ${L}│${N}${content}$(printf '%*s' "$pad" '')${L}│${N}"
+}
+
+# 卡片顶部：╭─ TITLE ─...─ RIGHT ─╮
+render_card_top(){
+  local title="$1" right="$2"
+  local title_w right_w fill_w fill
+  title_w=$(_card_visible "$title")
+  right_w=$(_card_visible "$right")
+  # 内宽 = 1(─) + 1(空) + title + 1(空) + N + 1(空) + right + 1(空) + 1(─)
+  fill_w=$((CARD_INNER_WIDTH - 6 - title_w - right_w))
+  [ "$fill_w" -lt 1 ] && fill_w=1
+  fill=$(printf '%*s' "$fill_w" '' | tr ' ' '─')
+  echo -e "  ${L}╭─${N} ${title} ${L}${fill}${N} ${right} ${L}─╮${N}"
+}
+
+# 卡片底部
+render_card_bottom(){
+  local fill
+  fill=$(printf '%*s' "$CARD_INNER_WIDTH" '' | tr ' ' '─')
+  echo -e "  ${L}╰${fill}╯${N}"
+}
+
+# ─── 节点行（占两排：状态/端口/IP + 网络方向；未安装时只占一排） ───
+render_node_card_block(){
+  local type="$1" label
   case "$type" in
-    reality) label="Reality   " ;;
-    hy2)     label="Hysteria2 " ;;
-    *)       label="$type     " ;;
+    reality) label="Reality    " ;;   # 11 可见列：7 + 4 sp
+    hy2)     label="Hysteria2  " ;;   # 11 可见列：9 + 2 sp
+    *)       label=$(printf '%-11s' "$type") ;;
   esac
+
   if ! node_installed "$type"; then
-    echo -e "  ${L}│${N}  ${label} ${D}·${N}  ${Y}未安装${N}"
+    render_card_line "   ${C}${label}${N}${Y}未安装${N}"
     return
   fi
+
   local port ip mode_label
   port=$(get_node_value "$type" Port 2>/dev/null || true)
   ip=$(get_node_value "$type" IP 2>/dev/null || true)
   mode_label=$(describe_install_mode "$(get_node_value "$type" Mode 2>/dev/null || echo ipv4)")
+
+  # 让短端口和长端口的 IP 起始列尽量对齐
+  local port_len gap gap_str
+  port_len=${#port}
+  gap=$((7 - port_len))
+  [ "$gap" -lt 1 ] && gap=1
+  gap_str=$(printf '%*s' "$gap" '')
+
+  # 附加信息：HY2 端口跳跃 / 链式中转
   local extra=""
   if [ "$type" = "hy2" ]; then
     local hop_v
@@ -6125,13 +6197,18 @@ render_node_summary_line(){
     target_port=$(get_chain_value "$type" TargetPort 2>/dev/null || true)
     extra="${extra}  ${Y}↳中转→${target_host:-?}:${target_port:-?}${N}"
   fi
-  echo -e "  ${L}│${N}  ${label} ${D}·${N}  ${G}已安装${N}  端口 ${C}${port:-?}${N}  IP ${C}${ip:-?}${N}  ${D}${mode_label}${N}${extra}"
+
+  # 第一行：协议名 + 已安装 + :端口 + IP + 附加
+  render_card_line "   ${C}${label}${N}${G}已安装${N}  :${C}${port:-?}${N}${gap_str}${C}${ip:-?}${N}${extra}"
+  # 第二行：网络方向（缩进对齐到第一行的状态列）
+  render_card_line "              ${D}${mode_label}${N}"
 }
 
-render_tcp_tuning_summary_line(){
-  local label="TCP 调优  "
+# TCP 调优行（单排）
+render_tcp_card_line(){
+  local label="TCP 调优   "  # 11 可见列
   if [ ! -f "$TCP_TUNING_PATH" ]; then
-    echo -e "  ${L}│${N}  ${label} ${D}·${N}  ${D}未启用${N}"
+    render_card_line "   ${C}${label}${N}${D}未启用${N}"
     return
   fi
   local rmem profile=""
@@ -6143,22 +6220,23 @@ render_tcp_tuning_summary_line(){
   local cc
   cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "?")
   if [ -n "$profile" ]; then
-    echo -e "  ${L}│${N}  ${label} ${D}·${N}  ${G}已启用${N}  ${C}${profile}${N}  ${D}cc=${cc}${N}"
+    render_card_line "   ${C}${label}${N}${G}已启用${N} ${D}·${N} ${C}${profile}${N} ${D}·${N} ${D}cc=${cc}${N}"
   else
-    echo -e "  ${L}│${N}  ${label} ${D}·${N}  ${G}已启用${N}  ${D}cc=${cc}${N}"
+    render_card_line "   ${C}${label}${N}${G}已启用${N} ${D}·${N} ${D}cc=${cc}${N}"
   fi
 }
 
-render_initcwnd_summary_line(){
-  local label="initcwnd  "
+# initcwnd 行（单排）
+render_initcwnd_card_line(){
+  local label="initcwnd   "  # 11 可见列
   if ! command -v ip >/dev/null 2>&1; then
-    echo -e "  ${L}│${N}  ${label} ${D}·${N}  ${D}未知 (ip 命令缺失)${N}"
+    render_card_line "   ${C}${label}${N}${D}未知 (ip 命令缺失)${N}"
     return
   fi
   local route_line val persist
   route_line=$(ip route show default 2>/dev/null | head -n1)
   if [ -z "$route_line" ]; then
-    echo -e "  ${L}│${N}  ${label} ${D}·${N}  ${D}无默认路由${N}"
+    render_card_line "   ${C}${label}${N}${D}无默认路由${N}"
     return
   fi
   val=$(printf '%s\n' "$route_line" | awk '{
@@ -6167,7 +6245,7 @@ render_initcwnd_summary_line(){
     }
   }')
   if [ -z "$val" ]; then
-    echo -e "  ${L}│${N}  ${label} ${D}·${N}  ${D}未设置${N}"
+    render_card_line "   ${C}${label}${N}${D}未设置${N}"
     return
   fi
   if [ -f "$INITCWND_SERVICE_PATH" ] \
@@ -6176,7 +6254,36 @@ render_initcwnd_summary_line(){
   else
     persist="${Y}(未持久化)${N}"
   fi
-  echo -e "  ${L}│${N}  ${label} ${D}·${N}  ${C}${val}${N}  ${persist}"
+  render_card_line "   ${C}${label}${N}${C}${val}${N}  ${persist}"
+}
+
+# 主菜单卡片：标题栏 + 协议块 + 系统调优行
+render_main_menu_card(){
+  local ver status status_str title
+  if is_singbox_installed; then
+    ver=$(sing-box version 2>/dev/null | head -1 | awk '{print $3}' || echo "未知")
+    status=$(systemctl is-active sing-box 2>/dev/null || echo "未知")
+    if [ "$status" = "active" ]; then
+      status_str="${G}运行中${N}"
+    else
+      status_str="${R}${status}${N}"
+    fi
+  else
+    ver="未安装"
+    status_str="${Y}未安装${N}"
+  fi
+
+  title="${B}${C}管理菜单${N} ${D}·${N} ${C}v${ver}${N}"
+  render_card_top "$title" "$status_str"
+  render_card_blank
+  render_node_card_block reality
+  render_card_blank
+  render_node_card_block hy2
+  render_card_blank
+  render_tcp_card_line
+  render_initcwnd_card_line
+  render_card_blank
+  render_card_bottom
 }
 
 show_node_install_menu(){
@@ -6585,41 +6692,20 @@ show_chain_menu(){
 }
 
 show_menu(){
-  local ver=""
-  local status=""
-  local status_str=""
   local main_action_label=""
 
   while true; do
     migrate_legacy_info
 
-    if is_singbox_installed; then
-      ver=$(sing-box version 2>/dev/null | head -1 | awk '{print $3}' || echo "未知")
-      status=$(systemctl is-active sing-box 2>/dev/null || echo "未知")
-      if [ "$status" = "active" ]; then
-        status_str="${G}运行中${N}"
-      else
-        status_str="${R}$status${N}"
-      fi
-      if [ "$(count_installed_nodes)" -eq 0 ]; then
-        main_action_label="创建节点"
-      else
-        main_action_label="节点 / 内核管理"
-      fi
+    if is_singbox_installed && [ "$(count_installed_nodes)" -gt 0 ]; then
+      main_action_label="节点 / 内核管理"
     else
-      ver="未安装"
-      status_str="${Y}未安装${N}"
       main_action_label="创建节点"
     fi
 
-    render_section_header "管理菜单"
-    echo -e "  ${L}│${N}  版本      ${D}·${N}  ${C}$ver${N}"
-    echo -e "  ${L}│${N}  状态      ${D}·${N}  $status_str"
-    render_node_summary_line reality
-    render_node_summary_line hy2
-    render_tcp_tuning_summary_line
-    render_initcwnd_summary_line
-    render_divider
+    clear
+    render_brand_banner
+    render_main_menu_card
     render_menu_item 1 "管理员设置"
     render_menu_item 2 "系统基础设置"
     render_menu_item 3 "${main_action_label}"
