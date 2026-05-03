@@ -5259,6 +5259,807 @@ port_hop_listen_addrs_for_mode(){
   printf '%s|%s' "$listen_v4" "$listen_v6"
 }
 
+# ╔══════════════════════════════════════════════════════════════════════╗
+# ║                端口转发 PORTFWD 模块（独立单元）                     ║
+# ║   修改 / 移除整段端口转发，编辑这一块即可，不依赖脚本其他业务模块    ║
+# ╠══════════════════════════════════════════════════════════════════════╣
+# ║ 用途：中转机做透明 TCP/UDP 端口转发到落地机                          ║
+# ║       客户端 ─► 本机:PORT ─(NAT)─► 落地机:PORT (sing-box)            ║
+# ║       本机不解协议，只在内核 NAT 层透传字节流                        ║
+# ║                                                                      ║
+# ║ 入口：show_portfwd_menu                                              ║
+# ║ 卸载钩子：portfwd_cleanup_all both                                   ║
+# ║                                                                      ║
+# ║ 自有文件 / iptables 资源：                                           ║
+# ║   /etc/sing-box/portfwd/<id>.rule  — 每条规则一份 KV 元数据          ║
+# ║   /etc/sysctl.d/99-leyili-portfwd.conf — ip_forward sysctl drop-in   ║
+# ║   nat 表 自定义链 LEYILI_PORTFWD       (hook 到 PREROUTING)          ║
+# ║   filter 表 自定义链 LEYILI_PORTFWD_FWD (hook 到 FORWARD)            ║
+# ║                                                                      ║
+# ║ 命名约定：                                                           ║
+# ║   _portfwd_*       — 内部 helper（仅模块内调用）                     ║
+# ║   portfwd_*        — 模块对外 API                                    ║
+# ║   show_portfwd_*   — 模块菜单                                        ║
+# ║                                                                      ║
+# ║ 仅依赖（不调脚本其他业务模块）：                                     ║
+# ║   iptables / ip6tables(可选) / sed / awk / ip / curl(可选)           ║
+# ║   脚本通用 UI：require_root pause_screen notify_invalid_choice       ║
+# ║               render_section_header render_menu_item render_divider  ║
+# ║   颜色变量：G Y C R B N L W D（脚本顶部统一定义）                    ║
+# ╚══════════════════════════════════════════════════════════════════════╝
+
+# ─── 模块常量 ───────────────────────────────────────────────
+PORTFWD_DIR="/etc/sing-box/portfwd"
+PORTFWD_NAT_CHAIN="LEYILI_PORTFWD"
+PORTFWD_FWD_CHAIN="LEYILI_PORTFWD_FWD"
+PORTFWD_SYSCTL_PATH="/etc/sysctl.d/99-leyili-portfwd.conf"
+PORTFWD_PERSIST_V4_DEBIAN="/etc/iptables/rules.v4"
+PORTFWD_PERSIST_V4_RHEL="/etc/sysconfig/iptables"
+PORTFWD_PERSIST_V6_DEBIAN="/etc/iptables/rules.v6"
+PORTFWD_PERSIST_V6_RHEL="/etc/sysconfig/ip6tables"
+PORTFWD_SINGBOX_NODES_DIR="/etc/sing-box/nodes"
+
+# ─── 内部 helper（_portfwd_*，模块内自己实现，不复用） ──────
+_portfwd_is_debian_family(){
+  [ -r /etc/os-release ] || return 1
+  # shellcheck disable=SC1091
+  . /etc/os-release
+  case "${ID:-}" in
+    debian|ubuntu|raspbian|linuxmint|devuan|kali|pop|elementary|zorin) return 0 ;;
+  esac
+  case "${ID_LIKE:-}" in
+    *debian*|*ubuntu*) return 0 ;;
+  esac
+  return 1
+}
+
+_portfwd_validate_port(){
+  local port="$1"
+  case "$port" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  [ "$port" -ge 1 ] && [ "$port" -le 65535 ]
+}
+
+_portfwd_validate_ipv4(){
+  local ip="$1" a b c d oct
+  [ -n "$ip" ] || return 1
+  printf '%s' "$ip" | grep -Eq '^([0-9]{1,3}\.){3}[0-9]{1,3}$' || return 1
+  IFS='.' read -r a b c d <<<"$ip"
+  for oct in "$a" "$b" "$c" "$d"; do
+    [ "$oct" -ge 0 ] 2>/dev/null && [ "$oct" -le 255 ] 2>/dev/null || return 1
+  done
+  return 0
+}
+
+_portfwd_validate_ipv6(){
+  local ip="$1"
+  [ -n "$ip" ] || return 1
+  printf '%s' "$ip" | grep -Eq '^[0-9a-fA-F:]+$' || return 1
+  printf '%s' "$ip" | grep -q ':' || return 1
+  return 0
+}
+
+# 检测本机主 IPv4（仅模块内用，不调外面的 detect_primary_ipv4）
+_portfwd_detect_local_ipv4(){
+  local detected=""
+  if command -v ip >/dev/null 2>&1; then
+    detected=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{
+      for (i = 1; i <= NF; i++) if ($i == "src") { print $(i + 1); exit }
+    }')
+    if [ -z "$detected" ]; then
+      detected=$(ip -4 addr show scope global up 2>/dev/null | awk '/inet / {
+        split($2, parts, "/"); print parts[1]; exit
+      }')
+    fi
+  fi
+  if [ -z "$detected" ] && command -v curl >/dev/null 2>&1; then
+    detected=$(curl -s4 --max-time 3 ip.sb 2>/dev/null || true)
+  fi
+  printf '%s' "$detected"
+}
+
+_portfwd_detect_local_ipv6(){
+  local detected=""
+  if command -v ip >/dev/null 2>&1; then
+    detected=$(ip -6 route get 2606:4700:4700::1111 2>/dev/null | awk '{
+      for (i = 1; i <= NF; i++) if ($i == "src") { print $(i + 1); exit }
+    }')
+    if [ -z "$detected" ]; then
+      detected=$(ip -6 addr show scope global up 2>/dev/null | awk '/inet6 / {
+        split($2, parts, "/"); print parts[1]; exit
+      }')
+    fi
+  fi
+  if [ -z "$detected" ] && command -v curl >/dev/null 2>&1; then
+    detected=$(curl -s6 --max-time 3 ip.sb 2>/dev/null || true)
+  fi
+  printf '%s' "$detected"
+}
+
+# 检测可能与本模块直接编辑 iptables 冲突的管理工具
+_portfwd_detect_conflicts(){
+  local conflicts=""
+  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -qi "^Status: active"; then
+    conflicts="${conflicts}ufw "
+  fi
+  if command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active firewalld >/dev/null 2>&1; then
+    conflicts="${conflicts}firewalld "
+  fi
+  if [ -d /opt/1panel ] || systemctl list-unit-files 2>/dev/null | grep -q '^1panel'; then
+    conflicts="${conflicts}1Panel "
+  fi
+  printf '%s' "${conflicts% }"
+}
+
+# 模块自有持久化（不调用 ip4_save_rules / ip6_save_rules）
+_portfwd_persist_v4(){
+  command -v iptables-save >/dev/null 2>&1 || return 1
+  local target
+  if _portfwd_is_debian_family; then
+    target="$PORTFWD_PERSIST_V4_DEBIAN"
+  else
+    target="$PORTFWD_PERSIST_V4_RHEL"
+  fi
+  mkdir -p "$(dirname "$target")"
+  iptables-save > "$target"
+}
+
+_portfwd_persist_v6(){
+  command -v ip6tables-save >/dev/null 2>&1 || return 1
+  local target
+  if _portfwd_is_debian_family; then
+    target="$PORTFWD_PERSIST_V6_DEBIAN"
+  else
+    target="$PORTFWD_PERSIST_V6_RHEL"
+  fi
+  mkdir -p "$(dirname "$target")"
+  ip6tables-save > "$target"
+}
+
+# 首次使用时安装 iptables-persistent（Debian 系），其它发行版跳过
+_portfwd_ensure_persistence(){
+  if ! _portfwd_is_debian_family; then
+    return 0
+  fi
+  if dpkg -s iptables-persistent >/dev/null 2>&1; then
+    return 0
+  fi
+  echo -e "${Y}==> 安装 iptables-persistent（重启后自动加载规则）...${N}"
+  echo "iptables-persistent iptables-persistent/autosave_v4 boolean false" \
+    | debconf-set-selections 2>/dev/null
+  echo "iptables-persistent iptables-persistent/autosave_v6 boolean false" \
+    | debconf-set-selections 2>/dev/null
+  DEBIAN_FRONTEND=noninteractive apt-get update -qq >/dev/null 2>&1 || true
+  DEBIAN_FRONTEND=noninteractive apt-get install -y iptables-persistent >/dev/null 2>&1 || true
+}
+
+# 自己读 sing-box nodes/*.info（不调 list_installed_nodes / get_node_value）
+# 输出每行：<node>:<port>
+_portfwd_collect_singbox_ports(){
+  [ -d "$PORTFWD_SINGBOX_NODES_DIR" ] || return 0
+  local f node port
+  for f in "$PORTFWD_SINGBOX_NODES_DIR"/*.info; do
+    [ -f "$f" ] || continue
+    node=$(basename "$f" .info)
+    port=$(sed -n 's/^Port=//p' "$f" 2>/dev/null | head -n 1)
+    [ -n "$port" ] && printf '%s:%s\n' "$node" "$port"
+  done
+}
+
+# ─── 模块数据 / 元数据 ──────────────────────────────────────
+ensure_portfwd_dir(){
+  mkdir -p "$PORTFWD_DIR" 2>/dev/null || true
+}
+
+portfwd_id(){
+  local family="$1" proto="$2" src_port="$3" dst_host="$4" dst_port="$5"
+  local safe_host
+  safe_host=$(printf '%s' "$dst_host" | tr ':' '_')
+  printf '%s-%s-%s-%s-%s' "$family" "$proto" "$src_port" "$safe_host" "$dst_port"
+}
+
+portfwd_rule_path(){
+  printf '%s/%s.rule' "$PORTFWD_DIR" "$1"
+}
+
+portfwd_set_value(){
+  local file="$1" key="$2" value="$3"
+  ensure_portfwd_dir
+  if [ ! -f "$file" ]; then
+    : > "$file" || return 1
+  fi
+  if grep -q "^${key}=" "$file" 2>/dev/null; then
+    sed -i "s|^${key}=.*|${key}=${value}|" "$file"
+  else
+    printf '%s=%s\n' "$key" "$value" >> "$file"
+  fi
+}
+
+portfwd_get_value(){
+  local file="$1" key="$2"
+  [ -f "$file" ] || return 1
+  sed -n "s/^${key}=//p" "$file" | head -n 1
+}
+
+# 列出某 family 的所有 rule id（不带 .rule 后缀）
+portfwd_list_rules(){
+  local family="$1"
+  [ -d "$PORTFWD_DIR" ] || return 0
+  ls -1 "$PORTFWD_DIR" 2>/dev/null \
+    | grep -E "^${family}-.+\.rule$" \
+    | sed 's/\.rule$//' \
+    | sort
+}
+
+portfwd_count(){
+  local family="$1"
+  portfwd_list_rules "$family" | grep -c . || true
+}
+
+portfwd_describe_rule(){
+  local id="$1"
+  local f
+  f=$(portfwd_rule_path "$id")
+  [ -f "$f" ] || return 1
+  local proto src dst_host dst_port
+  proto=$(portfwd_get_value "$f" Proto)
+  src=$(portfwd_get_value "$f" SrcPort)
+  dst_host=$(portfwd_get_value "$f" DstHost)
+  dst_port=$(portfwd_get_value "$f" DstPort)
+  printf '%-3s :%-5s  →  %s:%s' "$proto" "$src" "$dst_host" "$dst_port"
+}
+
+portfwd_check_self_loop(){
+  local family="$1" host="$2"
+  local my_ip
+  if [ "$family" = "v4" ]; then
+    my_ip=$(_portfwd_detect_local_ipv4)
+  else
+    my_ip=$(_portfwd_detect_local_ipv6)
+  fi
+  [ -n "$my_ip" ] && [ "$host" = "$my_ip" ]
+}
+
+# ─── sysctl: ip_forward ────────────────────────────────────
+portfwd_enable_ip_forward(){
+  sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1 || true
+  sysctl -w net.ipv6.conf.all.forwarding=1 >/dev/null 2>&1 || true
+
+  cat > "$PORTFWD_SYSCTL_PATH" <<'EOF'
+# Managed by leyili.sh / 端口转发模块
+# 该文件在所有转发规则被删除时会自动移除
+net.ipv4.ip_forward = 1
+net.ipv6.conf.all.forwarding = 1
+EOF
+}
+
+portfwd_disable_ip_forward_if_idle(){
+  local total=0
+  if [ -d "$PORTFWD_DIR" ]; then
+    total=$(find "$PORTFWD_DIR" -maxdepth 1 -name '*.rule' -type f 2>/dev/null | wc -l | tr -d ' ')
+  fi
+  if [ "${total:-0}" -eq 0 ] && [ -f "$PORTFWD_SYSCTL_PATH" ]; then
+    rm -f "$PORTFWD_SYSCTL_PATH"
+    # 不主动 sysctl -w 0：Docker / 其他服务可能也依赖 ip_forward
+  fi
+}
+
+# ─── iptables 链 / 规则 ────────────────────────────────────
+portfwd_ensure_chains_v4(){
+  iptables -t nat -N "$PORTFWD_NAT_CHAIN" 2>/dev/null || true
+  iptables -t nat -C PREROUTING -j "$PORTFWD_NAT_CHAIN" 2>/dev/null \
+    || iptables -t nat -I PREROUTING 1 -j "$PORTFWD_NAT_CHAIN"
+  iptables -N "$PORTFWD_FWD_CHAIN" 2>/dev/null || true
+  iptables -C FORWARD -j "$PORTFWD_FWD_CHAIN" 2>/dev/null \
+    || iptables -I FORWARD 1 -j "$PORTFWD_FWD_CHAIN"
+  iptables -C "$PORTFWD_FWD_CHAIN" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null \
+    || iptables -I "$PORTFWD_FWD_CHAIN" 1 -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+}
+
+portfwd_ensure_chains_v6(){
+  command -v ip6tables >/dev/null 2>&1 || return 1
+  ip6tables -t nat -N "$PORTFWD_NAT_CHAIN" 2>/dev/null || true
+  ip6tables -t nat -C PREROUTING -j "$PORTFWD_NAT_CHAIN" 2>/dev/null \
+    || ip6tables -t nat -I PREROUTING 1 -j "$PORTFWD_NAT_CHAIN"
+  ip6tables -N "$PORTFWD_FWD_CHAIN" 2>/dev/null || true
+  ip6tables -C FORWARD -j "$PORTFWD_FWD_CHAIN" 2>/dev/null \
+    || ip6tables -I FORWARD 1 -j "$PORTFWD_FWD_CHAIN"
+  ip6tables -C "$PORTFWD_FWD_CHAIN" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null \
+    || ip6tables -I "$PORTFWD_FWD_CHAIN" 1 -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+}
+
+portfwd_apply_v4(){
+  local proto="$1" src_port="$2" dst_host="$3" dst_port="$4"
+  portfwd_ensure_chains_v4
+
+  iptables -t nat -C "$PORTFWD_NAT_CHAIN" -p "$proto" --dport "$src_port" \
+    -j DNAT --to-destination "${dst_host}:${dst_port}" 2>/dev/null \
+    || iptables -t nat -A "$PORTFWD_NAT_CHAIN" -p "$proto" --dport "$src_port" \
+       -j DNAT --to-destination "${dst_host}:${dst_port}"
+
+  iptables -t nat -C POSTROUTING -d "${dst_host}/32" -p "$proto" --dport "$dst_port" \
+    -j MASQUERADE 2>/dev/null \
+    || iptables -t nat -A POSTROUTING -d "${dst_host}/32" -p "$proto" --dport "$dst_port" \
+       -j MASQUERADE
+
+  iptables -C "$PORTFWD_FWD_CHAIN" -d "${dst_host}/32" -p "$proto" --dport "$dst_port" \
+    -j ACCEPT 2>/dev/null \
+    || iptables -A "$PORTFWD_FWD_CHAIN" -d "${dst_host}/32" -p "$proto" --dport "$dst_port" \
+       -j ACCEPT
+}
+
+portfwd_apply_v6(){
+  local proto="$1" src_port="$2" dst_host="$3" dst_port="$4"
+  portfwd_ensure_chains_v6 || return 1
+
+  ip6tables -t nat -C "$PORTFWD_NAT_CHAIN" -p "$proto" --dport "$src_port" \
+    -j DNAT --to-destination "[${dst_host}]:${dst_port}" 2>/dev/null \
+    || ip6tables -t nat -A "$PORTFWD_NAT_CHAIN" -p "$proto" --dport "$src_port" \
+       -j DNAT --to-destination "[${dst_host}]:${dst_port}"
+
+  ip6tables -t nat -C POSTROUTING -d "${dst_host}/128" -p "$proto" --dport "$dst_port" \
+    -j MASQUERADE 2>/dev/null \
+    || ip6tables -t nat -A POSTROUTING -d "${dst_host}/128" -p "$proto" --dport "$dst_port" \
+       -j MASQUERADE
+
+  ip6tables -C "$PORTFWD_FWD_CHAIN" -d "${dst_host}/128" -p "$proto" --dport "$dst_port" \
+    -j ACCEPT 2>/dev/null \
+    || ip6tables -A "$PORTFWD_FWD_CHAIN" -d "${dst_host}/128" -p "$proto" --dport "$dst_port" \
+       -j ACCEPT
+}
+
+portfwd_remove_v4(){
+  local proto="$1" src_port="$2" dst_host="$3" dst_port="$4"
+  iptables -t nat -D "$PORTFWD_NAT_CHAIN" -p "$proto" --dport "$src_port" \
+    -j DNAT --to-destination "${dst_host}:${dst_port}" 2>/dev/null || true
+  iptables -t nat -D POSTROUTING -d "${dst_host}/32" -p "$proto" --dport "$dst_port" \
+    -j MASQUERADE 2>/dev/null || true
+  iptables -D "$PORTFWD_FWD_CHAIN" -d "${dst_host}/32" -p "$proto" --dport "$dst_port" \
+    -j ACCEPT 2>/dev/null || true
+}
+
+portfwd_remove_v6(){
+  local proto="$1" src_port="$2" dst_host="$3" dst_port="$4"
+  command -v ip6tables >/dev/null 2>&1 || return 0
+  ip6tables -t nat -D "$PORTFWD_NAT_CHAIN" -p "$proto" --dport "$src_port" \
+    -j DNAT --to-destination "[${dst_host}]:${dst_port}" 2>/dev/null || true
+  ip6tables -t nat -D POSTROUTING -d "${dst_host}/128" -p "$proto" --dport "$dst_port" \
+    -j MASQUERADE 2>/dev/null || true
+  ip6tables -D "$PORTFWD_FWD_CHAIN" -d "${dst_host}/128" -p "$proto" --dport "$dst_port" \
+    -j ACCEPT 2>/dev/null || true
+}
+
+# 卸载脚本 / 用户一键清空时调用；family 可选 v4 / v6 / both（默认）
+portfwd_cleanup_all(){
+  local family="${1:-both}"
+  local f host port proto
+
+  if [ "$family" = "v4" ] || [ "$family" = "both" ]; then
+    if [ -d "$PORTFWD_DIR" ]; then
+      for f in "$PORTFWD_DIR"/v4-*.rule; do
+        [ -f "$f" ] || continue
+        host=$(portfwd_get_value "$f" DstHost)
+        port=$(portfwd_get_value "$f" DstPort)
+        proto=$(portfwd_get_value "$f" Proto)
+        if [ -n "$host" ] && [ -n "$port" ] && [ -n "$proto" ]; then
+          iptables -t nat -D POSTROUTING -d "${host}/32" -p "$proto" --dport "$port" \
+            -j MASQUERADE 2>/dev/null || true
+        fi
+        rm -f "$f"
+      done
+    fi
+    iptables -t nat -F "$PORTFWD_NAT_CHAIN" 2>/dev/null || true
+    iptables -t nat -D PREROUTING -j "$PORTFWD_NAT_CHAIN" 2>/dev/null || true
+    iptables -t nat -X "$PORTFWD_NAT_CHAIN" 2>/dev/null || true
+    iptables -F "$PORTFWD_FWD_CHAIN" 2>/dev/null || true
+    iptables -D FORWARD -j "$PORTFWD_FWD_CHAIN" 2>/dev/null || true
+    iptables -X "$PORTFWD_FWD_CHAIN" 2>/dev/null || true
+  fi
+
+  if [ "$family" = "v6" ] || [ "$family" = "both" ]; then
+    if [ -d "$PORTFWD_DIR" ]; then
+      for f in "$PORTFWD_DIR"/v6-*.rule; do
+        [ -f "$f" ] || continue
+        host=$(portfwd_get_value "$f" DstHost)
+        port=$(portfwd_get_value "$f" DstPort)
+        proto=$(portfwd_get_value "$f" Proto)
+        if [ -n "$host" ] && [ -n "$port" ] && [ -n "$proto" ] \
+           && command -v ip6tables >/dev/null 2>&1; then
+          ip6tables -t nat -D POSTROUTING -d "${host}/128" -p "$proto" --dport "$port" \
+            -j MASQUERADE 2>/dev/null || true
+        fi
+        rm -f "$f"
+      done
+    fi
+    if command -v ip6tables >/dev/null 2>&1; then
+      ip6tables -t nat -F "$PORTFWD_NAT_CHAIN" 2>/dev/null || true
+      ip6tables -t nat -D PREROUTING -j "$PORTFWD_NAT_CHAIN" 2>/dev/null || true
+      ip6tables -t nat -X "$PORTFWD_NAT_CHAIN" 2>/dev/null || true
+      ip6tables -F "$PORTFWD_FWD_CHAIN" 2>/dev/null || true
+      ip6tables -D FORWARD -j "$PORTFWD_FWD_CHAIN" 2>/dev/null || true
+      ip6tables -X "$PORTFWD_FWD_CHAIN" 2>/dev/null || true
+    fi
+  fi
+
+  _portfwd_persist_v4 >/dev/null 2>&1 || true
+  _portfwd_persist_v6 >/dev/null 2>&1 || true
+  portfwd_disable_ip_forward_if_idle
+}
+
+# ─── 菜单 / 交互 ────────────────────────────────────────────
+show_portfwd_menu(){
+  if ! require_root; then return 1; fi
+  if ! command -v iptables >/dev/null 2>&1; then
+    echo ""
+    echo -e "${R}系统未安装 iptables，无法使用端口转发${N}"
+    pause_screen
+    return 1
+  fi
+
+  local choice v4_count v6_count conflicts
+  while true; do
+    v4_count=$(portfwd_count v4)
+    v6_count=$(portfwd_count v6)
+    conflicts=$(_portfwd_detect_conflicts)
+
+    render_section_header "端口转发（中转落地）"
+
+    echo -e "  ${B}${C}用途${N}"
+    echo -e "  ${D}客户端 ──► ${C}本机${D}:PORT  ──(NAT)──►  ${C}落地机${D}:PORT  (sing-box)${N}"
+    echo -e "  ${D}本机不解协议，只在内核 NAT 层透传字节流${N}"
+    echo -e "  ${D}客户端只需把落地节点链接里的 IP 改成本机 IP，其它字段照旧${N}"
+    echo ""
+
+    if [ -n "$conflicts" ]; then
+      echo -e "  ${Y}⚠ 检测到 ${C}${conflicts}${Y} 也在管理防火墙，规则可能被覆盖${N}"
+    fi
+
+    echo -e "  ${B}${C}当前规则数${N}"
+    echo -e "  ${L}│${N}  IPv4  ${D}·${N}  ${C}${v4_count:-0}${N} 条"
+    echo -e "  ${L}│${N}  IPv6  ${D}·${N}  ${C}${v6_count:-0}${N} 条"
+    render_divider
+    render_menu_item 1 "IPv4 端口转发"
+    render_menu_item 2 "IPv6 端口转发"
+    render_menu_item 0 "返回上级"
+    render_divider
+    read -p "  请输入序号: " choice
+    case "$choice" in
+      1) show_portfwd_family_menu v4 ;;
+      2)
+        if ! command -v ip6tables >/dev/null 2>&1; then
+          echo ""
+          echo -e "${R}系统未安装 ip6tables${N}"
+          pause_screen
+        else
+          show_portfwd_family_menu v6
+        fi
+        ;;
+      0) return ;;
+      *) notify_invalid_choice ;;
+    esac
+  done
+}
+
+show_portfwd_family_menu(){
+  local family="$1"
+  local family_label
+  if [ "$family" = "v4" ]; then family_label="IPv4"; else family_label="IPv6"; fi
+
+  local choice id desc i count
+  while true; do
+    render_section_header "${family_label} 端口转发"
+
+    count=$(portfwd_count "$family")
+    if [ "${count:-0}" -gt 0 ]; then
+      echo -e "  ${B}${C}当前规则${N}"
+      i=1
+      while IFS= read -r id; do
+        [ -n "$id" ] || continue
+        desc=$(portfwd_describe_rule "$id")
+        printf "  ${L}│${N}  ${Y}%2d${N}  %s\n" "$i" "$desc"
+        i=$((i + 1))
+      done < <(portfwd_list_rules "$family")
+    else
+      echo -e "  ${D}（暂无规则）${N}"
+    fi
+    render_divider
+    render_menu_item 1 "新增转发"
+    render_menu_item 2 "删除某条转发"
+    render_menu_item 3 "一键清空所有 ${family_label} 转发"
+    render_menu_item 4 "查看完整 iptables 规则"
+    render_menu_item 0 "返回上级"
+    render_divider
+    read -p "  请输入序号: " choice
+    case "$choice" in
+      1) portfwd_add_interactive "$family" ;;
+      2) portfwd_del_interactive "$family" ;;
+      3) portfwd_clear_all_interactive "$family" ;;
+      4) portfwd_view_full_rules "$family" ;;
+      0) return ;;
+      *) notify_invalid_choice ;;
+    esac
+  done
+}
+
+portfwd_add_interactive(){
+  local family="$1"
+  local dst_host src_port proto_choice protos="" proto id rule_path confirm
+  local family_label dst_label_hint
+  if [ "$family" = "v4" ]; then
+    family_label="IPv4"
+    dst_label_hint="如 1.2.3.4"
+  else
+    family_label="IPv6"
+    dst_label_hint="如 2001:db8::1"
+  fi
+
+  echo ""
+  echo -e "  ${B}${C}新增端口转发（${family_label}）${N}"
+  render_divider
+
+  read -p "  落地机 IP (${dst_label_hint}): " dst_host
+  dst_host=$(printf '%s' "$dst_host" | tr -d '[:space:]')
+  if [ -z "$dst_host" ]; then
+    echo -e "${Y}已取消${N}"
+    pause_screen
+    return 0
+  fi
+
+  if [ "$family" = "v4" ]; then
+    if ! _portfwd_validate_ipv4 "$dst_host"; then
+      echo -e "${R}IPv4 地址格式不对${N}"
+      pause_screen
+      return 1
+    fi
+  else
+    if ! _portfwd_validate_ipv6 "$dst_host"; then
+      echo -e "${R}IPv6 地址格式不对${N}"
+      pause_screen
+      return 1
+    fi
+  fi
+
+  if portfwd_check_self_loop "$family" "$dst_host"; then
+    echo ""
+    echo -e "  ${R}${B}警告：落地机地址 ${dst_host} 与本机公网 IP 相同${N}"
+    echo -e "  ${Y}转发到本机会形成回环，本机服务会收到 NAT 后的包${N}"
+    read -p "  仍要继续？输入大写 YES 强制继续: " confirm
+    if [ "$confirm" != "YES" ]; then
+      echo -e "  已取消"
+      pause_screen
+      return 1
+    fi
+  fi
+
+  read -p "  端口 (1-65535): " src_port
+  if ! _portfwd_validate_port "$src_port"; then
+    echo -e "${R}端口必须是 1-65535 的数字${N}"
+    pause_screen
+    return 1
+  fi
+
+  # 节点端口冲突检测：先收集所有节点端口字符串，避免在 process substitution 里嵌套 read
+  local node_ports="" entry collide_node=""
+  node_ports=$(_portfwd_collect_singbox_ports 2>/dev/null | tr '\n' ' ')
+  for entry in $node_ports; do
+    if [ "${entry##*:}" = "$src_port" ]; then
+      collide_node="${entry%%:*}"
+      break
+    fi
+  done
+
+  if [ -n "$collide_node" ]; then
+    echo ""
+    echo -e "  ${Y}⚠ 端口 ${src_port} 是本机 ${collide_node} 节点的入站端口${N}"
+    echo -e "  ${Y}启用本规则后，该节点的入站会被 NAT 截走转到落地机${N}"
+    read -p "  仍要继续？(y/N): " confirm
+    if [ "$confirm" != "y" ] && [ "$confirm" != "Y" ]; then
+      echo -e "  已取消"
+      pause_screen
+      return 1
+    fi
+  fi
+
+  echo ""
+  read -p "  协议  1=TCP  2=UDP  3=TCP+UDP  [3]: " proto_choice
+  proto_choice="${proto_choice:-3}"
+  case "$proto_choice" in
+    1) protos="tcp" ;;
+    2) protos="udp" ;;
+    3) protos="tcp udp" ;;
+    *) echo -e "${R}无效选项${N}"; pause_screen; return 1 ;;
+  esac
+
+  echo ""
+  echo -e "  ${B}预览${N}"
+  for proto in $protos; do
+    if [ "$family" = "v4" ]; then
+      echo -e "    本机 :${src_port}/${proto}  →  ${dst_host}:${src_port}"
+    else
+      echo -e "    本机 :${src_port}/${proto}  →  [${dst_host}]:${src_port}"
+    fi
+  done
+  echo ""
+  read -p "  确认 (y/N): " confirm
+  if [ "$confirm" != "y" ] && [ "$confirm" != "Y" ]; then
+    echo -e "${Y}已取消${N}"
+    pause_screen
+    return 0
+  fi
+
+  ensure_portfwd_dir
+  echo -e "${Y}==> 启用 IP 转发 (sysctl)...${N}"
+  portfwd_enable_ip_forward
+
+  # 首次使用时确保 iptables-persistent 已装，避免重启后规则丢失
+  _portfwd_ensure_persistence
+
+  echo -e "${Y}==> 写入 NAT / FORWARD 规则...${N}"
+  for proto in $protos; do
+    id=$(portfwd_id "$family" "$proto" "$src_port" "$dst_host" "$src_port")
+    rule_path=$(portfwd_rule_path "$id")
+
+    if [ -f "$rule_path" ]; then
+      echo -e "  ${Y}规则 ${id} 已存在，跳过${N}"
+      continue
+    fi
+
+    if [ "$family" = "v4" ]; then
+      portfwd_apply_v4 "$proto" "$src_port" "$dst_host" "$src_port"
+    else
+      portfwd_apply_v6 "$proto" "$src_port" "$dst_host" "$src_port"
+    fi
+
+    portfwd_set_value "$rule_path" Family "$family"
+    portfwd_set_value "$rule_path" Proto "$proto"
+    portfwd_set_value "$rule_path" SrcPort "$src_port"
+    portfwd_set_value "$rule_path" DstHost "$dst_host"
+    portfwd_set_value "$rule_path" DstPort "$src_port"
+    portfwd_set_value "$rule_path" CreatedAt "$(date -Iseconds 2>/dev/null || date +%s)"
+
+    echo -e "  ${G}+ ${proto} :${src_port} → ${dst_host}:${src_port}${N}"
+  done
+
+  echo -e "${Y}==> 持久化规则...${N}"
+  _portfwd_persist_v4 >/dev/null 2>&1 || true
+  _portfwd_persist_v6 >/dev/null 2>&1 || true
+
+  echo ""
+  echo -e "  ${G}✔ 已生效${N}"
+  echo -e "  ${D}客户端：把落地节点链接里的 IP 改成本机 IP，端口/密钥/SNI 均不变${N}"
+  pause_screen
+}
+
+portfwd_del_interactive(){
+  local family="$1"
+  local count idx i id sel rule_path proto src_port dst_host dst_port
+
+  count=$(portfwd_count "$family")
+  if [ "${count:-0}" -eq 0 ]; then
+    echo ""
+    echo -e "  ${Y}当前没有规则可删${N}"
+    pause_screen
+    return 0
+  fi
+
+  echo ""
+  echo -e "  ${B}${C}选要删除的规则${N}"
+  i=1
+  while IFS= read -r id; do
+    [ -n "$id" ] || continue
+    printf "    %2d) %s\n" "$i" "$(portfwd_describe_rule "$id")"
+    i=$((i + 1))
+  done < <(portfwd_list_rules "$family")
+  echo "     0) 返回"
+  echo ""
+  read -p "  请输入序号: " sel
+
+  case "$sel" in
+    ''|0) return 0 ;;
+    *[!0-9]*) echo -e "${R}非数字${N}"; pause_screen; return 1 ;;
+  esac
+  if [ "$sel" -lt 1 ] || [ "$sel" -ge "$i" ]; then
+    echo -e "${R}超出范围${N}"
+    pause_screen
+    return 1
+  fi
+
+  idx=1
+  id=""
+  local cur
+  while IFS= read -r cur; do
+    [ -n "$cur" ] || continue
+    if [ "$idx" = "$sel" ]; then
+      id="$cur"
+      break
+    fi
+    idx=$((idx + 1))
+  done < <(portfwd_list_rules "$family")
+
+  if [ -z "$id" ]; then
+    echo -e "${R}未找到对应规则${N}"
+    pause_screen
+    return 1
+  fi
+
+  rule_path=$(portfwd_rule_path "$id")
+  proto=$(portfwd_get_value "$rule_path" Proto)
+  src_port=$(portfwd_get_value "$rule_path" SrcPort)
+  dst_host=$(portfwd_get_value "$rule_path" DstHost)
+  dst_port=$(portfwd_get_value "$rule_path" DstPort)
+
+  if [ "$family" = "v4" ]; then
+    portfwd_remove_v4 "$proto" "$src_port" "$dst_host" "$dst_port"
+  else
+    portfwd_remove_v6 "$proto" "$src_port" "$dst_host" "$dst_port"
+  fi
+  rm -f "$rule_path"
+
+  _portfwd_persist_v4 >/dev/null 2>&1 || true
+  _portfwd_persist_v6 >/dev/null 2>&1 || true
+  portfwd_disable_ip_forward_if_idle
+
+  echo ""
+  echo -e "  ${G}已删除：${proto} :${src_port} → ${dst_host}:${dst_port}${N}"
+  pause_screen
+}
+
+portfwd_clear_all_interactive(){
+  local family="$1"
+  local family_label confirm
+  if [ "$family" = "v4" ]; then family_label="IPv4"; else family_label="IPv6"; fi
+
+  if [ "$(portfwd_count "$family")" -eq 0 ]; then
+    echo ""
+    echo -e "  ${Y}当前没有规则${N}"
+    pause_screen
+    return 0
+  fi
+
+  echo ""
+  echo -e "  ${R}${B}一键清空所有 ${family_label} 转发${N}"
+  read -p "  确认？(y/N): " confirm
+  if [ "$confirm" != "y" ] && [ "$confirm" != "Y" ]; then
+    echo -e "  已取消"
+    pause_screen
+    return 0
+  fi
+
+  portfwd_cleanup_all "$family"
+
+  echo ""
+  echo -e "  ${G}已清空 ${family_label} 端口转发${N}"
+  pause_screen
+}
+
+portfwd_view_full_rules(){
+  local family="$1"
+  echo ""
+  if [ "$family" = "v4" ]; then
+    echo -e "  ${B}${C}IPv4 NAT 自定义链 (${PORTFWD_NAT_CHAIN})${N}"
+    iptables -t nat -L "$PORTFWD_NAT_CHAIN" -n -v --line-numbers 2>&1 || echo "  (链不存在)"
+    echo ""
+    echo -e "  ${B}${C}IPv4 FORWARD 子链 (${PORTFWD_FWD_CHAIN})${N}"
+    iptables -L "$PORTFWD_FWD_CHAIN" -n -v --line-numbers 2>&1 || echo "  (链不存在)"
+    echo ""
+    echo -e "  ${B}${C}IPv4 POSTROUTING (含 MASQUERADE)${N}"
+    iptables -t nat -L POSTROUTING -n -v --line-numbers 2>&1
+  else
+    echo -e "  ${B}${C}IPv6 NAT 自定义链 (${PORTFWD_NAT_CHAIN})${N}"
+    ip6tables -t nat -L "$PORTFWD_NAT_CHAIN" -n -v --line-numbers 2>&1 || echo "  (链不存在)"
+    echo ""
+    echo -e "  ${B}${C}IPv6 FORWARD 子链 (${PORTFWD_FWD_CHAIN})${N}"
+    ip6tables -L "$PORTFWD_FWD_CHAIN" -n -v --line-numbers 2>&1 || echo "  (链不存在)"
+    echo ""
+    echo -e "  ${B}${C}IPv6 POSTROUTING (含 MASQUERADE)${N}"
+    ip6tables -t nat -L POSTROUTING -n -v --line-numbers 2>&1
+  fi
+  pause_screen
+}
+
+# ╚════════════════════════ PORTFWD 模块结束 ════════════════════════════╝
+
 # ─── Hysteria2 节点 ────────────────────────────────────
 generate_hy2_random_port(){
   local p attempts=0
@@ -6138,7 +6939,8 @@ modify_hy2_params(){
 
 # ─── 完整卸载脚本 ─────────────────────────────────────
 # 清理范围：节点 inbound、节点防火墙端口、sing-box 服务与软件包、
-#          /etc/sing-box（含 nodes/、certs/、备份）、
+#          /etc/sing-box（含 nodes/、certs/、portfwd/、备份）、
+#          端口转发 iptables 规则与 sysctl drop-in、
 #          legacy /root/proxy-info.txt、/usr/local/bin/sb。
 # 不动：SSH 端口/sshd 配置、用户账户、sudoers、自动更新策略、
 #        IPv6 防火墙菜单规则、1Panel、apt 基础工具、
@@ -6211,6 +7013,10 @@ uninstall_script_completely(){
   port_hop_cleanup_all
   ip4_save_rules >/dev/null 2>&1 || true
   ip6_save_rules >/dev/null 2>&1 || true
+
+  # 端口转发 iptables 链 + sysctl drop-in 兜底清理
+  echo -e "${Y}==> 清理端口转发规则与 sysctl drop-in...${N}"
+  portfwd_cleanup_all both
 
   # 2. 停服 + 卸载 sing-box 软件包
   echo -e "${Y}==> 停止并禁用 sing-box 服务...${N}"
@@ -6518,6 +7324,7 @@ show_node_manage_menu(){
     render_menu_item 2 "卸载单个节点"
     render_menu_item 3 "升级 sing-box 内核"
     render_menu_item 4 "链式代理设置 (中转机)"
+    render_menu_item 5 "端口转发 (中转落地)"
     render_menu_item 0 "返回上级"
     render_divider
     read -p "  请输入序号: " choice
@@ -6526,6 +7333,7 @@ show_node_manage_menu(){
       2) show_node_uninstall_menu ;;
       3) upgrade_singbox_kernel ;;
       4) show_chain_menu ;;
+      5) show_portfwd_menu ;;
       0) return ;;
       *) notify_invalid_choice ;;
     esac

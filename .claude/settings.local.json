@@ -40,7 +40,8 @@
       "Bash(awk NR>=4830 && NR<=4870 *)",
       "Bash(awk NR>=5495 && NR<=5560 *)",
       "Bash(awk NR>=3722 && NR<=3760 *)",
-      "Bash(awk NR>=3838 && NR<=3870 *)"
+      "Bash(awk NR>=3838 && NR<=3870 *)",
+      "Bash(gh api *)"
     ]
   }
 }
