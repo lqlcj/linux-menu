@@ -6129,6 +6129,13 @@ render_card_blank(){
   echo -e "  ${L}│${N}$(printf '%*s' "$CARD_INNER_WIDTH" '')${L}│${N}"
 }
 
+# 拼接 N 个 ─（避开 tr ' ' '─'：多数 tr 实现只能单字节替换，会把 ─ 截成 0xE2 乱码）
+_card_dash_fill(){
+  local n="$1" out="" i
+  for ((i = 0; i < n; i++)); do out+='─'; done
+  printf '%s' "$out"
+}
+
 # 卡片普通行（自动右侧补空格到内宽）
 render_card_line(){
   local content="$1" visible pad
@@ -6147,14 +6154,14 @@ render_card_top(){
   # 内宽 = 1(─) + 1(空) + title + 1(空) + N + 1(空) + right + 1(空) + 1(─)
   fill_w=$((CARD_INNER_WIDTH - 6 - title_w - right_w))
   [ "$fill_w" -lt 1 ] && fill_w=1
-  fill=$(printf '%*s' "$fill_w" '' | tr ' ' '─')
+  fill=$(_card_dash_fill "$fill_w")
   echo -e "  ${L}╭─${N} ${title} ${L}${fill}${N} ${right} ${L}─╮${N}"
 }
 
 # 卡片底部
 render_card_bottom(){
   local fill
-  fill=$(printf '%*s' "$CARD_INNER_WIDTH" '' | tr ' ' '─')
+  fill=$(_card_dash_fill "$CARD_INNER_WIDTH")
   echo -e "  ${L}╰${fill}╯${N}"
 }
 
