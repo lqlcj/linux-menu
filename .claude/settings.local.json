@@ -41,7 +41,9 @@
       "Bash(awk NR>=5495 && NR<=5560 *)",
       "Bash(awk NR>=3722 && NR<=3760 *)",
       "Bash(awk NR>=3838 && NR<=3870 *)",
-      "Bash(gh api *)"
+      "Bash(gh api *)",
+      "Bash(sed -n '5255,5268p' \"C:/Users/leyili/Desktop/linux-menu/linux-menu/leyili.sh\")",
+      "Bash(sed -n '6515,6535p' \"C:/Users/leyili/Desktop/linux-menu/linux-menu/leyili.sh\")"
     ]
   }
 }
