@@ -412,6 +412,44 @@ ip6_ensure_persistence(){
   return 0
 }
 
+# 确保 iptables/ip6tables 命令可用（minimal cloud 镜像常缺）
+# 返回 0=已就绪或安装成功，1=失败
+ensure_iptables_installed(){
+  local need_install=0
+
+  if ! command -v iptables >/dev/null 2>&1 || ! command -v ip6tables >/dev/null 2>&1; then
+    need_install=1
+  fi
+
+  if [ "$need_install" = "0" ]; then
+    return 0
+  fi
+
+  if ! is_debian_family; then
+    echo -e "${R}非 Debian 系发行版，请手动安装 iptables 后重试${N}"
+    return 1
+  fi
+
+  echo ""
+  echo -e "${Y}==> 检测到 iptables/ip6tables 未安装，使用官方源 (apt) 安装...${N}"
+  if ! DEBIAN_FRONTEND=noninteractive apt-get update -qq; then
+    echo -e "${R}apt-get update 失败${N}"
+    return 1
+  fi
+  if ! DEBIAN_FRONTEND=noninteractive apt-get install -y iptables >/dev/null; then
+    echo -e "${R}apt-get install iptables 失败${N}"
+    return 1
+  fi
+
+  if ! command -v iptables >/dev/null 2>&1 || ! command -v ip6tables >/dev/null 2>&1; then
+    echo -e "${R}安装后仍找不到 iptables/ip6tables，请手动检查${N}"
+    return 1
+  fi
+
+  echo -e "${G}iptables / ip6tables 安装完成${N}"
+  return 0
+}
+
 ip6_save_rules(){
   local target="$IP6_RULES_PATH_DEBIAN"
 
@@ -1020,8 +1058,32 @@ ensure_password_auth_enabled(){
   return 0
 }
 
+# 判断 IPv4 是否属于私有 / CGNAT / 链路本地 / loopback / 0.0.0.0
+# NAT 型 VPS（阿里云国际轻量、腾讯云轻量、AWS Lightsail、各种 NAT 套餐）网卡绑的是
+# 内网 IP，公网 IP 在云厂商 NAT 网关上做映射；本地探测会拿到内网段，需要回退到外部接口。
+is_private_ipv4(){
+  case "$1" in
+    10.*|127.*|192.168.*|0.0.0.0|169.254.*) return 0 ;;
+    172.16.*|172.17.*|172.18.*|172.19.*) return 0 ;;
+    172.2[0-9].*|172.3[01].*) return 0 ;;
+    100.6[4-9].*|100.[7-9][0-9].*|100.1[01][0-9].*|100.12[0-7].*) return 0 ;;
+  esac
+  return 1
+}
+
+# 判断 IPv6 是否属于 ULA / link-local / loopback / unspecified
+is_private_ipv6(){
+  local ip
+  ip=$(printf '%s' "$1" | tr 'A-Z' 'a-z')
+  case "$ip" in
+    ::1|::|fe8?:*|fe9?:*|fea?:*|feb?:*) return 0 ;;
+    fc??:*|fd??:*) return 0 ;;
+  esac
+  return 1
+}
+
 detect_primary_ipv4(){
-  local detected=""
+  local detected="" local_fallback=""
 
   if command -v ip >/dev/null 2>&1; then
     detected=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{
@@ -1032,6 +1094,10 @@ detect_primary_ipv4(){
         }
       }
     }')
+    if [ -n "$detected" ] && is_private_ipv4 "$detected"; then
+      local_fallback="$detected"
+      detected=""
+    fi
 
     if [ -z "$detected" ]; then
       detected=$(ip -4 addr show scope global up 2>/dev/null | awk '/inet / {
@@ -1039,6 +1105,10 @@ detect_primary_ipv4(){
         print parts[1]
         exit
       }')
+      if [ -n "$detected" ] && is_private_ipv4 "$detected"; then
+        [ -z "$local_fallback" ] && local_fallback="$detected"
+        detected=""
+      fi
     fi
   fi
 
@@ -1046,11 +1116,17 @@ detect_primary_ipv4(){
     detected=$(curl -s4 --max-time 3 ip.sb 2>/dev/null || true)
   fi
 
+  # curl 也失败时，宁可返回先前探到的内网 IP 也别返回空——
+  # 至少能让用户在节点信息里看到检测结果，避免上层卡在「未检测到可用的 IPv4 地址」
+  if [ -z "$detected" ]; then
+    detected="$local_fallback"
+  fi
+
   printf '%s' "$detected"
 }
 
 detect_primary_ipv6(){
-  local detected=""
+  local detected="" local_fallback=""
 
   if command -v ip >/dev/null 2>&1; then
     detected=$(ip -6 route get 2606:4700:4700::1111 2>/dev/null | awk '{
@@ -1061,6 +1137,10 @@ detect_primary_ipv6(){
         }
       }
     }')
+    if [ -n "$detected" ] && is_private_ipv6 "$detected"; then
+      local_fallback="$detected"
+      detected=""
+    fi
 
     if [ -z "$detected" ]; then
       detected=$(ip -6 addr show scope global up 2>/dev/null | awk '/inet6 / {
@@ -1068,11 +1148,19 @@ detect_primary_ipv6(){
         print parts[1]
         exit
       }')
+      if [ -n "$detected" ] && is_private_ipv6 "$detected"; then
+        [ -z "$local_fallback" ] && local_fallback="$detected"
+        detected=""
+      fi
     fi
   fi
 
   if [ -z "$detected" ]; then
     detected=$(curl -s6 --max-time 3 ip.sb 2>/dev/null || true)
+  fi
+
+  if [ -z "$detected" ]; then
+    detected="$local_fallback"
   fi
 
   printf '%s' "$detected"
@@ -1910,7 +1998,7 @@ parse_node_link(){
   fi
   # 拆 ?query
   if [[ "$rest" == *"?"* ]]; then
-    query="${rest#*?}"
+    query="${rest#*\?}"
     rest="${rest%%\?*}"
   fi
   # 拆 user@host:port
@@ -2350,9 +2438,7 @@ show_ipv6_firewall_menu(){
     return 1
   fi
 
-  if ! command -v ip6tables >/dev/null 2>&1; then
-    echo ""
-    echo -e "${R}系统未安装 ip6tables，无法管理 IPv6 防火墙${N}"
+  if ! ensure_iptables_installed; then
     pause_screen
     return 1
   fi
@@ -2750,9 +2836,7 @@ show_ipv4_firewall_menu(){
     return 1
   fi
 
-  if ! command -v iptables >/dev/null 2>&1; then
-    echo ""
-    echo -e "${R}系统未安装 iptables，无法管理 IPv4 防火墙${N}"
+  if ! ensure_iptables_installed; then
     pause_screen
     return 1
   fi
