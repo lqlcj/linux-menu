@@ -24,7 +24,23 @@
       "Bash(awk ' *)",
       "Bash(awk -F'=' '/^[[:space:]]*net\\\\.core\\\\.rmem_max/ { gsub\\(/[[:space:]]/, \"\", $2\\); print $2; exit }')",
       "Bash(awk '{ *)",
-      "Bash(bash -c ' *)"
+      "Bash(bash -c ' *)",
+      "Bash(cp leyili.sh leyili.sh.original)",
+      "Bash(sed -n '1,34p' leyili.sh)",
+      "Bash(sed -n '35,39p' leyili.sh)",
+      "Bash(sed -n '40,119p' leyili.sh)",
+      "Bash(sed -n '120,329p' leyili.sh)",
+      "Bash(bash *)",
+      "Bash(openssl version *)",
+      "Bash(curl --version)",
+      "Bash(sort -t'|' -k7 -n)",
+      "Bash(command -v timeout)",
+      "Bash(openssl s_client -connect www.u-tokyo.ac.jp:443 -servername www.u-tokyo.ac.jp -tls1_3 -alpn h2 -groups X25519)",
+      "Bash(openssl s_client -connect www.waseda.jp:443 -servername www.waseda.jp -tls1_3 -alpn h2,http/1.1 -groups X25519:P-256)",
+      "Bash(awk NR>=4830 && NR<=4870 *)",
+      "Bash(awk NR>=5495 && NR<=5560 *)",
+      "Bash(awk NR>=3722 && NR<=3760 *)",
+      "Bash(awk NR>=3838 && NR<=3870 *)"
     ]
   }
 }

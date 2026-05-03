@@ -205,6 +205,105 @@ deny_port_in_firewall(){
   esac
 }
 
+# 节点入站统一开放端口：
+# - ufw / firewalld 走 allow_port_in_firewall（双栈，一条命令同时开 v4+v6）
+# - 若 v4 / v6 INPUT 默认策略 = DROP（脚本本身的 iptables / ip6tables 防火墙菜单初始化过），
+#   主动追加该协议主端口的 ACCEPT 规则并持久化
+# 用法：node_apply_firewall_for_mode <port> <proto:tcp|udp> <mode:ipv4|dualstack|ipv6-in-ipv4-out>
+node_apply_firewall_for_mode(){
+  local port="$1"
+  local proto="${2:-tcp}"
+  local mode="${3:-ipv4}"
+  local need_v4=0 need_v6=0
+
+  case "$mode" in
+    ipv4)              need_v4=1 ;;
+    dualstack)         need_v4=1; need_v6=1 ;;
+    ipv6-in-ipv4-out)  need_v6=1 ;;
+    *)                 need_v4=1 ;;
+  esac
+
+  # ufw / firewalld 是双栈，只要任一侧需要就调一次
+  if [ "$need_v4" = "1" ] || [ "$need_v6" = "1" ]; then
+    allow_port_in_firewall "$port" "$proto"
+  fi
+
+  # 脚本自管的 iptables 防火墙（默认策略 DROP 时 INPUT 是白名单制）
+  if [ "$need_v4" = "1" ] && command -v iptables >/dev/null 2>&1; then
+    local v4_pol
+    v4_pol=$(ip4_get_input_policy 2>/dev/null || true)
+    if [ "$v4_pol" = "DROP" ]; then
+      if iptables -C INPUT -p "$proto" --dport "$port" -j ACCEPT 2>/dev/null; then
+        echo -e "  v4 防火墙: ${D}${port}/${proto} 已在放行列表${N}"
+      else
+        iptables -A INPUT -p "$proto" --dport "$port" -j ACCEPT 2>/dev/null \
+          && echo -e "  v4 防火墙: ${C}iptables 已放行 ${port}/${proto}${N}" \
+          || echo -e "  v4 防火墙: ${Y}iptables 放行失败，请手动检查${N}"
+        ip4_save_rules >/dev/null 2>&1 || true
+      fi
+    fi
+  fi
+
+  if [ "$need_v6" = "1" ] && command -v ip6tables >/dev/null 2>&1; then
+    local v6_pol
+    v6_pol=$(ip6_get_input_policy 2>/dev/null || true)
+    if [ "$v6_pol" = "DROP" ]; then
+      if ip6tables -C INPUT -p "$proto" --dport "$port" -j ACCEPT 2>/dev/null; then
+        echo -e "  v6 防火墙: ${D}${port}/${proto} 已在放行列表${N}"
+      else
+        ip6tables -A INPUT -p "$proto" --dport "$port" -j ACCEPT 2>/dev/null \
+          && echo -e "  v6 防火墙: ${C}ip6tables 已放行 ${port}/${proto}${N}" \
+          || echo -e "  v6 防火墙: ${Y}ip6tables 放行失败，请手动检查${N}"
+        ip6_save_rules >/dev/null 2>&1 || true
+      fi
+    fi
+  fi
+}
+
+# 节点入站统一撤销端口（uninstall / 改端口时配套使用）
+# 用法：node_revoke_firewall_for_mode <port> <proto> <mode>
+node_revoke_firewall_for_mode(){
+  local port="$1"
+  local proto="${2:-tcp}"
+  local mode="${3:-ipv4}"
+  local need_v4=0 need_v6=0
+
+  case "$mode" in
+    ipv4)              need_v4=1 ;;
+    dualstack)         need_v4=1; need_v6=1 ;;
+    ipv6-in-ipv4-out)  need_v6=1 ;;
+    *)                 need_v4=1 ;;
+  esac
+
+  if [ "$need_v4" = "1" ] || [ "$need_v6" = "1" ]; then
+    deny_port_in_firewall "$port" "$proto"
+  fi
+
+  if [ "$need_v4" = "1" ] && command -v iptables >/dev/null 2>&1; then
+    local v4_removed=0
+    while iptables -C INPUT -p "$proto" --dport "$port" -j ACCEPT 2>/dev/null; do
+      iptables -D INPUT -p "$proto" --dport "$port" -j ACCEPT 2>/dev/null || break
+      v4_removed=1
+    done
+    if [ "$v4_removed" = "1" ]; then
+      echo -e "  v4 防火墙: ${D}iptables 撤销 ${port}/${proto}${N}"
+      ip4_save_rules >/dev/null 2>&1 || true
+    fi
+  fi
+
+  if [ "$need_v6" = "1" ] && command -v ip6tables >/dev/null 2>&1; then
+    local v6_removed=0
+    while ip6tables -C INPUT -p "$proto" --dport "$port" -j ACCEPT 2>/dev/null; do
+      ip6tables -D INPUT -p "$proto" --dport "$port" -j ACCEPT 2>/dev/null || break
+      v6_removed=1
+    done
+    if [ "$v6_removed" = "1" ]; then
+      echo -e "  v6 防火墙: ${D}ip6tables 撤销 ${port}/${proto}${N}"
+      ip6_save_rules >/dev/null 2>&1 || true
+    fi
+  fi
+}
+
 # 给用户打印"请自行放行端口"的提示，覆盖 IPv4(ufw/firewalld)、IPv6(本脚本菜单)、云安全组
 print_firewall_hint(){
   local port="$1"
@@ -2285,20 +2384,27 @@ ip6_init_firewall(){
   ip6tables -P INPUT DROP
   ip6tables -P OUTPUT ACCEPT
 
-  # 自动恢复 hy2 节点端口跳跃放行（IPv6 侧）
-  local hop_v hop_start_v hop_end_v hy2_mode
+  # 自动恢复 reality / hy2 节点主端口放行（IPv6 侧）
+  # 仅在节点 Mode 为 dualstack / ipv6-in-ipv4-out 时需要
+  local node_port node_mode
+  if node_installed reality; then
+    node_port=$(get_node_value reality Port 2>/dev/null || true)
+    node_mode=$(get_node_value reality Mode 2>/dev/null || echo ipv4)
+    if [ -n "$node_port" ] \
+       && { [ "$node_mode" = "dualstack" ] || [ "$node_mode" = "ipv6-in-ipv4-out" ]; }; then
+      ip6tables -C INPUT -p tcp --dport "$node_port" -j ACCEPT 2>/dev/null \
+        || ip6tables -A INPUT -p tcp --dport "$node_port" -j ACCEPT 2>/dev/null || true
+      echo -e "  ${G}已自动恢复 reality 主端口放行 (v6)：${node_port}/tcp${N}"
+    fi
+  fi
   if node_installed hy2; then
-    hop_v=$(get_node_value hy2 PortHop 2>/dev/null || echo 0)
-    if [ "$hop_v" = "1" ]; then
-      hop_start_v=$(get_node_value hy2 PortHopStart 2>/dev/null || true)
-      hop_end_v=$(get_node_value hy2 PortHopEnd 2>/dev/null || true)
-      hy2_mode=$(get_node_value hy2 Mode 2>/dev/null || echo ipv4)
-      # 仅在 dualstack / ipv6-in-ipv4-out 模式下需要 v6 放行
-      if [ -n "$hop_start_v" ] && [ -n "$hop_end_v" ] \
-         && { [ "$hy2_mode" = "dualstack" ] || [ "$hy2_mode" = "ipv6-in-ipv4-out" ]; }; then
-        ip6tables -A INPUT -p udp --dport "${hop_start_v}:${hop_end_v}" -j ACCEPT 2>/dev/null || true
-        echo -e "  ${G}已自动恢复 hy2 端口跳跃放行 (v6)：${hop_start_v}-${hop_end_v}/udp${N}"
-      fi
+    node_port=$(get_node_value hy2 Port 2>/dev/null || true)
+    node_mode=$(get_node_value hy2 Mode 2>/dev/null || echo ipv4)
+    if [ -n "$node_port" ] \
+       && { [ "$node_mode" = "dualstack" ] || [ "$node_mode" = "ipv6-in-ipv4-out" ]; }; then
+      ip6tables -C INPUT -p udp --dport "$node_port" -j ACCEPT 2>/dev/null \
+        || ip6tables -A INPUT -p udp --dport "$node_port" -j ACCEPT 2>/dev/null || true
+      echo -e "  ${G}已自动恢复 hy2 主端口放行 (v6)：${node_port}/udp${N}"
     fi
   fi
 
@@ -2669,17 +2775,27 @@ ip4_init_firewall(){
   iptables -P INPUT DROP
   iptables -P OUTPUT ACCEPT
 
-  # 修复 #14：自动恢复已配置的 hy2 端口跳跃放行
-  local hop_v hop_start_v hop_end_v
+  # 自动恢复 reality / hy2 节点主端口放行（IPv4 侧）
+  # 仅在节点 Mode 为 ipv4 / dualstack 时需要
+  local node_port node_mode
+  if node_installed reality; then
+    node_port=$(get_node_value reality Port 2>/dev/null || true)
+    node_mode=$(get_node_value reality Mode 2>/dev/null || echo ipv4)
+    if [ -n "$node_port" ] \
+       && { [ "$node_mode" = "ipv4" ] || [ "$node_mode" = "dualstack" ]; }; then
+      iptables -C INPUT -p tcp --dport "$node_port" -j ACCEPT 2>/dev/null \
+        || iptables -A INPUT -p tcp --dport "$node_port" -j ACCEPT 2>/dev/null || true
+      echo -e "  ${G}已自动恢复 reality 主端口放行：${node_port}/tcp${N}"
+    fi
+  fi
   if node_installed hy2; then
-    hop_v=$(get_node_value hy2 PortHop 2>/dev/null || echo 0)
-    if [ "$hop_v" = "1" ]; then
-      hop_start_v=$(get_node_value hy2 PortHopStart 2>/dev/null || true)
-      hop_end_v=$(get_node_value hy2 PortHopEnd 2>/dev/null || true)
-      if [ -n "$hop_start_v" ] && [ -n "$hop_end_v" ]; then
-        iptables -A INPUT -p udp --dport "${hop_start_v}:${hop_end_v}" -j ACCEPT 2>/dev/null || true
-        echo -e "  ${G}已自动恢复 hy2 端口跳跃放行：${hop_start_v}-${hop_end_v}/udp${N}"
-      fi
+    node_port=$(get_node_value hy2 Port 2>/dev/null || true)
+    node_mode=$(get_node_value hy2 Mode 2>/dev/null || echo ipv4)
+    if [ -n "$node_port" ] \
+       && { [ "$node_mode" = "ipv4" ] || [ "$node_mode" = "dualstack" ]; }; then
+      iptables -C INPUT -p udp --dport "$node_port" -j ACCEPT 2>/dev/null \
+        || iptables -A INPUT -p udp --dport "$node_port" -j ACCEPT 2>/dev/null || true
+      echo -e "  ${G}已自动恢复 hy2 主端口放行：${node_port}/udp${N}"
     fi
   fi
 
@@ -3874,8 +3990,12 @@ modify_reality_params(){
   ipv6_new_link=$(build_dualstack_ipv6_link_for_node reality 2>/dev/null || true)
   [ -n "$new_link" ] && set_node_value reality Link "$new_link"
   if [ -n "$new_port" ] && [ "$new_port" != "$cur_port" ]; then
+    local rt_mode_now
+    rt_mode_now=$(get_node_value reality Mode 2>/dev/null || echo ipv4)
+    # 旧端口先撤、新端口再开（双栈/v6 模式同时处理 v4/v6）
+    [ -n "$cur_port" ] && node_revoke_firewall_for_mode "$cur_port" tcp "$rt_mode_now"
+    node_apply_firewall_for_mode "$new_port" tcp "$rt_mode_now"
     print_firewall_hint "$new_port" tcp "Reality 节点新端口"
-    echo -e "  ${D}旧端口 ${cur_port}/tcp 如已不再使用，请自行回收（参见上述路径反向操作）${N}"
   fi
   cleanup_old_backups "${CONFIG_PATH}.bak.*" 5
 
@@ -4842,6 +4962,7 @@ install_reality_node(){
     return 1
   fi
 
+  node_apply_firewall_for_mode "$PORT" tcp "$install_mode"
   print_firewall_hint "$PORT" tcp "Reality 节点入站"
 
   link=$(build_reality_link "$UUID" "$access_ip" "$PORT" "$SNI" "$public_key" "$SHORT_ID" "$TAG" 2>/dev/null || true)
@@ -4940,6 +5061,15 @@ uninstall_reality_node(){
     echo -e "  已取消"
     return 0
   fi
+
+  # 必须在 remove_node_info 之前撤防火墙规则，否则读不到 Mode/Port
+  local rt_port rt_mode
+  rt_port=$(get_node_value reality Port 2>/dev/null || true)
+  rt_mode=$(get_node_value reality Mode 2>/dev/null || echo ipv4)
+  if [ -n "$rt_port" ]; then
+    node_revoke_firewall_for_mode "$rt_port" tcp "$rt_mode"
+  fi
+
   config_remove_inbound_by_tag "reality-in" || true
   config_remove_inbound_chain "reality-in" || true
   config_remove_outbound_by_tag "chain-reality-out" || true
@@ -5014,8 +5144,9 @@ port_hop_apply_v4(){
   fi
   iptables -t nat -C PREROUTING -j "$PORT_HOP_NAT_CHAIN" 2>/dev/null \
     || iptables -t nat -I PREROUTING 1 -j "$PORT_HOP_NAT_CHAIN"
-  iptables -C INPUT -p udp --dport "${start}:${end}" -j ACCEPT 2>/dev/null \
-    || iptables -A INPUT -p udp --dport "${start}:${end}" -j ACCEPT
+  # filter 表 INPUT 看到的是 DNAT/REDIRECT 之后的 dport（主端口），所以放行主端口而非 hop 范围
+  iptables -C INPUT -p udp --dport "$port" -j ACCEPT 2>/dev/null \
+    || iptables -A INPUT -p udp --dport "$port" -j ACCEPT
 }
 
 port_hop_apply_v6(){
@@ -5034,8 +5165,9 @@ port_hop_apply_v6(){
   fi
   ip6tables -t nat -C PREROUTING -j "$PORT_HOP_NAT_CHAIN" 2>/dev/null \
     || ip6tables -t nat -I PREROUTING 1 -j "$PORT_HOP_NAT_CHAIN"
-  ip6tables -C INPUT -p udp --dport "${start}:${end}" -j ACCEPT 2>/dev/null \
-    || ip6tables -A INPUT -p udp --dport "${start}:${end}" -j ACCEPT
+  # filter 表 INPUT 看到的是 DNAT/REDIRECT 之后的 dport（主端口），所以放行主端口而非 hop 范围
+  ip6tables -C INPUT -p udp --dport "$port" -j ACCEPT 2>/dev/null \
+    || ip6tables -A INPUT -p udp --dport "$port" -j ACCEPT
 }
 
 port_hop_remove_v4(){
@@ -5043,9 +5175,8 @@ port_hop_remove_v4(){
   iptables -t nat -F "$PORT_HOP_NAT_CHAIN" 2>/dev/null || true
   iptables -t nat -D PREROUTING -j "$PORT_HOP_NAT_CHAIN" 2>/dev/null || true
   iptables -t nat -X "$PORT_HOP_NAT_CHAIN" 2>/dev/null || true
-  while iptables -C INPUT -p udp --dport "${start}:${end}" -j ACCEPT 2>/dev/null; do
-    iptables -D INPUT -p udp --dport "${start}:${end}" -j ACCEPT
-  done
+  # 注意：不在此删除 INPUT 链主端口 ACCEPT，因为节点本身可能仍需要它；
+  # 节点真正卸载时由 node_revoke_firewall_for_mode 统一清理。
 }
 
 port_hop_remove_v6(){
@@ -5056,9 +5187,7 @@ port_hop_remove_v6(){
   ip6tables -t nat -F "$PORT_HOP_NAT_CHAIN" 2>/dev/null || true
   ip6tables -t nat -D PREROUTING -j "$PORT_HOP_NAT_CHAIN" 2>/dev/null || true
   ip6tables -t nat -X "$PORT_HOP_NAT_CHAIN" 2>/dev/null || true
-  while ip6tables -C INPUT -p udp --dport "${start}:${end}" -j ACCEPT 2>/dev/null; do
-    ip6tables -D INPUT -p udp --dport "${start}:${end}" -j ACCEPT
-  done
+  # 同上，不在此清 INPUT 主端口规则
 }
 
 port_hop_apply(){
@@ -5070,6 +5199,9 @@ port_hop_apply(){
                        port_hop_apply_v6 "$port" "$start" "$end" "$listen_v6" ;;
     ipv6-in-ipv4-out)  port_hop_apply_v6 "$port" "$start" "$end" "$listen_v6" ;;
   esac
+  # ufw / firewalld：DNAT 后 dport 是主端口，放行 hop 范围本身没用，
+  # 但用户阅读规则列表时能看到该范围被显式标记，且不会与节点主端口规则冲突。
+  # 主端口本身由 node_apply_firewall_for_mode 在 install/modify 时放行。
   case "$(detect_firewall_backend)" in
     ufw)
       ufw allow "${start}:${end}/udp" >/dev/null 2>&1 || true
@@ -5494,9 +5626,10 @@ install_hy2_node(){
     fi
   fi
 
+  node_apply_firewall_for_mode "$PORT" udp "$install_mode"
   print_firewall_hint "$PORT" udp "Hysteria2 节点入站"
   if [ "$HOP_ENABLE" = "1" ]; then
-    echo -e "  ${D}端口跳跃范围 ${HOP_START}-${HOP_END}/udp 已自动放行${N}"
+    echo -e "  ${D}端口跳跃 DNAT 已配置：${HOP_START}-${HOP_END}/udp → 主端口 ${PORT}/udp${N}"
   fi
   if [ "$cert_source" = "acme" ]; then
     print_firewall_hint 80 tcp "ACME 证书签发与续期，签发期间必须可外部访问"
@@ -5601,16 +5734,22 @@ uninstall_hy2_node(){
   fi
 
   # 清理端口跳跃规则（必须在 remove_node_info 之前，否则读不到 info）
-  local hop_enabled hop_start hop_end mode
+  local hop_enabled hop_start hop_end mode hy2_port
   hop_enabled=$(get_node_value hy2 PortHop 2>/dev/null || echo 0)
+  hy2_port=$(get_node_value hy2 Port 2>/dev/null || true)
+  mode=$(get_node_value hy2 Mode 2>/dev/null || echo ipv4)
   if [ "$hop_enabled" = "1" ]; then
     hop_start=$(get_node_value hy2 PortHopStart 2>/dev/null || true)
     hop_end=$(get_node_value hy2 PortHopEnd 2>/dev/null || true)
-    mode=$(get_node_value hy2 Mode 2>/dev/null || echo ipv4)
     if [ -n "$hop_start" ] && [ -n "$hop_end" ]; then
       port_hop_remove "$hop_start" "$hop_end" "$mode"
       echo -e "  ${D}端口跳跃规则已清理 (${hop_start}-${hop_end})${N}"
     fi
+  fi
+
+  # 撤销主端口防火墙规则
+  if [ -n "$hy2_port" ]; then
+    node_revoke_firewall_for_mode "$hy2_port" udp "$mode"
   fi
 
   config_remove_inbound_by_tag "hy2-in" || true
@@ -5970,8 +6109,12 @@ modify_hy2_params(){
   ipv6_new_link=$(build_dualstack_ipv6_link_for_node hy2 2>/dev/null || true)
   [ -n "$new_link" ] && set_node_value hy2 Link "$new_link"
   if [ -n "$new_port" ] && [ "$new_port" != "$cur_port" ]; then
+    local hy2_mode_now
+    hy2_mode_now=$(get_node_value hy2 Mode 2>/dev/null || echo ipv4)
+    # 旧端口先撤、新端口再开（双栈/v6 模式同时处理 v4/v6）
+    [ -n "$cur_port" ] && node_revoke_firewall_for_mode "$cur_port" udp "$hy2_mode_now"
+    node_apply_firewall_for_mode "$new_port" udp "$hy2_mode_now"
     print_firewall_hint "$new_port" udp "Hysteria2 节点新端口"
-    echo -e "  ${D}旧端口 ${cur_port}/udp 如已不再使用，请自行回收（参见上述路径反向操作）${N}"
   fi
   cleanup_old_backups "${CONFIG_PATH}.bak.*" 5
 
