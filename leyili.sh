@@ -687,6 +687,80 @@ get_current_ssh_port(){
   printf '%s' "${current_port:-22}"
 }
 
+# 用 sshd -T 取某指令实际生效值（已合并 sshd_config.d 与 Match 默认段）
+# 返回小写值，找不到时返回空。失败不终止调用方。
+get_effective_sshd_value(){
+  local key="$1"
+  local sshd_bin=""
+  local lower_key=""
+
+  [ -z "$key" ] && return 0
+  sshd_bin=$(get_sshd_binary)
+  [ -z "$sshd_bin" ] && return 0
+  [ ! -f "$SSHD_CONFIG_PATH" ] && return 0
+
+  lower_key=$(printf '%s' "$key" | tr '[:upper:]' '[:lower:]')
+  "$sshd_bin" -T -f "$SSHD_CONFIG_PATH" 2>/dev/null \
+    | awk -v k="$lower_key" 'tolower($1) == k {print $2; exit}'
+}
+
+# 把 /etc/ssh/sshd_config.d/*.conf 里 <key> 不等于 <expected_value> 的赋值行注释掉
+# 备份原文件为 <file>.bak.<时间戳>，使用 cleanup_old_backups 保留 5 份
+# 返回 0=已处理或无需处理，1=有错误
+neutralize_sshd_dropin_overrides(){
+  local key="$1"
+  local expected_value="$2"
+  local dropin_dir="/etc/ssh/sshd_config.d"
+  local file=""
+  local timestamp=""
+  local touched=0
+  local lower_expected=""
+
+  [ -z "$key" ] && return 1
+  [ -d "$dropin_dir" ] || return 0
+
+  lower_expected=$(printf '%s' "$expected_value" | tr '[:upper:]' '[:lower:]')
+  timestamp=$(date +%Y%m%d%H%M%S)
+
+  shopt -s nullglob
+  for file in "$dropin_dir"/*.conf; do
+    [ -f "$file" ] || continue
+    # 文件里是否存在 <key> 的有效赋值，且值不等于期望
+    if awk -v k="$key" -v want="$lower_expected" '
+      BEGIN{ ignore=0 }
+      /^[[:space:]]*Match[[:space:]]+/ { ignore=1; next }
+      /^[[:space:]]*$/ { next }
+      tolower($1) == tolower(k) && !ignore {
+        v=tolower($2)
+        if (v != want) { found=1; exit }
+      }
+      END{ exit !found }
+    ' "$file"; then
+      cp "$file" "${file}.bak.${timestamp}" 2>/dev/null || true
+      # 注释掉所有 <key> 行（在 Match 之前），保留 Match 之后不动
+      awk -v k="$key" '
+        BEGIN{ in_match=0 }
+        /^[[:space:]]*Match[[:space:]]+/ { in_match=1; print; next }
+        {
+          if (!in_match && tolower($1) == tolower(k) && $0 !~ /^[[:space:]]*#/) {
+            print "# leyili-disabled: " $0
+            next
+          }
+          print
+        }
+      ' "$file" > "${file}.tmp.$$" && mv "${file}.tmp.$$" "$file"
+      touched=1
+      echo -e "  ${Y}已注释覆盖项：${N}${C}${file}${N} ${D}(备份 .bak.${timestamp})${N}"
+    fi
+  done
+  shopt -u nullglob
+
+  if [ "$touched" = "1" ]; then
+    cleanup_old_backups "${dropin_dir}/*.bak.*" 5 2>/dev/null || true
+  fi
+  return 0
+}
+
 generate_random_high_port(){
   local current_port="$1"
   local candidate=""
@@ -747,7 +821,9 @@ apply_sshd_setting(){
   local backup_path=""
   local sshd_bin=""
   local ssh_service=""
-  local effective_port=""
+  local effective_value=""
+  local lower_key=""
+  local lower_value=""
   local listen_ok=0
 
   if ! require_root; then
@@ -793,15 +869,27 @@ apply_sshd_setting(){
     return 1
   fi
 
-  # 修改 Port 时，用 sshd -T 校验"实际生效的端口"是新值（防止 Match 块或 include 文件覆盖）
-  if [ "$key" = "Port" ]; then
-    effective_port=$("$sshd_bin" -T -f "$SSHD_CONFIG_PATH" 2>/dev/null \
-                     | awk '$1 == "port" {print $2; exit}')
-    if [ -n "$effective_port" ] && [ "$effective_port" != "$value" ]; then
+  # 用 sshd -T 校验"实际生效值"等于目标（覆盖 Match 块和 sshd_config.d/*.conf 影响）
+  # 不一致时先尝试自动注释 sshd_config.d 中的反向覆盖再次校验，仍不一致才回滚
+  lower_key=$(printf '%s' "$key" | tr '[:upper:]' '[:lower:]')
+  lower_value=$(printf '%s' "$value" | tr '[:upper:]' '[:lower:]')
+  effective_value=$(get_effective_sshd_value "$key")
+  if [ -n "$effective_value" ] && [ "$(printf '%s' "$effective_value" | tr '[:upper:]' '[:lower:]')" != "$lower_value" ]; then
+    echo -e "  ${Y}sshd -T 报告 ${key} 实际生效=${effective_value}，与目标 ${value} 不一致${N}"
+    echo -e "  ${Y}尝试清理 /etc/ssh/sshd_config.d/*.conf 中的覆盖项...${N}"
+    neutralize_sshd_dropin_overrides "$key" "$value" || true
+    if ! "$sshd_bin" -t -f "$SSHD_CONFIG_PATH"; then
+      cp "$backup_path" "$SSHD_CONFIG_PATH" 2>/dev/null || true
+      echo -e "${R}清理覆盖后 sshd -t 校验失败，已恢复备份${N}"
+      pause_screen
+      return 1
+    fi
+    effective_value=$(get_effective_sshd_value "$key")
+    if [ -n "$effective_value" ] && [ "$(printf '%s' "$effective_value" | tr '[:upper:]' '[:lower:]')" != "$lower_value" ]; then
       cp "$backup_path" "$SSHD_CONFIG_PATH" 2>/dev/null || true
       echo ""
-      echo -e "${R}sshd -T 检测到实际生效端口为 ${effective_port}，与目标 ${value} 不一致${N}"
-      echo -e "${Y}可能存在 Match 块或 /etc/ssh/sshd_config.d/*.conf 覆盖，已恢复备份${N}"
+      echo -e "${R}sshd -T 仍显示 ${key}=${effective_value}，无法达到 ${value}，已恢复备份${N}"
+      echo -e "${Y}可能存在 Match 块限制，请手动检查 /etc/ssh/sshd_config 与 /etc/ssh/sshd_config.d/${N}"
       pause_screen
       return 1
     fi
@@ -845,6 +933,90 @@ apply_sshd_setting(){
   if [ "$key" = "Port" ]; then
     echo -e "  ${Y}重要：${N}请立即开新终端验证新端口可登录，再关闭当前会话！"
   fi
+  return 0
+}
+
+# 幂等：确保 SSH 密码登录全局生效
+# - 主 sshd_config 写入 PasswordAuthentication=yes、KbdInteractiveAuthentication=yes
+# - 清理 /etc/ssh/sshd_config.d/*.conf 里的反向覆盖
+# - sshd -t 校验 + sshd -T 验证实际生效值 + 重启服务
+# 失败时尽量回滚。返回 0=成功或已是预期状态，1=失败
+ensure_password_auth_enabled(){
+  local sshd_bin=""
+  local ssh_service=""
+  local backup_path=""
+  local effective=""
+  local need_restart=0
+
+  if ! require_root; then
+    return 1
+  fi
+
+  if [ ! -f "$SSHD_CONFIG_PATH" ]; then
+    echo -e "${R}未找到 $SSHD_CONFIG_PATH${N}"
+    return 1
+  fi
+
+  sshd_bin=$(get_sshd_binary)
+  if [ -z "$sshd_bin" ]; then
+    echo -e "${R}未找到 sshd 可执行文件${N}"
+    return 1
+  fi
+
+  # 已经 yes 就早退（幂等）
+  effective=$(get_effective_sshd_value PasswordAuthentication)
+  local kbd_effective
+  kbd_effective=$(get_effective_sshd_value KbdInteractiveAuthentication)
+  if [ "$effective" = "yes" ] && { [ -z "$kbd_effective" ] || [ "$kbd_effective" = "yes" ]; }; then
+    echo -e "  ${D}密码登录已启用（PasswordAuthentication=yes），跳过${N}"
+    return 0
+  fi
+
+  echo -e "${Y}==> 确保 SSH 密码登录可用${N}"
+  backup_path="${SSHD_CONFIG_PATH}.bak.$(date +%Y%m%d%H%M%S)"
+  if ! cp "$SSHD_CONFIG_PATH" "$backup_path"; then
+    echo -e "${R}SSH 配置备份失败${N}"
+    return 1
+  fi
+
+  if ! set_sshd_global_directive "PasswordAuthentication" "yes"; then
+    cp "$backup_path" "$SSHD_CONFIG_PATH" 2>/dev/null || true
+    echo -e "${R}写入 PasswordAuthentication 失败，已回滚${N}"
+    return 1
+  fi
+  if ! set_sshd_global_directive "KbdInteractiveAuthentication" "yes"; then
+    cp "$backup_path" "$SSHD_CONFIG_PATH" 2>/dev/null || true
+    echo -e "${R}写入 KbdInteractiveAuthentication 失败，已回滚${N}"
+    return 1
+  fi
+
+  neutralize_sshd_dropin_overrides "PasswordAuthentication" "yes" || true
+  neutralize_sshd_dropin_overrides "KbdInteractiveAuthentication" "yes" || true
+
+  if ! "$sshd_bin" -t -f "$SSHD_CONFIG_PATH"; then
+    cp "$backup_path" "$SSHD_CONFIG_PATH" 2>/dev/null || true
+    echo -e "${R}sshd -t 校验失败，已回滚主配置${N}"
+    return 1
+  fi
+
+  effective=$(get_effective_sshd_value PasswordAuthentication)
+  if [ -n "$effective" ] && [ "$effective" != "yes" ]; then
+    cp "$backup_path" "$SSHD_CONFIG_PATH" 2>/dev/null || true
+    echo -e "${R}sshd -T 显示 PasswordAuthentication 实际为 ${effective}，已回滚${N}"
+    echo -e "${Y}请手动检查 /etc/ssh/sshd_config.d/ 是否有未识别的覆盖${N}"
+    return 1
+  fi
+
+  ssh_service=$(detect_ssh_service_name)
+  if ! systemctl restart "$ssh_service"; then
+    cp "$backup_path" "$SSHD_CONFIG_PATH" 2>/dev/null || true
+    systemctl restart "$ssh_service" >/dev/null 2>&1 || true
+    echo -e "${R}SSH 服务重启失败，已回滚${N}"
+    return 1
+  fi
+
+  cleanup_old_backups "${SSHD_CONFIG_PATH}.bak.*" 5 2>/dev/null || true
+  echo -e "  ${G}PasswordAuthentication = yes (已生效)${N}"
   return 0
 }
 
@@ -3222,6 +3394,8 @@ show_docker_menu(){
 
 create_regular_user(){
   local username=""
+  local home_dir=""
+  local copy_choice=""
 
   if ! require_root; then
     return 1
@@ -3247,6 +3421,29 @@ create_regular_user(){
     echo -e "${R}用户创建失败，请检查上方输出${N}"
     pause_screen
     return 1
+  fi
+
+  # 如果 root 有 authorized_keys，询问是否拷贝给新用户（密钥登录场景双保险）
+  if [ -s /root/.ssh/authorized_keys ]; then
+    home_dir=$(getent passwd "$username" | cut -d: -f6)
+    if [ -n "$home_dir" ] && [ -d "$home_dir" ]; then
+      echo ""
+      echo -e "  ${Y}检测到 /root/.ssh/authorized_keys 存在${N}"
+      read -p "  是否将 root 的 SSH 公钥复制给 ${username}？(Y/n): " copy_choice
+      if [ "$copy_choice" != "n" ] && [ "$copy_choice" != "N" ]; then
+        mkdir -p "$home_dir/.ssh"
+        if cp /root/.ssh/authorized_keys "$home_dir/.ssh/authorized_keys"; then
+          chmod 700 "$home_dir/.ssh"
+          chmod 600 "$home_dir/.ssh/authorized_keys"
+          chown -R "$username:$username" "$home_dir/.ssh"
+          echo -e "  ${G}已复制公钥到 ${C}${home_dir}/.ssh/authorized_keys${N}"
+        else
+          echo -e "  ${R}公钥复制失败，请稍后手动处理${N}"
+        fi
+      else
+        echo -e "  ${D}已跳过公钥复制${N}"
+      fi
+    fi
   fi
 
   echo ""
@@ -3377,20 +3574,58 @@ configure_ssh_port(){
     return 0
   fi
 
+  # 先确保密码登录可用（防止云镜像 sshd_config.d 默认禁用密码登录），
+  # 否则改完端口、关掉旧会话后普通用户就连不上了。
+  echo ""
+  if ! ensure_password_auth_enabled; then
+    echo -e "${R}密码登录配置失败，已中止 SSH 端口修改${N}"
+    pause_screen
+    return 1
+  fi
+
   allow_tcp_port_in_firewall "$ssh_port"
 
   if apply_sshd_setting "Port" "$ssh_port" "SSH 端口已更新并重启服务"; then
     cleanup_old_backups "${SSHD_CONFIG_PATH}.bak.*" 5
+
+    # iptables 兜底：如果旧端口在 INPUT 链有显式 ACCEPT 规则
+    # （常见于搬瓦工预装 iptables-persistent 的镜像），给新端口加同样的规则
+    if command -v iptables >/dev/null 2>&1 \
+       && iptables -C INPUT -p tcp --dport "$current_ssh_port" -j ACCEPT 2>/dev/null; then
+      if ! iptables -C INPUT -p tcp --dport "$ssh_port" -j ACCEPT 2>/dev/null; then
+        if iptables -I INPUT -p tcp --dport "$ssh_port" -j ACCEPT 2>/dev/null; then
+          echo -e "  ${G}已在 iptables INPUT 链放行 ${ssh_port}/tcp${N}"
+          if command -v netfilter-persistent >/dev/null 2>&1; then
+            netfilter-persistent save >/dev/null 2>&1 || true
+          elif [ -d /etc/iptables ]; then
+            iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
+          fi
+        else
+          echo -e "  ${Y}iptables 规则追加失败，请手动执行：iptables -I INPUT -p tcp --dport ${ssh_port} -j ACCEPT${N}"
+        fi
+      fi
+    fi
+
     server_ip=$(detect_primary_ipv4)
     server_ip="${server_ip:-你的IP}"
     echo -e "  新登录方式: ${C}ssh 用户名@${server_ip} -p ${ssh_port}${N}"
     echo -e "  配置文件: ${C}$SSHD_CONFIG_PATH${N}"
+    echo ""
+    echo -e "  ${B}${R}【强烈建议】${N}${B}保留当前 SSH 窗口！${N}"
+    echo -e "  ${B}先开新终端用普通用户 + 新端口验证可登录，再关闭当前窗口。${N}"
     pause_screen
   fi
 }
 
 disable_root_ssh_login(){
   local confirm=""
+  local sudo_users=""
+  local user=""
+  local home_dir=""
+  local has_key=0
+  local has_passwd=0
+  local can_login_user=""
+  local pwd_auth_effective=""
 
   if ! require_root; then
     return 1
@@ -3405,10 +3640,70 @@ disable_root_ssh_login(){
     return 0
   fi
 
+  # 防呆 1：保证密码登录可用（幂等，已开启就跳过）
+  echo ""
+  if ! ensure_password_auth_enabled; then
+    echo -e "${R}密码登录配置失败，已中止禁用 root 登录${N}"
+    pause_screen
+    return 1
+  fi
+
+  # 防呆 2：必须至少有 1 个非 root 的 sudo 用户能 SSH 登录
+  pwd_auth_effective=$(get_effective_sshd_value PasswordAuthentication)
+  sudo_users=$(getent group sudo 2>/dev/null | awk -F: '{print $4}' | tr ',' '\n' | grep -v '^root$' | grep -v '^$')
+  if [ -z "$sudo_users" ]; then
+    echo ""
+    echo -e "${R}没有发现非 root 的 sudo 组成员，禁用 root 登录会导致服务器变砖${N}"
+    echo -e "${Y}请先在管理员设置中执行 1)创建普通用户 + 2)加入 sudo 组${N}"
+    pause_screen
+    return 1
+  fi
+
+  echo ""
+  echo -e "  ${B}检查可登录的非 root sudo 用户...${N}"
+  while IFS= read -r user; do
+    [ -z "$user" ] && continue
+    has_key=0
+    has_passwd=0
+    home_dir=$(getent passwd "$user" | cut -d: -f6)
+    if [ -n "$home_dir" ] && [ -s "$home_dir/.ssh/authorized_keys" ]; then
+      has_key=1
+    fi
+    if [ "$pwd_auth_effective" = "yes" ] \
+       && passwd -S "$user" 2>/dev/null | awk '{exit !($2 == "P")}'; then
+      has_passwd=1
+    fi
+    if [ "$has_key" = "1" ] || [ "$has_passwd" = "1" ]; then
+      can_login_user="$user"
+      local marks=""
+      [ "$has_passwd" = "1" ] && marks="${marks}密码 "
+      [ "$has_key" = "1" ] && marks="${marks}公钥 "
+      echo -e "    ${G}✓${N}  ${C}${user}${N}  ${D}(${marks% })${N}"
+    else
+      echo -e "    ${R}✗${N}  ${C}${user}${N}  ${D}(未设密码且无 authorized_keys)${N}"
+    fi
+  done <<EOF
+$sudo_users
+EOF
+
+  if [ -z "$can_login_user" ]; then
+    echo ""
+    echo -e "${R}没有任何非 root sudo 用户能 SSH 登录，已中止${N}"
+    echo -e "${Y}修复建议：${N}"
+    echo -e "  - 给某个 sudo 用户设密码：${C}passwd <用户名>${N}"
+    echo -e "  - 或将公钥放到 ${C}~<用户名>/.ssh/authorized_keys${N}"
+    pause_screen
+    return 1
+  fi
+  echo -e "  ${G}通过：至少 ${C}${can_login_user}${G} 可登录${N}"
+
   if apply_sshd_setting "PermitRootLogin" "no" "root SSH 登录已禁用"; then
     cleanup_old_backups "${SSHD_CONFIG_PATH}.bak.*" 5
     echo -e "  当前设置: ${C}PermitRootLogin no${N}"
     echo -e "  配置文件: ${C}$SSHD_CONFIG_PATH${N}"
+    echo ""
+    echo -e "  ${B}${R}【强烈建议】${N}${B}保留当前 SSH 窗口！${N}"
+    echo -e "  ${B}先开新终端用普通用户登录，并验证 ${C}sudo -i${N}${B} 可用，再关闭当前窗口。${N}"
     pause_screen
   fi
 }
