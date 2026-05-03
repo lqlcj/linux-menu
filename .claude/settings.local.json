@@ -23,7 +23,8 @@
       "Bash(bash -n C:/Users/leyili/Desktop/linux-menu/linux-menu/leyili.sh)",
       "Bash(awk ' *)",
       "Bash(awk -F'=' '/^[[:space:]]*net\\\\.core\\\\.rmem_max/ { gsub\\(/[[:space:]]/, \"\", $2\\); print $2; exit }')",
-      "Bash(awk '{ *)"
+      "Bash(awk '{ *)",
+      "Bash(bash -c ' *)"
     ]
   }
 }
