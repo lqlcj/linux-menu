@@ -16,7 +16,7 @@ SCRIPT_PATH="/usr/local/bin/${COMMAND_NAME}"
 SELF_INSTALL_URL="${SELF_INSTALL_URL:-https://raw.githubusercontent.com/lqlcj/linux-menu/main/leyili.sh}"
 TCP_TUNING_PATH="/etc/sysctl.d/99-proxy-optimized.conf"
 INITCWND_SERVICE_PATH="/etc/systemd/system/initcwnd.service"
-INITCWND_VALUE="20"
+INITCWND_VALUE="24"
 SWAPFILE_PATH="/swapfile"
 SWAP_SIZE="2G"
 SWAP_SIZE_MB="2048"
@@ -4023,17 +4023,17 @@ apply_tcp_tuning(){
   case "$region" in
     hk)
       region_label="香港"
-      notsent_lowat=16384
+      notsent_lowat=131072
       fin_timeout=5
       ;;
     jp)
       region_label="日本"
-      notsent_lowat=32768
+      notsent_lowat=131072
       fin_timeout=5
       ;;
     us-west)
       region_label="美西"
-      notsent_lowat=65536
+      notsent_lowat=131072
       fin_timeout=10
       ;;
     eu)
@@ -4088,6 +4088,8 @@ apply_tcp_tuning(){
 # --- 拥塞控制 + 调度 ---
 net.core.default_qdisc = fq
 net.ipv4.tcp_congestion_control = bbr
+# TFO 客户端+服务端 (RFC 7413)；国内运营商可能干扰 TFO cookie，
+# 内核 blackhole 机制会自动退化为普通 TCP，开了不一定有用但不会有害
 net.ipv4.tcp_fastopen = 3
 
 # --- 缓冲区 (按地区 BDP 与内存档计算) ---
@@ -4099,6 +4101,7 @@ net.ipv4.tcp_rmem = 16384 262144 ${buffer_max}
 net.ipv4.tcp_wmem = 16384 262144 ${buffer_max}
 
 # --- 长连接 / 慢启动 / MTU ---
+# 防 TCP-in-TCP 隧道 bufferbloat (Cloudflare web server 通用值 + NaiveProxy 推荐)
 net.ipv4.tcp_notsent_lowat = ${notsent_lowat}
 net.ipv4.tcp_slow_start_after_idle = 0
 net.ipv4.tcp_window_scaling = 1
@@ -4106,13 +4109,11 @@ net.ipv4.tcp_timestamps = 1
 net.ipv4.tcp_sack = 1
 net.ipv4.tcp_mtu_probing = 1
 net.ipv4.ip_no_pmtu_disc = 0
-net.ipv4.tcp_adv_win_scale = 1
 
 # --- 连接回收与高并发 ---
 net.ipv4.tcp_tw_reuse = 1
 net.ipv4.tcp_fin_timeout = ${fin_timeout}
 net.ipv4.tcp_max_tw_buckets = 65536
-net.ipv4.tcp_max_orphans = 32768
 net.core.somaxconn = 8192
 net.core.netdev_max_backlog = 16384
 net.ipv4.tcp_max_syn_backlog = 8192
@@ -4126,8 +4127,16 @@ net.ipv4.tcp_keepalive_probes = 5
 # --- 代理服务器专用 ---
 # 不缓存上次连接的 RTT/cwnd 指纹 (面对全球客户端必加)
 net.ipv4.tcp_no_metrics_save = 1
-# ECN 显式拥塞通知 (BBR 配合表现更好)
-net.ipv4.tcp_ecn = 1
+# ECN: 2 = 被动接受不主动发起 (RFC 8311 推荐，避开国内运营商对 ECN 标记的误判)
+net.ipv4.tcp_ecn = 2
+# TIME-WAIT 状态下抑制迷路 RST/重复 FIN 干扰 (RFC 1337)
+net.ipv4.tcp_rfc1337 = 1
+# 异常连接重试上限 (Alibaba Cloud 推荐 5-10，10≈280s 给翻墙耐心容忍家庭网络抖动)
+net.ipv4.tcp_retries2 = 10
+# SYN+ACK 重试 (Cloudflare/Red Hat 主流推荐 3≈45s，比默认 5≈63s 更稳健)
+net.ipv4.tcp_synack_retries = 3
+# 孤儿连接重试 (HAProxy/Nginx 生产标配；默认 8 在高并发下消耗内存，3≈25s 释放)
+net.ipv4.tcp_orphan_retries = 3
 
 # --- 临时端口范围 (避开常用服务端口) ---
 net.ipv4.ip_local_port_range = 10000 65535
@@ -4351,8 +4360,8 @@ apply_network_optimization(){
   if ! require_root; then return 1; fi
 
   case "$region" in
-    hk)      region_label="香港"; initcwnd_value=24 ;;
-    jp)      region_label="日本"; initcwnd_value=24 ;;
+    hk)      region_label="香港"; initcwnd_value=32 ;;
+    jp)      region_label="日本"; initcwnd_value=32 ;;
     us-west) region_label="美西"; initcwnd_value=32 ;;
     eu)      region_label="欧洲"; initcwnd_value=32 ;;
     *)
