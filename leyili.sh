@@ -8502,12 +8502,18 @@ ipv6_rotation_addr_bind(){
     return 1
   fi
 
-  if ! ip -6 addr add "$addr/64" dev "$iface" 2>/dev/null; then
+  # 捕获 ip 命令的 stderr，失败时显示给用户（之前用 2>/dev/null 是 bug）
+  local err
+  err=$(ip -6 addr add "$addr/64" dev "$iface" 2>&1)
+  local rc=$?
+  if [ $rc -ne 0 ]; then
+    [ -n "$err" ] && echo "  ${R}ip add 错误：$err${N}" >&2
     return 2
   fi
 
   # R9: 内核可能"无错"但实际未生效（罕见，例如商家网络限制）
   if ! ipv6_rotation_addr_exists_on_iface "$addr" "$iface"; then
+    echo "  ${R}R9 二次验证失败：地址绑定后未在网卡上生效${N}" >&2
     return 3
   fi
   return 0
