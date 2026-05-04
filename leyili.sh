@@ -8622,6 +8622,237 @@ ipv6_rotation_build_link(){
   build_reality_link "$uuid" "$addr" "$port" "$sni" "$pbk" "$sid" "${tag}-rot"
 }
 
+# ─── S7: 业务主流程 (F1/F2/F3/F4) ───────────────────────────
+# 设计: 4 个函数对应方案 6.1-6.4 流程；非交互（reset 除外，因有 read -p）
+# 鲁棒性: R5 绑定后写 state 失败 → 立刻回滚解绑
+
+# F1: 立即轮换
+# 返回: 0 = 成功；1 = 前置检查失败；2 = 绑定/解绑失败；3 = 写 state 失败
+ipv6_rotation_rotate_now(){
+  if ! ipv6_rotation_check_prereqs; then
+    return 1
+  fi
+
+  local iface prefix
+  iface=$(ipv6_rotation_detect_interface) || return 1
+  prefix=$(ipv6_rotation_detect_prefix "$iface") || return 1
+
+  local current_state old_addr
+  current_state=$(ipv6_rotation_state_validate)
+  old_addr=$(printf '%s' "$current_state" | jq -r '.current_rotated.address // empty')
+
+  # 生成新地址（最多 3 次防碰撞 ::a / 旧地址）
+  local known_addr="${prefix}:0:0:0:a"
+  local new_host new_addr attempt=0
+  while [ $attempt -lt 3 ]; do
+    new_host=$(ipv6_rotation_random_host64) || return 2
+    new_addr=$(ipv6_rotation_compose_addr "$prefix" "$new_host")
+    if [ "$new_addr" != "$known_addr" ] && [ "$new_addr" != "$old_addr" ]; then
+      break
+    fi
+    attempt=$((attempt + 1))
+  done
+  if [ $attempt -ge 3 ]; then
+    echo -e "  ${R}随机地址连续 3 次碰撞，请重试${N}" >&2
+    return 2
+  fi
+
+  # 解绑旧地址（容忍失败：地址可能已不在）
+  if [ -n "$old_addr" ]; then
+    ipv6_rotation_addr_unbind "$old_addr" "$iface" || true
+  fi
+
+  # 绑定新地址
+  if ! ipv6_rotation_addr_bind "$new_addr" "$iface"; then
+    echo -e "  ${R}绑定新地址失败：$new_addr${N}" >&2
+    return 2
+  fi
+
+  # 读取 node_snapshot 并组装新 state
+  local node_snapshot now new_state
+  node_snapshot=$(ipv6_rotation_read_node_snapshot 2>/dev/null)
+  if [ -z "$node_snapshot" ]; then
+    node_snapshot="null"
+  fi
+  now=$(date -Iseconds 2>/dev/null || date +%Y-%m-%dT%H:%M:%S%z)
+
+  new_state=$(printf '%s' "$current_state" | jq \
+    --arg prefix "$prefix" \
+    --arg iface "$iface" \
+    --argjson snap "$node_snapshot" \
+    --arg addr "$new_addr" \
+    --arg ts "$now" \
+    '.prefix = $prefix
+     | .interface = $iface
+     | .node_snapshot = $snap
+     | .current_rotated = {address: $addr, created_at: $ts}')
+
+  if ! printf '%s' "$new_state" | ipv6_rotation_state_save; then
+    # R5: state 写入失败，回滚地址绑定
+    ipv6_rotation_addr_unbind "$new_addr" "$iface" || true
+    echo -e "  ${R}写入状态失败，已回滚地址绑定${N}" >&2
+    return 3
+  fi
+
+  # 生成 URL
+  local url port
+  url=$(ipv6_rotation_build_link "$new_addr" 2>/dev/null)
+  port=$(printf '%s' "$node_snapshot" | jq -r '.port // empty' 2>/dev/null)
+
+  # 输出
+  echo ""
+  echo -e "  ${G}╔══════════════════════════════════════════════════════╗${N}"
+  echo -e "  ${G}║${N}  ${B}IPv6 Reality 地址轮换完成${N}                          ${G}║${N}"
+  echo -e "  ${G}╚══════════════════════════════════════════════════════╝${N}"
+  echo -e "  新地址    : ${C}$new_addr${N}"
+  echo -e "  端口      : ${C}${port:-?}${N}"
+  echo -e "  绑定时间  : ${C}$now${N}"
+  echo -e "  网卡      : ${C}$iface${N}"
+  echo ""
+  if [ -n "$url" ]; then
+    echo -e "  ${B}新客户端链接：${N}"
+    echo -e "  ${G}$url${N}"
+  fi
+  echo ""
+  echo -e "  ${Y}注意：${N}原节点 (::a) 保持工作；旧轮换链接已立即失效"
+  echo ""
+  return 0
+}
+
+# F2: 查看当前轮换状态
+ipv6_rotation_show_current(){
+  local state addr created iface url port
+  state=$(ipv6_rotation_state_validate)
+  addr=$(printf '%s' "$state" | jq -r '.current_rotated.address // empty')
+  iface=$(printf '%s' "$state" | jq -r '.interface // empty')
+
+  echo ""
+  if [ -z "$addr" ]; then
+    echo -e "  ${Y}当前未轮换${N}，节点使用原始地址 ::a 提供服务"
+    echo ""
+    return 0
+  fi
+
+  created=$(printf '%s' "$state" | jq -r '.current_rotated.created_at // empty')
+
+  echo -e "  当前轮换地址 : ${C}$addr${N}"
+  echo -e "  绑定时间     : ${C}$created${N}"
+  echo -e "  网卡         : ${C}$iface${N}"
+
+  if [ -n "$iface" ] && ipv6_rotation_addr_exists_on_iface "$addr" "$iface"; then
+    echo -e "  状态         : ${G}✅ state 与实际一致${N}"
+
+    url=$(ipv6_rotation_build_link "$addr" 2>/dev/null)
+    if [ -n "$url" ]; then
+      echo ""
+      echo -e "  ${B}客户端链接：${N}"
+      echo -e "  ${G}$url${N}"
+    fi
+  else
+    echo -e "  状态         : ${R}❌ state 显示有此地址，但网卡上不存在${N}"
+    echo -e "  ${Y}可能原因${N}：VPS 重启过（重启后地址消失，state 仍存）"
+    echo -e "  ${Y}建议${N}    ：选「重置」清理 state，或「立即轮换」重新绑定"
+  fi
+  echo ""
+  return 0
+}
+
+# F3: 重置（解绑 + 清空 state.current_rotated）
+# 返回: 0 = 成功；1 = 用户取消；2 = 写 state 失败
+ipv6_rotation_reset(){
+  local state addr iface
+  state=$(ipv6_rotation_state_validate)
+  addr=$(printf '%s' "$state" | jq -r '.current_rotated.address // empty')
+  iface=$(printf '%s' "$state" | jq -r '.interface // empty')
+
+  if [ -z "$addr" ]; then
+    echo -e "  ${Y}当前未轮换，无需重置${N}"
+    return 0
+  fi
+
+  echo ""
+  echo -e "  将解绑当前轮换地址：${C}$addr${N}"
+  echo -e "  原始地址 ${C}::a${N} 不受影响"
+  read -p "  确认重置？(y/N): " confirm
+  case "$confirm" in
+    [yY]|[yY][eE][sS]) ;;
+    *) echo -e "  ${Y}已取消${N}"; return 1 ;;
+  esac
+
+  if [ -n "$iface" ]; then
+    ipv6_rotation_addr_unbind "$addr" "$iface" || true
+  fi
+
+  local new_state
+  new_state=$(printf '%s' "$state" | jq '.current_rotated = null')
+  if ! printf '%s' "$new_state" | ipv6_rotation_state_save; then
+    echo -e "  ${R}写入状态失败${N}" >&2
+    return 2
+  fi
+
+  echo -e "  ${G}已重置${N}，节点已回退到原始地址 ::a 提供服务"
+  return 0
+}
+
+# F4: 健康检查（4 项一致性）
+ipv6_rotation_health_check(){
+  local state addr iface stored_prefix actual_prefix
+  state=$(ipv6_rotation_state_validate)
+  addr=$(printf '%s' "$state" | jq -r '.current_rotated.address // empty')
+  iface=$(printf '%s' "$state" | jq -r '.interface // empty')
+  stored_prefix=$(printf '%s' "$state" | jq -r '.prefix // empty')
+
+  echo ""
+  echo -e "  ${B}IPv6 轮换健康检查${N}"
+  echo ""
+
+  # [1] /64 prefix（VPS 迁移检测）
+  if [ -n "$stored_prefix" ] && [ -n "$iface" ]; then
+    actual_prefix=$(ipv6_rotation_detect_prefix "$iface" 2>/dev/null)
+    if [ -z "$actual_prefix" ]; then
+      echo -e "  [1] /64 前缀     : ${R}❌ 当前无法探测到任何 /64 公网前缀${N}"
+    elif [ "$actual_prefix" = "$stored_prefix" ]; then
+      echo -e "  [1] /64 前缀     : ${G}✅ $stored_prefix${N}"
+    else
+      echo -e "  [1] /64 前缀     : ${Y}⚠ 已变化（VPS 迁移？）${N}"
+      echo -e "      state: $stored_prefix"
+      echo -e "      实际: $actual_prefix"
+    fi
+  else
+    echo -e "  [1] /64 前缀     : ${Y}⚠ state 中无前缀记录${N}"
+  fi
+
+  # [2] reality.info
+  ipv6_rotation_check_reality_info
+  case $? in
+    0) echo -e "  [2] reality.info : ${G}✅ Mode=dualstack${N}" ;;
+    1) echo -e "  [2] reality.info : ${R}❌ 不存在${N}" ;;
+    2) echo -e "  [2] reality.info : ${Y}⚠ Mode 非 dualstack${N}" ;;
+    3) echo -e "  [2] reality.info : ${R}❌ 字段损坏${N}" ;;
+  esac
+
+  # [3] R1 双源一致
+  ipv6_rotation_verify_listen_consistency
+  case $? in
+    0) echo -e "  [3] R1 双源一致  : ${G}✅ sing-box listen=::${N}" ;;
+    *) echo -e "  [3] R1 双源一致  : ${R}❌ sing-box config 异常${N}" ;;
+  esac
+
+  # [4] state vs 网卡
+  if [ -n "$addr" ]; then
+    if [ -n "$iface" ] && ipv6_rotation_addr_exists_on_iface "$addr" "$iface"; then
+      echo -e "  [4] 当前轮换地址 : ${G}✅ $addr 在 $iface 上${N}"
+    else
+      echo -e "  [4] 当前轮换地址 : ${R}❌ state 显示 $addr，但网卡上没有${N}"
+      echo -e "      ${Y}建议${N}：重置 + 立即轮换"
+    fi
+  else
+    echo -e "  [4] 当前轮换地址 : ${C}（无）${N} 当前为 INIT 状态"
+  fi
+  echo ""
+  return 0
+}
+
 # ─── 自检入口：dry-run 打印各底层函数输出 ──────────────────────
 # 用法: bash leyili.sh _ipv6r_selftest
 # 不挂载到菜单，仅用于开发期手动验证
@@ -8899,6 +9130,119 @@ _ipv6r_selftest(){
     fi
   else
     echo "[33-35] 跳过（缺 prefix）"
+  fi
+
+  echo ""
+  echo "=== S7: 业务主流程（rotate / show / reset / health）==="
+  if [ "$prefix" = "(未探到)" ] || [ "$iface" = "(未探到)" ]; then
+    echo "[S7] 缺 prefix/iface，跳过"
+    return 0
+  fi
+
+  # 备份 state.json
+  local s7_state_path saved_s7=0
+  s7_state_path=$(ipv6_rotation_state_path)
+  if [ -f "$s7_state_path" ]; then
+    cp -f "$s7_state_path" "${s7_state_path}.s7.before" && saved_s7=1
+  fi
+
+  # 备份 eth0 当前 IPv6 列表
+  local before_addrs after_addrs
+  before_addrs=$(ip -6 addr show dev "$iface" scope global 2>/dev/null \
+    | awk '/inet6 / { sub("/.*", "", $2); print $2 }' | sort)
+
+  echo "[36] 调用 rotate_now (静默)"
+  ipv6_rotation_rotate_now >/dev/null 2>&1
+  local rc=$? s7_addr1
+  s7_addr1=$(jq -r '.current_rotated.address // empty' "$s7_state_path" 2>/dev/null)
+  case $rc in
+    0) if [ -n "$s7_addr1" ]; then
+         echo "      → ✅ 返回 0，state.current_rotated.address = $s7_addr1"
+         if ipv6_rotation_addr_exists_on_iface "$s7_addr1" "$iface"; then
+           echo "      → ✅ 地址确实在 $iface 上"
+         else
+           echo "      → ❌ state 有地址但网卡上没有"
+         fi
+       else
+         echo "      → ❌ rotate 返回 0 但 state 无地址"
+       fi ;;
+    *) echo "      → ❌ rotate_now 返回 $rc" ;;
+  esac
+
+  echo "[37] 调用 show_current"
+  local out_show
+  out_show=$(ipv6_rotation_show_current 2>&1)
+  if printf '%s' "$out_show" | grep -qF "$s7_addr1"; then
+    echo "      → ✅ 输出包含当前轮换地址"
+  else
+    echo "      → ❌ 输出未包含当前地址"
+  fi
+  if printf '%s' "$out_show" | grep -q "状态与实际一致\|state 与实际一致"; then
+    echo "      → ✅ 一致性检查通过"
+  fi
+
+  echo "[38] 二次 rotate_now（硬切换：旧消失，新出现）"
+  ipv6_rotation_rotate_now >/dev/null 2>&1
+  local s7_addr2
+  s7_addr2=$(jq -r '.current_rotated.address // empty' "$s7_state_path" 2>/dev/null)
+  if [ -n "$s7_addr2" ] && [ "$s7_addr2" != "$s7_addr1" ]; then
+    echo "      → ✅ 新地址 $s7_addr2 ≠ 旧地址"
+  else
+    echo "      → ❌ 地址未变化或为空"
+  fi
+  if ! ipv6_rotation_addr_exists_on_iface "$s7_addr1" "$iface"; then
+    echo "      → ✅ 旧地址 $s7_addr1 已解绑（硬切换生效）"
+  else
+    echo "      → ❌ 旧地址仍在网卡上"
+  fi
+  if ipv6_rotation_addr_exists_on_iface "$s7_addr2" "$iface"; then
+    echo "      → ✅ 新地址 $s7_addr2 已绑定"
+  else
+    echo "      → ❌ 新地址未绑定"
+  fi
+
+  echo "[39] 调用 health_check"
+  local out_hc tick_count
+  out_hc=$(ipv6_rotation_health_check 2>&1)
+  tick_count=$(printf '%s' "$out_hc" | grep -c '✅')
+  echo "      → ✅ 输出含 $tick_count 个 ✅ 标记 (期望 4)"
+
+  echo "[40] 调用 reset (echo 'y' 喂入)"
+  echo "y" | ipv6_rotation_reset >/dev/null 2>&1
+  local s7_after_reset
+  s7_after_reset=$(jq -r '.current_rotated' "$s7_state_path" 2>/dev/null)
+  if [ "$s7_after_reset" = "null" ]; then
+    echo "      → ✅ state.current_rotated 已置为 null"
+  else
+    echo "      → ❌ state 未清空: $s7_after_reset"
+  fi
+  if ! ipv6_rotation_addr_exists_on_iface "$s7_addr2" "$iface"; then
+    echo "      → ✅ 地址已解绑"
+  else
+    echo "      → ❌ 地址仍在网卡上"
+  fi
+
+  # 兜底清理：解绑可能遗留的测试地址
+  [ -n "$s7_addr1" ] && ip -6 addr del "$s7_addr1/64" dev "$iface" 2>/dev/null || true
+  [ -n "$s7_addr2" ] && ip -6 addr del "$s7_addr2/64" dev "$iface" 2>/dev/null || true
+
+  # 恢复 state
+  rm -f "$s7_state_path" "${s7_state_path}.bak" "${s7_state_path}.bak."* 2>/dev/null
+  if [ "$saved_s7" -eq 1 ]; then
+    mv -f "${s7_state_path}.s7.before" "$s7_state_path" 2>/dev/null
+  fi
+
+  # 验证 eth0 IPv6 列表与测试前一致
+  after_addrs=$(ip -6 addr show dev "$iface" scope global 2>/dev/null \
+    | awk '/inet6 / { sub("/.*", "", $2); print $2 }' | sort)
+  if [ "$before_addrs" = "$after_addrs" ]; then
+    echo "[41] eth0 IPv6 列表恢复 → ✅ 与测试前完全一致"
+  else
+    echo "[41] eth0 IPv6 列表恢复 → ❌ 与测试前有差异"
+    echo "      测试前:"
+    printf '%s\n' "$before_addrs" | sed 's/^/        /'
+    echo "      测试后:"
+    printf '%s\n' "$after_addrs" | sed 's/^/        /'
   fi
 }
 
