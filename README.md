@@ -16,3 +16,5 @@ bash <(curl -fsSL https://raw.githubusercontent.com/lqlcj/linux-menu/main/leyili
 | :-- | :-- |
 | `LEYILI_ALLOW_ANY_DISTRO=1` | 允许在非 Debian/Ubuntu 系强制运行 |
 | `SELF_INSTALL_URL` | 自定义脚本更新源 |
+
+
