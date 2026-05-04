@@ -8082,6 +8082,189 @@ show_chain_menu(){
   done
 }
 
+# ═══════════════════════════════════════════════════════════════════════
+# IPv6 Reality 地址轮换模块
+# ─────────────────────────────────────────────────────────────────────
+# 设计文档 : leyili-IPv6轮换-实施方案.md
+# 状态目录 : /etc/sing-box/ipv6-rotation/
+# 命名前缀 : ipv6_rotation_*
+# 原则     : 不修改现有逻辑、状态独立持久、重启即重置、零外部依赖增量
+# ═══════════════════════════════════════════════════════════════════════
+
+IPV6_ROTATION_STATE_DIR="/etc/sing-box/ipv6-rotation"
+IPV6_ROTATION_LOCK_FILE="/var/lock/leyili-ipv6r.lock"
+
+ipv6_rotation_state_dir(){
+  printf '%s' "$IPV6_ROTATION_STATE_DIR"
+}
+
+ipv6_rotation_state_path(){
+  printf '%s/state.json' "$IPV6_ROTATION_STATE_DIR"
+}
+
+# ─── R3: 把 IPv6 简写形式展开为完整 8 段 ───────────────────────
+# 输入: 2a12:a304:4:9b8::a   或   2001:db8::   或   ::1
+# 输出: 完整 8 段，冒号分隔（不带 /N 前缀长度）
+ipv6_rotation_expand_ipv6(){
+  local addr="$1"
+  addr="${addr%/*}"
+
+  case "$addr" in
+    *::*) ;;
+    *) printf '%s' "$addr"; return 0 ;;
+  esac
+
+  local left="${addr%%::*}"
+  local right="${addr##*::}"
+  local left_n=0 right_n=0
+
+  if [ -n "$left" ]; then
+    left_n=$(awk -v s="$left" 'BEGIN { print split(s, _, ":") }')
+  fi
+  if [ -n "$right" ]; then
+    right_n=$(awk -v s="$right" 'BEGIN { print split(s, _, ":") }')
+  fi
+
+  local zero_n=$((8 - left_n - right_n))
+  if [ "$zero_n" -lt 1 ]; then
+    return 1
+  fi
+
+  local middle="" i
+  for ((i=0; i<zero_n; i++)); do
+    if [ -n "$middle" ]; then
+      middle="${middle}:0"
+    else
+      middle="0"
+    fi
+  done
+
+  if [ -n "$left" ] && [ -n "$right" ]; then
+    printf '%s:%s:%s' "$left" "$middle" "$right"
+  elif [ -n "$left" ]; then
+    printf '%s:%s' "$left" "$middle"
+  elif [ -n "$right" ]; then
+    printf '%s:%s' "$middle" "$right"
+  else
+    printf '0:0:0:0:0:0:0:0'
+  fi
+}
+
+# ─── R2: 探测 IPv6 默认路由所在网卡（多级 fallback） ─────────────
+# 输出: 网卡名（如 eth0/ens3/enp0s3）；无任何全局 IPv6 时返回 1
+ipv6_rotation_detect_interface(){
+  local iface=""
+
+  # L1: IPv6 默认路由的 dev
+  iface=$(ip -6 route get 2606:4700:4700::1111 2>/dev/null \
+    | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')
+  if [ -n "$iface" ]; then
+    printf '%s' "$iface"
+    return 0
+  fi
+
+  # L2: 第一个有公网 IPv6 的网卡（排除 fe80/fc/fd 私有段）
+  iface=$(ip -6 addr show scope global up 2>/dev/null \
+    | awk '
+        /^[0-9]+:/ { ifn=$2; sub(/:$/, "", ifn) }
+        /inet6 / && $2 !~ /^fe80/ && $2 !~ /^fc/ && $2 !~ /^fd/ {
+          print ifn; exit
+        }')
+  if [ -n "$iface" ]; then
+    printf '%s' "$iface"
+    return 0
+  fi
+
+  return 1
+}
+
+# ─── R4 + R8: 提取「IPv6 默认路由出口段」的 /64 前缀 ───────────
+# 输入: 网卡名（可省略，省略时调 detect_interface）
+# 输出: 4 段冒号分隔的前缀（如 2a12:a304:4:9b8）
+# 规则: 必须 /64、必须公网（复用 is_private_ipv6 拒绝私有/链路本地）
+ipv6_rotation_detect_prefix(){
+  local iface="$1"
+  if [ -z "$iface" ]; then
+    iface=$(ipv6_rotation_detect_interface) || return 1
+  fi
+
+  # 取该网卡上第一条 scope global 的 /64 地址
+  local addr_with_len
+  addr_with_len=$(ip -6 addr show dev "$iface" scope global 2>/dev/null \
+    | awk '/inet6 / && $2 ~ /\/64$/ { print $2; exit }')
+
+  if [ -z "$addr_with_len" ]; then
+    return 1
+  fi
+
+  local addr="${addr_with_len%/*}"
+
+  # R8: 拒绝私有/链路本地（复用脚本既有函数）
+  if is_private_ipv6 "$addr"; then
+    return 1
+  fi
+
+  local expanded prefix
+  expanded=$(ipv6_rotation_expand_ipv6 "$addr") || return 1
+  prefix=$(printf '%s' "$expanded" | cut -d: -f1-4)
+  if [ -z "$prefix" ]; then
+    return 1
+  fi
+  printf '%s' "$prefix"
+}
+
+# ─── 生成随机 64 位主机部分（4 段，每段 4 位 hex） ───────────────
+# 输出: aabb:ccdd:eeff:0011 形式
+ipv6_rotation_random_host64(){
+  if [ ! -r /dev/urandom ]; then
+    return 1
+  fi
+  od -An -N8 -tx1 /dev/urandom 2>/dev/null \
+    | tr -d ' \n' \
+    | awk '{
+        printf "%s:%s:%s:%s",
+          substr($0, 1, 4),
+          substr($0, 5, 4),
+          substr($0, 9, 4),
+          substr($0, 13, 4)
+      }'
+}
+
+# ─── 拼接 /64 prefix + host64 为完整 IPv6 ─────────────────────
+# 输入: prefix host64
+# 输出: prefix:host64 完整地址
+ipv6_rotation_compose_addr(){
+  local prefix="$1" host="$2"
+  if [ -z "$prefix" ] || [ -z "$host" ]; then
+    return 1
+  fi
+  printf '%s:%s' "$prefix" "$host"
+}
+
+# ─── 自检入口：dry-run 打印各底层函数输出 ──────────────────────
+# 用法: bash leyili.sh _ipv6r_selftest
+# 不挂载到菜单，仅用于开发期手动验证
+_ipv6r_selftest(){
+  local iface prefix host addr
+  echo "[1] state_dir  = $(ipv6_rotation_state_dir)"
+  echo "[2] state_path = $(ipv6_rotation_state_path)"
+  echo "[3] expand_ipv6 2a12:a304:4:9b8::a   = $(ipv6_rotation_expand_ipv6 '2a12:a304:4:9b8::a')"
+  echo "[4] expand_ipv6 ::1                  = $(ipv6_rotation_expand_ipv6 '::1')"
+  echo "[5] expand_ipv6 2001:db8::           = $(ipv6_rotation_expand_ipv6 '2001:db8::')"
+  echo "[6] expand_ipv6 ::                   = $(ipv6_rotation_expand_ipv6 '::')"
+  echo "[7] expand_ipv6 a:b:c:d:e:f:1:2      = $(ipv6_rotation_expand_ipv6 'a:b:c:d:e:f:1:2')"
+  iface=$(ipv6_rotation_detect_interface 2>/dev/null) || iface="(未探到)"
+  echo "[8] detect_interface = $iface"
+  prefix=$(ipv6_rotation_detect_prefix 2>/dev/null) || prefix="(未探到)"
+  echo "[9] detect_prefix    = $prefix"
+  host=$(ipv6_rotation_random_host64) || host="(失败)"
+  echo "[10] random_host64   = $host"
+  if [ "$prefix" != "(未探到)" ] && [ "$host" != "(失败)" ]; then
+    addr=$(ipv6_rotation_compose_addr "$prefix" "$host")
+    echo "[11] compose_addr    = $addr"
+  fi
+}
+
 show_menu(){
   local main_action_label=""
 
@@ -8159,4 +8342,10 @@ if [ "${LEYILI_ALLOW_ANY_DISTRO:-0}" != "1" ]; then
   fi
 fi
 register_sb_command || true
+
+# ─── 隐藏 self-test 入口（开发期 dry-run 用，不挂菜单） ─
+case "${1:-}" in
+  _ipv6r_selftest) _ipv6r_selftest; exit 0 ;;
+esac
+
 show_menu
