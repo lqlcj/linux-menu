@@ -7560,6 +7560,18 @@ render_node_card_block(){
   render_card_line "   ${C}${label}${N}${G}已安装${N}  :${C}${port:-?}${N}${gap_str}${C}${ip:-?}${N}${extra}"
   # 第二行：网络方向（缩进对齐到第一行的状态列）
   render_card_line "              ${D}${mode_label}${N}"
+
+  # 第三行（仅 reality 且正在 IPv6 轮换时显示）：轮换状态提示
+  if [ "$type" = "reality" ] \
+     && [ -f "/etc/sing-box/ipv6-rotation/state.json" ] \
+     && command -v jq >/dev/null 2>&1; then
+    local rot_addr
+    rot_addr=$(jq -r '.current_rotated.address // empty' \
+      "/etc/sing-box/ipv6-rotation/state.json" 2>/dev/null)
+    if [ -n "$rot_addr" ]; then
+      render_card_line "              ${G}↻ IPv6 轮换中${N} ${D}(菜单 3→5→2 查看链接)${N}"
+    fi
+  fi
 }
 
 # TCP 调优行（单排）
