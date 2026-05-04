@@ -7758,6 +7758,7 @@ show_node_manage_menu(){
     render_menu_item 2 "卸载单个节点"
     render_menu_item 3 "升级 sing-box 内核"
     render_menu_item 4 "链式代理设置 (中转机)"
+    render_menu_item 5 "IPv6 Reality 地址轮换"
     render_menu_item 0 "返回上级"
     render_divider
     read -p "  请输入序号: " choice
@@ -7766,6 +7767,7 @@ show_node_manage_menu(){
       2) show_node_uninstall_menu ;;
       3) upgrade_singbox_kernel ;;
       4) show_chain_menu ;;
+      5) ipv6_rotation_menu ;;
       0) return ;;
       *) notify_invalid_choice ;;
     esac
@@ -8851,6 +8853,49 @@ ipv6_rotation_health_check(){
   fi
   echo ""
   return 0
+}
+
+# ─── S8: 菜单挂载（节点管理菜单第 5 项调用此函数） ──────────────
+ipv6_rotation_menu(){
+  local state addr status_label status_color
+  while true; do
+    state=$(ipv6_rotation_state_validate 2>/dev/null)
+    addr=$(printf '%s' "$state" | jq -r '.current_rotated.address // empty' 2>/dev/null)
+
+    if [ -n "$addr" ]; then
+      status_label="ROTATED"
+      status_color="$G"
+    else
+      status_label="INIT"
+      status_color="$Y"
+    fi
+
+    clear
+    render_section_header "IPv6 Reality 地址轮换"
+    echo -e "  当前状态     : ${status_color}${status_label}${N}"
+    if [ -n "$addr" ]; then
+      echo -e "  当前轮换地址 : ${C}$addr${N}"
+    else
+      echo -e "  当前轮换地址 : ${D}（无，使用原始 ::a）${N}"
+    fi
+    echo -e "  原始节点地址 : ${C}::a${N} ${D}(始终保留)${N}"
+    render_divider
+    render_menu_item 1 "立即轮换（生成新地址 + 链接）"
+    render_menu_item 2 "查看当前轮换地址 + 链接"
+    render_menu_item 3 "重置（解绑当前轮换地址）"
+    render_menu_item 4 "健康检查（state 与实际是否一致）"
+    render_menu_item 0 "返回上级"
+    render_divider
+    read -p "  请输入序号: " choice
+    case "$choice" in
+      1) ipv6_rotation_rotate_now; pause_screen ;;
+      2) ipv6_rotation_show_current; pause_screen ;;
+      3) ipv6_rotation_reset; pause_screen ;;
+      4) ipv6_rotation_health_check; pause_screen ;;
+      0) return 0 ;;
+      *) notify_invalid_choice ;;
+    esac
+  done
 }
 
 # ─── 自检入口：dry-run 打印各底层函数输出 ──────────────────────
