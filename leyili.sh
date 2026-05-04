@@ -8462,6 +8462,69 @@ ipv6_rotation_read_node_snapshot(){
     }'
 }
 
+# ─── S4: 地址操作（ip -6 addr add/del + 规范化校验） ────────────
+# 设计: bind 后必须二次验证（R9）；unbind 失败仅警告（R5）；
+#       exists 用展开后字符串对比，避免 :: 简写形式漏判
+
+# 检测地址是否真在网卡上（精确匹配，规范化对比）
+# 输入: addr iface
+# 返回: 0 = 在；1 = 不在或参数错
+ipv6_rotation_addr_exists_on_iface(){
+  local addr="$1" iface="$2"
+  if [ -z "$addr" ] || [ -z "$iface" ]; then
+    return 1
+  fi
+
+  local addr_canonical
+  addr_canonical=$(ipv6_rotation_expand_ipv6 "$addr") || return 1
+
+  local show_addr show_canonical
+  while IFS= read -r show_addr; do
+    [ -z "$show_addr" ] && continue
+    show_canonical=$(ipv6_rotation_expand_ipv6 "$show_addr") || continue
+    if [ "$show_canonical" = "$addr_canonical" ]; then
+      return 0
+    fi
+  done < <(ip -6 addr show dev "$iface" 2>/dev/null \
+    | awk '/inet6 / { sub("/.*", "", $2); print $2 }')
+
+  return 1
+}
+
+# 绑定 IPv6 地址到网卡（/64 子网）+ R9 二次验证
+# 输入: addr iface
+# 返回: 0 = 成功；1 = 参数错；2 = ip 命令失败；3 = R9 二次验证失败
+ipv6_rotation_addr_bind(){
+  local addr="$1" iface="$2"
+  if [ -z "$addr" ] || [ -z "$iface" ]; then
+    return 1
+  fi
+
+  if ! ip -6 addr add "$addr/64" dev "$iface" 2>/dev/null; then
+    return 2
+  fi
+
+  # R9: 内核可能"无错"但实际未生效（罕见，例如商家网络限制）
+  if ! ipv6_rotation_addr_exists_on_iface "$addr" "$iface"; then
+    return 3
+  fi
+  return 0
+}
+
+# 解绑 IPv6 地址；失败仅警告，调用方应容忍（地址可能已不存在）
+# 输入: addr iface
+# 返回: 0 = 命令成功；1 = 参数错；2 = ip 命令失败（调用方建议忽略）
+ipv6_rotation_addr_unbind(){
+  local addr="$1" iface="$2"
+  if [ -z "$addr" ] || [ -z "$iface" ]; then
+    return 1
+  fi
+  if ! ip -6 addr del "$addr/64" dev "$iface" 2>/dev/null; then
+    return 2
+  fi
+  return 0
+}
+
 # ─── 自检入口：dry-run 打印各底层函数输出 ──────────────────────
 # 用法: bash leyili.sh _ipv6r_selftest
 # 不挂载到菜单，仅用于开发期手动验证
@@ -8606,6 +8669,82 @@ _ipv6r_selftest(){
   else
     echo "      → 失败（关键字段缺失或 port 非数字）"
   fi
+
+  echo ""
+  echo "=== S4: 地址操作（bind/unbind/exists）==="
+  if [ "$prefix" = "(未探到)" ] || [ "$iface" = "(未探到)" ]; then
+    echo "[S4] 缺 prefix/iface，跳过（需要全局 IPv6）"
+    return 0
+  fi
+
+  local test_host test_addr known_addr
+  test_host=$(ipv6_rotation_random_host64) || true
+  if [ -z "$test_host" ]; then
+    echo "[S4] random_host64 失败，跳过"
+    return 0
+  fi
+  test_addr=$(ipv6_rotation_compose_addr "$prefix" "$test_host")
+  known_addr="${prefix}:0:0:0:a"
+
+  echo "[24] addr_exists_on_iface 校验已知 ::a (展开后=${known_addr})"
+  if ipv6_rotation_addr_exists_on_iface "$known_addr" "$iface"; then
+    echo "      → ✅ 找到（规范化展开对比成功，能匹配 :: 简写形式）"
+  else
+    echo "      → ❌ 未找到（展开对比逻辑可能有问题）"
+  fi
+
+  echo "[25] addr_exists_on_iface 校验未绑定的随机地址应不在"
+  if ipv6_rotation_addr_exists_on_iface "$test_addr" "$iface"; then
+    echo "      → ❌ 异常：未绑定却显示存在"
+  else
+    echo "      → ✅ 正确：尚未绑定"
+  fi
+
+  echo "[26] addr_bind $test_addr"
+  ipv6_rotation_addr_bind "$test_addr" "$iface"
+  local bind_rc=$?
+  case $bind_rc in
+    0) echo "      → ✅ 绑定成功（含 R9 二次验证）" ;;
+    1) echo "      → ❌ 参数错（不应发生）" ;;
+    2) echo "      → ❌ ip 命令失败（商家限制？）" ;;
+    3) echo "      → ❌ R9 二次验证失败：bind 报告成功但地址不在网卡上" ;;
+  esac
+
+  if [ $bind_rc -eq 0 ]; then
+    echo "[27] addr_exists_on_iface 校验绑定后应在"
+    if ipv6_rotation_addr_exists_on_iface "$test_addr" "$iface"; then
+      echo "      → ✅"
+    else
+      echo "      → ❌"
+    fi
+
+    echo "[28] addr_unbind $test_addr"
+    if ipv6_rotation_addr_unbind "$test_addr" "$iface"; then
+      echo "      → ✅ 解绑成功"
+    else
+      echo "      → ❌ 解绑失败（理论不应发生）"
+    fi
+
+    echo "[29] addr_exists_on_iface 校验解绑后应不在"
+    if ipv6_rotation_addr_exists_on_iface "$test_addr" "$iface"; then
+      echo "      → ❌ 异常：解绑后还在"
+    else
+      echo "      → ✅ 已不在"
+    fi
+
+    echo "[30] addr_unbind 重复解绑（地址已不存在，应返回非 0）"
+    if ipv6_rotation_addr_unbind "$test_addr" "$iface"; then
+      echo "      → 命令仍成功（少见但可接受）"
+    else
+      echo "      → ✅ 返回非 0（预期，调用方应忽略）"
+    fi
+  else
+    echo "      [27]-[30] 跳过（[26] 绑定失败）"
+  fi
+
+  # 兜底清理：无论上面发生什么，确保测试地址不会遗留在网卡上
+  ip -6 addr del "$test_addr/64" dev "$iface" 2>/dev/null || true
+  echo "[31] 兜底清理完成（确认测试地址已不在 eth0 上）"
 }
 
 show_menu(){
