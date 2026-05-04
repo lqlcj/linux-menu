@@ -8525,6 +8525,103 @@ ipv6_rotation_addr_unbind(){
   return 0
 }
 
+# ─── S5: 前置检查（综合 8 项） ────────────────────────────────
+# 第 9 项「并发锁」延后到 S9 实现
+# 错误信息走 stderr；返回 0 = 全过；非 0 = 失败项数
+ipv6_rotation_check_prereqs(){
+  local errors=0
+
+  if [ "$(id -u)" -ne 0 ]; then
+    echo "  ${R}✗${N} 需要 root 权限" >&2
+    errors=$((errors + 1))
+  fi
+
+  if ! is_singbox_installed; then
+    echo "  ${R}✗${N} sing-box 未安装" >&2
+    errors=$((errors + 1))
+  fi
+
+  if ! command -v jq >/dev/null 2>&1; then
+    echo "  ${R}✗${N} jq 未安装（apt install jq）" >&2
+    errors=$((errors + 1))
+  fi
+
+  ipv6_rotation_check_reality_info
+  case $? in
+    0) ;;
+    1) echo "  ${R}✗${N} reality 节点未安装（请先创建 IPv6 reality 节点）" >&2
+       errors=$((errors + 1)) ;;
+    2) echo "  ${R}✗${N} reality 节点不是 dualstack 模式（无法 IPv6 轮换）" >&2
+       echo "    实际 Mode=$(get_node_value reality Mode 2>/dev/null)" >&2
+       echo "    解决：删除现有 reality 节点 → 重新创建并选 dualstack 模式" >&2
+       errors=$((errors + 1)) ;;
+    3) echo "  ${R}✗${N} reality.info 字段损坏（缺 Mode 字段）" >&2
+       errors=$((errors + 1)) ;;
+  esac
+
+  ipv6_rotation_verify_listen_consistency
+  case $? in
+    0) ;;
+    1) echo "  ${R}✗${N} sing-box config 不可读或 jq 缺失" >&2
+       errors=$((errors + 1)) ;;
+    2) echo "  ${R}✗${N} sing-box config 中找不到 reality-in inbound（与 info 不一致）" >&2
+       errors=$((errors + 1)) ;;
+    3) local actual
+       actual=$(jq -r '.inbounds[]? | select(.tag=="reality-in") | .listen // empty' "$CONFIG_PATH" 2>/dev/null)
+       echo "  ${R}✗${N} sing-box reality-in listen=$actual（必须为 ::）" >&2
+       echo "    R1 双源校验失败：info 与 sing-box config 不一致" >&2
+       errors=$((errors + 1)) ;;
+  esac
+
+  local iface
+  iface=$(ipv6_rotation_detect_interface 2>/dev/null)
+  if [ -z "$iface" ]; then
+    echo "  ${R}✗${N} 未探测到带公网 IPv6 的网卡" >&2
+    errors=$((errors + 1))
+  elif ! ip link show "$iface" 2>/dev/null | grep -q 'state UP'; then
+    echo "  ${R}✗${N} 网卡 $iface 未 UP" >&2
+    errors=$((errors + 1))
+  fi
+
+  if [ -n "$iface" ]; then
+    local prefix
+    prefix=$(ipv6_rotation_detect_prefix "$iface" 2>/dev/null)
+    if [ -z "$prefix" ]; then
+      echo "  ${R}✗${N} 未探测到 /64 公网 IPv6 前缀（本期仅支持 /64）" >&2
+      errors=$((errors + 1))
+    fi
+  fi
+
+  return $errors
+}
+
+# ─── S6: URL 生成（包装 build_reality_link） ────────────────────
+# 从 reality.info 拉字段 + 传入新地址 + tag 加 -rot 后缀
+# 输入: addr (无方括号，build_reality_link 内部 url_encode_host 自动加 [])
+# stdout: vless URL；缺字段返回 1
+ipv6_rotation_build_link(){
+  local addr="$1"
+  if [ -z "$addr" ]; then
+    return 1
+  fi
+
+  local tag port uuid pbk sid sni
+  tag=$(get_node_value reality Tag 2>/dev/null)
+  port=$(get_node_value reality Port 2>/dev/null)
+  uuid=$(get_node_value reality UUID 2>/dev/null)
+  pbk=$(get_node_value reality PublicKey 2>/dev/null)
+  sid=$(get_node_value reality ShortID 2>/dev/null)
+  sni=$(get_node_value reality SNI 2>/dev/null)
+
+  if [ -z "$tag" ] || [ -z "$port" ] || [ -z "$uuid" ] \
+     || [ -z "$pbk" ] || [ -z "$sid" ] || [ -z "$sni" ]; then
+    return 1
+  fi
+
+  # 加 -rot 后缀让客户端能区分原节点和轮换节点
+  build_reality_link "$uuid" "$addr" "$port" "$sni" "$pbk" "$sid" "${tag}-rot"
+}
+
 # ─── 自检入口：dry-run 打印各底层函数输出 ──────────────────────
 # 用法: bash leyili.sh _ipv6r_selftest
 # 不挂载到菜单，仅用于开发期手动验证
@@ -8745,6 +8842,64 @@ _ipv6r_selftest(){
   # 兜底清理：无论上面发生什么，确保测试地址不会遗留在网卡上
   ip -6 addr del "$test_addr/64" dev "$iface" 2>/dev/null || true
   echo "[31] 兜底清理完成（确认测试地址已不在 eth0 上）"
+
+  echo ""
+  echo "=== S5: 前置检查（综合 8 项） ==="
+  local prereq_out prereq_rc
+  prereq_out=$(ipv6_rotation_check_prereqs 2>&1)
+  prereq_rc=$?
+  if [ "$prereq_rc" -eq 0 ]; then
+    echo "[32] check_prereqs → ✅ 全部通过（可执行轮换）"
+  else
+    echo "[32] check_prereqs → ❌ 失败 $prereq_rc 项"
+    printf '%s\n' "$prereq_out" | sed 's/^/      /'
+  fi
+
+  echo ""
+  echo "=== S6: URL 生成（端到端 dry-run） ==="
+  local sample_addr sample_url
+  if [ "$prefix" != "(未探到)" ]; then
+    local sample_host
+    sample_host=$(ipv6_rotation_random_host64)
+    sample_addr=$(ipv6_rotation_compose_addr "$prefix" "$sample_host")
+    echo "[33] 模拟轮换地址: $sample_addr"
+
+    sample_url=$(ipv6_rotation_build_link "$sample_addr" 2>/dev/null)
+    if [ -n "$sample_url" ]; then
+      local masked_url
+      masked_url=$(printf '%s' "$sample_url" \
+        | sed -E 's|vless://[a-f0-9-]{36}@|vless://<UUID>@|; s|pbk=[A-Za-z0-9_+/=-]+|pbk=<PUBKEY>|')
+      echo "[34] URL 生成成功（敏感字段已替换）："
+      echo "      $masked_url"
+
+      # 验证 URL 关键结构
+      echo "[35] URL 结构校验："
+      case "$sample_url" in
+        vless://*) echo "      ✅ 协议头 vless://" ;;
+        *) echo "      ❌ 协议头错误" ;;
+      esac
+      case "$sample_url" in
+        *"@[$sample_addr]:"*) echo "      ✅ IPv6 地址正确包裹 [$sample_addr]" ;;
+        *) echo "      ❌ IPv6 包裹异常（应有 [$sample_addr]）" ;;
+      esac
+      case "$sample_url" in
+        *flow=xtls-rprx-vision*) echo "      ✅ flow=xtls-rprx-vision" ;;
+        *) echo "      ❌ flow 字段缺失" ;;
+      esac
+      case "$sample_url" in
+        *security=reality*) echo "      ✅ security=reality" ;;
+        *) echo "      ❌ security 字段缺失" ;;
+      esac
+      case "$sample_url" in
+        *'#'*-rot) echo "      ✅ tag 后缀 -rot（区分轮换节点）" ;;
+        *) echo "      ❌ tag 后缀缺失" ;;
+      esac
+    else
+      echo "[34] → ❌ build_link 失败（reality.info 字段缺失？）"
+    fi
+  else
+    echo "[33-35] 跳过（缺 prefix）"
+  fi
 }
 
 show_menu(){
