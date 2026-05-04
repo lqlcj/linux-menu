@@ -8880,6 +8880,27 @@ ipv6_rotation_health_check(){
   return 0
 }
 
+# ─── S9: 并发锁（flock 串行化） ────────────────────────────────
+# 设计: 只锁会改状态的操作 (rotate / reset)；只读操作 (show / health) 不锁
+# 用法: ipv6_rotation_with_lock <函数名> [参数...]
+ipv6_rotation_with_lock(){
+  if ! command -v flock >/dev/null 2>&1; then
+    # 系统无 flock 直接运行（兼容退化）
+    "$@"
+    return $?
+  fi
+
+  # 用子 shell + 文件描述符 200 的形式持有锁
+  # flock -n: 非阻塞，立即失败（避免阻塞 UI）
+  (
+    flock -n 200 || {
+      echo -e "  ${R}另一个 IPv6 轮换操作正在进行，请稍后再试${N}" >&2
+      exit 99
+    }
+    "$@"
+  ) 200>"$IPV6_ROTATION_LOCK_FILE"
+}
+
 # ─── S8: 菜单挂载（节点管理菜单第 5 项调用此函数） ──────────────
 ipv6_rotation_menu(){
   local state addr status_label status_color
@@ -8913,9 +8934,9 @@ ipv6_rotation_menu(){
     render_divider
     read -p "  请输入序号: " choice
     case "$choice" in
-      1) ipv6_rotation_rotate_now; pause_screen ;;
+      1) ipv6_rotation_with_lock ipv6_rotation_rotate_now; pause_screen ;;
       2) ipv6_rotation_show_current; pause_screen ;;
-      3) ipv6_rotation_reset; pause_screen ;;
+      3) ipv6_rotation_with_lock ipv6_rotation_reset; pause_screen ;;
       4) ipv6_rotation_health_check; pause_screen ;;
       0) return 0 ;;
       *) notify_invalid_choice ;;
@@ -9316,6 +9337,41 @@ _ipv6r_selftest(){
     printf '%s\n' "$before_addrs" | sed 's/^/        /'
     echo "      测试后:"
     printf '%s\n' "$after_addrs" | sed 's/^/        /'
+  fi
+
+  echo ""
+  echo "=== S9: 并发锁（flock 串行化） ==="
+  if ! command -v flock >/dev/null 2>&1; then
+    echo "[42] 系统无 flock，跳过并发锁测试"
+    return 0
+  fi
+
+  # 启动后台进程持有锁 3 秒
+  (flock 200; sleep 3) 200>"$IPV6_ROTATION_LOCK_FILE" &
+  local bg_pid=$!
+  sleep 0.5
+
+  # 此时再尝试获取锁应当失败
+  local lock_out lock_rc
+  lock_out=$(ipv6_rotation_with_lock true 2>&1)
+  lock_rc=$?
+  if [ $lock_rc -ne 0 ]; then
+    echo "[42] 并发锁竞争: ✅ 第二个调用被拒绝 (rc=$lock_rc)"
+    if printf '%s' "$lock_out" | grep -q "正在进行"; then
+      echo "      ✅ 友好错误提示已输出"
+    fi
+  else
+    echo "[42] 并发锁竞争: ❌ 第二个调用未被拒绝（锁失效？）"
+  fi
+
+  # 等后台进程结束（最多 5 秒）
+  wait $bg_pid 2>/dev/null
+
+  # 锁释放后再次尝试应当成功
+  if ipv6_rotation_with_lock true >/dev/null 2>&1; then
+    echo "      ✅ 锁释放后 with_lock 再次成功"
+  else
+    echo "      ❌ 锁释放后仍失败"
   fi
 }
 
