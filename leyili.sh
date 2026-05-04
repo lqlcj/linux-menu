@@ -8377,6 +8377,91 @@ ipv6_rotation_state_init(){
     | ipv6_rotation_state_save
 }
 
+# ─── S3: 配置读取（从 reality.info + R1 双源校验） ──────────────
+# 设计: 各函数只返回信息（返回码区分情况），不强制阻断
+#       策略由 S5 check_prereqs 综合决定
+
+# 检查 reality.info 是否存在且 Mode=dualstack
+# 返回 0 = OK；1 = info 不存在；2 = Mode 非 dualstack；3 = info 字段缺失
+ipv6_rotation_check_reality_info(){
+  if ! node_installed reality 2>/dev/null; then
+    return 1
+  fi
+  local mode
+  mode=$(get_node_value reality Mode 2>/dev/null)
+  if [ -z "$mode" ]; then
+    return 3
+  fi
+  if [ "$mode" != "dualstack" ]; then
+    return 2
+  fi
+  return 0
+}
+
+# R1: 双源校验
+# 核对 sing-box config 的 reality-in inbound 存在且 listen=::
+# 返回 0 = 一致；1 = config 不可读；2 = 找不到 reality-in；3 = listen 非 ::
+ipv6_rotation_verify_listen_consistency(){
+  if [ ! -r "$CONFIG_PATH" ]; then
+    return 1
+  fi
+  if ! command -v jq >/dev/null 2>&1; then
+    return 1
+  fi
+  local listen
+  listen=$(jq -r '.inbounds[]? | select(.tag=="reality-in") | .listen // empty' \
+    "$CONFIG_PATH" 2>/dev/null)
+  if [ -z "$listen" ]; then
+    return 2
+  fi
+  if [ "$listen" != "::" ]; then
+    return 3
+  fi
+  return 0
+}
+
+# 从 reality.info 读取并组装 node_snapshot JSON
+# stdout: node_snapshot JSON（jq 紧凑格式）
+# 关键字段任一缺失或 port 非数字 → 返回 1
+ipv6_rotation_read_node_snapshot(){
+  local tag port uuid pbk sid sni
+  tag=$(get_node_value reality Tag 2>/dev/null)
+  port=$(get_node_value reality Port 2>/dev/null)
+  uuid=$(get_node_value reality UUID 2>/dev/null)
+  pbk=$(get_node_value reality PublicKey 2>/dev/null)
+  sid=$(get_node_value reality ShortID 2>/dev/null)
+  sni=$(get_node_value reality SNI 2>/dev/null)
+
+  if [ -z "$tag" ] || [ -z "$port" ] || [ -z "$uuid" ] \
+     || [ -z "$pbk" ] || [ -z "$sid" ] || [ -z "$sni" ]; then
+    return 1
+  fi
+
+  case "$port" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+
+  jq -nc \
+    --arg inbound_tag "reality-in" \
+    --arg tag "$tag" \
+    --argjson port "$port" \
+    --arg uuid "$uuid" \
+    --arg pbk "$pbk" \
+    --arg sid "$sid" \
+    --arg sni "$sni" \
+    --arg flow "xtls-rprx-vision" \
+    '{
+      inbound_tag: $inbound_tag,
+      tag: $tag,
+      port: $port,
+      uuid: $uuid,
+      public_key: $pbk,
+      short_id: $sid,
+      server_name: $sni,
+      flow: $flow
+    }'
+}
+
 # ─── 自检入口：dry-run 打印各底层函数输出 ──────────────────────
 # 用法: bash leyili.sh _ipv6r_selftest
 # 不挂载到菜单，仅用于开发期手动验证
@@ -8476,6 +8561,51 @@ _ipv6r_selftest(){
     mv -f "${sample_path}.selftest.before" "$sample_path" 2>/dev/null || true
   fi
   echo "[20] 测试后清理完成（已恢复原 state，如有）"
+
+  echo ""
+  echo "=== S3: 配置读取（reality.info + R1 双源校验）==="
+
+  ipv6_rotation_check_reality_info
+  case $? in
+    0) echo "[21] check_reality_info: ✅ OK (Mode=dualstack)" ;;
+    1) echo "[21] check_reality_info: ❌ reality 节点未安装（reality.info 不存在）" ;;
+    2) echo "[21] check_reality_info: ❌ Mode 非 dualstack（轮换不可用）"
+       echo "      实际 Mode=$(get_node_value reality Mode 2>/dev/null)" ;;
+    3) echo "[21] check_reality_info: ❌ info 字段损坏" ;;
+  esac
+
+  ipv6_rotation_verify_listen_consistency
+  local listen_rc=$?
+  case $listen_rc in
+    0) echo "[22] verify_listen_consistency: ✅ sing-box config listen='::' 一致" ;;
+    1) echo "[22] verify_listen_consistency: ❌ sing-box config 不可读或缺 jq" ;;
+    2) echo "[22] verify_listen_consistency: ❌ sing-box config 中找不到 reality-in inbound" ;;
+    3) local actual_listen
+       actual_listen=$(jq -r '.inbounds[]? | select(.tag=="reality-in") | .listen // empty' "$CONFIG_PATH" 2>/dev/null)
+       echo "[22] verify_listen_consistency: ❌ listen 非 ::（实际=$actual_listen）" ;;
+  esac
+
+  echo "[23] read_node_snapshot →"
+  local snap
+  snap=$(ipv6_rotation_read_node_snapshot 2>/dev/null)
+  if [ -n "$snap" ]; then
+    echo "      字段（敏感字段已截短）："
+    printf '%s' "$snap" | jq -r '
+      "        inbound_tag = " + .inbound_tag,
+      "        tag         = " + .tag,
+      "        port        = " + (.port | tostring) + "  (类型: " + (.port | type) + ")",
+      "        uuid        = " + (.uuid[:8]) + "***(隐藏)",
+      "        public_key  = " + (.public_key[:8]) + "***(隐藏)",
+      "        short_id    = " + .short_id,
+      "        server_name = " + .server_name,
+      "        flow        = " + .flow
+    '
+    local field_count
+    field_count=$(printf '%s' "$snap" | jq '. | keys | length')
+    echo "      字段总数: $field_count (期望 8)"
+  else
+    echo "      → 失败（关键字段缺失或 port 非数字）"
+  fi
 }
 
 show_menu(){
