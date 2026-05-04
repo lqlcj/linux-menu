@@ -1481,7 +1481,7 @@ EOF
                       ]
                       else .dns.servers end)
     | .dns.strategy = (.dns.strategy // "ipv4_only")
-    | .inbounds = ((.inbounds // []) | map(select(.tag == "reality-in" or .tag == "hy2-in")))
+    | .inbounds = ((.inbounds // []) | map(select(.tag == "reality-in" or .tag == "hy2-in" or .tag == "anytls-in")))
     | .outbounds = (if ((.outbounds // []) | length) == 0
                     then [{"type":"direct","tag":"direct-out","domain_resolver":"cloudflare"}]
                     else (.outbounds | map(
@@ -1912,6 +1912,28 @@ build_reality_link(){
     "$uuid" "$host" "$port" "$sni" "$public_key" "$short_id" "$tag"
 }
 
+build_anytls_link(){
+  # build_anytls_link <password> <ip> <port> <sni> <public_key> <short_id> <tag>
+  # AnyTLS 标准 URI（anytls-go uri_scheme.md）只定义 sni/insecure；
+  # 这里增加 reality 扩展参数（security/pbk/sid/fp），与 v2rayN / sing-box GUI / Shadowrocket 的事实标准兼容。
+  local password="$1"
+  local ip="$2"
+  local port="$3"
+  local sni="$4"
+  local public_key="$5"
+  local short_id="$6"
+  local tag="${7:-anytls}"
+
+  if [ -z "$password" ] || [ -z "$ip" ] || [ -z "$port" ] || [ -z "$sni" ] || [ -z "$public_key" ] || [ -z "$short_id" ]; then
+    return 1
+  fi
+
+  local host
+  host=$(url_encode_host "$ip")
+  printf 'anytls://%s@%s:%s/?security=reality&sni=%s&fp=chrome&pbk=%s&sid=%s&insecure=0#%s\n' \
+    "$password" "$host" "$port" "$sni" "$public_key" "$short_id" "$tag"
+}
+
 build_hy2_link(){
   # build_hy2_link <password> <ip> <port> <sni> <insecure 0|1> <obfs_type|""> <obfs_password|""> <tag> [hop_start] [hop_end]
   local password="$1"
@@ -1965,7 +1987,7 @@ parse_query_string(){
   done
 }
 
-# 输入：vless:// 或 hysteria2:// 链接
+# 输入：vless:// 或 hysteria2:// 或 anytls:// 链接
 # 输出：KEY=VALUE 行（Type / Host / Port / Tag 是通用字段，其余协议特有）
 parse_node_link(){
   local url="$1"
@@ -1985,6 +2007,10 @@ parse_node_link(){
       proto="hy2"
       rest="${url#hy2://}"
       ;;
+    anytls://*)
+      proto="anytls"
+      rest="${url#anytls://}"
+      ;;
     *)
       return 1
       ;;
@@ -2000,6 +2026,10 @@ parse_node_link(){
   if [[ "$rest" == *"?"* ]]; then
     query="${rest#*\?}"
     rest="${rest%%\?*}"
+  fi
+  # 切除可能的路径段（如 anytls://pwd@host:port/  这种带斜杠的标准形式）
+  if [[ "$rest" == */* ]]; then
+    rest="${rest%%/*}"
   fi
   # 拆 user@host:port
   if [[ "$rest" == *"@"* ]]; then
@@ -2054,6 +2084,22 @@ parse_node_link(){
         security)   printf 'Security=%s\n' "$v" ;;
         type)       printf 'Network=%s\n' "$v" ;;
         fp)         printf 'Fingerprint=%s\n' "$v" ;;
+      esac
+    done < <(parse_query_string "${query:-}")
+  elif [ "$proto" = "anytls" ]; then
+    printf 'Type=anytls\n'
+    printf 'Password=%s\n' "$userinfo"
+    local kv
+    while IFS= read -r kv; do
+      [ -z "$kv" ] && continue
+      local k="${kv%%=*}" v="${kv#*=}"
+      case "$k" in
+        sni)        printf 'SNI=%s\n' "$v" ;;
+        pbk)        printf 'PublicKey=%s\n' "$v" ;;
+        sid)        printf 'ShortID=%s\n' "$v" ;;
+        security)   printf 'Security=%s\n' "$v" ;;
+        fp)         printf 'Fingerprint=%s\n' "$v" ;;
+        insecure)   printf 'Insecure=%s\n' "$v" ;;
       esac
     done < <(parse_query_string "${query:-}")
   else
@@ -2172,6 +2218,41 @@ build_chain_outbound_from_link(){
           }
         }) + (if $obfs == null then {} else {obfs: $obfs} end)'
       ;;
+    anytls)
+      local password pubk sid
+      password=$(printf '%s\n' "$fields" | sed -n 's/^Password=//p' | head -1)
+      pubk=$(printf '%s\n' "$fields" | sed -n 's/^PublicKey=//p' | head -1)
+      sid=$(printf '%s\n' "$fields" | sed -n 's/^ShortID=//p' | head -1)
+      if [ -z "$password" ] || [ -z "$pubk" ] || [ -z "$sid" ] || [ -z "$sni" ]; then
+        return 1
+      fi
+      jq -n \
+        --arg tag "$outbound_tag" \
+        --arg server "$host" \
+        --argjson port "$port" \
+        --arg password "$password" \
+        --arg sni "$sni" \
+        --arg pbk "$pubk" \
+        --arg sid "$sid" '
+        {
+          type: "anytls",
+          tag: $tag,
+          server: $server,
+          server_port: $port,
+          password: $password,
+          domain_strategy: "ipv4_only",
+          tls: {
+            enabled: true,
+            server_name: $sni,
+            utls: {enabled: true, fingerprint: "chrome"},
+            reality: {
+              enabled: true,
+              public_key: $pbk,
+              short_id: $sid
+            }
+          }
+        }'
+      ;;
     *)
       return 1
       ;;
@@ -2213,6 +2294,13 @@ build_link_for_node(){
         hop_end=$(get_node_value "$type" PortHopEnd 2>/dev/null || true)
       fi
       build_hy2_link "$password" "$ip" "$port" "$sni" "$insecure" "$obfs_type" "$obfs_pw" "$tag" "${hop_start:-}" "${hop_end:-}"
+      ;;
+    anytls)
+      local password pubk sid
+      password=$(get_node_value "$type" Password 2>/dev/null || true)
+      pubk=$(get_node_value "$type" PublicKey 2>/dev/null || true)
+      sid=$(get_node_value "$type" ShortID 2>/dev/null || true)
+      build_anytls_link "$password" "$ip" "$port" "$sni" "$pubk" "$sid" "$tag"
       ;;
     *)
       return 1
@@ -2638,7 +2726,7 @@ ip6_init_firewall(){
   ip6tables -P INPUT DROP
   ip6tables -P OUTPUT ACCEPT
 
-  # 自动恢复 reality / hy2 节点主端口放行（IPv6 侧）
+  # 自动恢复 reality / hy2 / anytls 节点主端口放行（IPv6 侧）
   # 仅在节点 Mode 为 dualstack / ipv6-in-ipv4-out 时需要
   local node_port node_mode
   if node_installed reality; then
@@ -2659,6 +2747,16 @@ ip6_init_firewall(){
       ip6tables -C INPUT -p udp --dport "$node_port" -j ACCEPT 2>/dev/null \
         || ip6tables -A INPUT -p udp --dport "$node_port" -j ACCEPT 2>/dev/null || true
       echo -e "  ${G}已自动恢复 hy2 主端口放行 (v6)：${node_port}/udp${N}"
+    fi
+  fi
+  if node_installed anytls; then
+    node_port=$(get_node_value anytls Port 2>/dev/null || true)
+    node_mode=$(get_node_value anytls Mode 2>/dev/null || echo ipv4)
+    if [ -n "$node_port" ] \
+       && { [ "$node_mode" = "dualstack" ] || [ "$node_mode" = "ipv6-in-ipv4-out" ]; }; then
+      ip6tables -C INPUT -p tcp --dport "$node_port" -j ACCEPT 2>/dev/null \
+        || ip6tables -A INPUT -p tcp --dport "$node_port" -j ACCEPT 2>/dev/null || true
+      echo -e "  ${G}已自动恢复 anytls 主端口放行 (v6)：${node_port}/tcp${N}"
     fi
   fi
 
@@ -3027,7 +3125,7 @@ ip4_init_firewall(){
   iptables -P INPUT DROP
   iptables -P OUTPUT ACCEPT
 
-  # 自动恢复 reality / hy2 节点主端口放行（IPv4 侧）
+  # 自动恢复 reality / hy2 / anytls 节点主端口放行（IPv4 侧）
   # 仅在节点 Mode 为 ipv4 / dualstack 时需要
   local node_port node_mode
   if node_installed reality; then
@@ -3048,6 +3146,16 @@ ip4_init_firewall(){
       iptables -C INPUT -p udp --dport "$node_port" -j ACCEPT 2>/dev/null \
         || iptables -A INPUT -p udp --dport "$node_port" -j ACCEPT 2>/dev/null || true
       echo -e "  ${G}已自动恢复 hy2 主端口放行：${node_port}/udp${N}"
+    fi
+  fi
+  if node_installed anytls; then
+    node_port=$(get_node_value anytls Port 2>/dev/null || true)
+    node_mode=$(get_node_value anytls Mode 2>/dev/null || echo ipv4)
+    if [ -n "$node_port" ] \
+       && { [ "$node_mode" = "ipv4" ] || [ "$node_mode" = "dualstack" ]; }; then
+      iptables -C INPUT -p tcp --dport "$node_port" -j ACCEPT 2>/dev/null \
+        || iptables -A INPUT -p tcp --dport "$node_port" -j ACCEPT 2>/dev/null || true
+      echo -e "  ${G}已自动恢复 anytls 主端口放行：${node_port}/tcp${N}"
     fi
   fi
 
@@ -4112,6 +4220,20 @@ render_node_detail(){
         echo -e "  端口跳跃  : ${D}未启用${N}"
       fi
       ;;
+    anytls)
+      local pwd_v pubk_v sid_v
+      pwd_v=$(get_node_value "$type" Password 2>/dev/null || true)
+      pubk_v=$(get_node_value "$type" PublicKey 2>/dev/null || true)
+      sid_v=$(get_node_value "$type" ShortID 2>/dev/null || true)
+      echo -e "  类型      : ${C}AnyTLS${N}  Tag : ${C}${tag}${N}"
+      echo -e "  Password  : ${C}${pwd_v:-未知}${N}"
+      echo -e "  PublicKey : ${C}${pubk_v:-未知}${N} ${D}(共享自 Reality)${N}"
+      echo -e "  ShortID   : ${C}${sid_v:-未知}${N} ${D}(共享自 Reality)${N}"
+      echo -e "  模式      : ${C}${mode_label}${N}"
+      echo -e "  IP        : ${C}${ip:-未知}${N}"
+      echo -e "  端口      : ${C}${port:-未知}${N} ${D}(TCP)${N}"
+      echo -e "  SNI       : ${C}${sni:-未知}${N}"
+      ;;
   esac
 }
 
@@ -4302,6 +4424,23 @@ modify_reality_params(){
     set_node_value reality PublicKey "$new_pub"
     set_node_value reality PrivateKey "$new_pri"
     set_node_value reality ShortID "$new_short_id"
+
+    # 联动：AnyTLS 节点也复用同一对密钥，必须同步否则客户端会静默连不上
+    if node_installed anytls; then
+      echo ""
+      echo -e "${Y}==> 同步更新 AnyTLS 节点的密钥对...${N}"
+      if sync_anytls_to_reality_keys "$new_pri" "$new_pub" "$new_short_id"; then
+        if sing-box check -c "$CONFIG_PATH" >/dev/null 2>&1 \
+           && systemctl restart sing-box >/dev/null 2>&1; then
+          echo -e "  ${G}AnyTLS 节点密钥已同步${N}"
+          echo -e "  ${Y}请用「查看客户端链接」获取新的 AnyTLS 分享链接${N}"
+        else
+          echo -e "  ${R}AnyTLS 同步后配置校验或重启失败，请手动排查 sing-box 日志${N}"
+        fi
+      else
+        echo -e "  ${R}AnyTLS 同步失败（jq 改写错误），请手动排查${N}"
+      fi
+    fi
   fi
 
   local cur_ip cur_tag final_pub final_sid new_link ipv6_new_link
@@ -4363,6 +4502,7 @@ modify_node_params(){
   case "$node_type" in
     reality) modify_reality_params ;;
     hy2)     modify_hy2_params ;;
+    anytls)  modify_anytls_params ;;
     *)
       echo -e "${R}未知节点类型: $node_type${N}"
       pause_screen
@@ -5085,6 +5225,24 @@ get_current_singbox_version(){
   sing-box version 2>/dev/null | head -1 | awk '{print $3}'
 }
 
+# 当前 sing-box 主.次版本是否 >= 给定阈值
+# 用法：sb_version_at_least 1.12  → 0 表示满足，1 表示不满足
+sb_version_at_least(){
+  local required="$1" cur major_req minor_req major_cur minor_cur
+  cur=$(get_current_singbox_version)
+  [ -n "$cur" ] || return 1
+  cur="${cur#v}"
+  major_req=$(printf '%s' "$required" | cut -d. -f1)
+  minor_req=$(printf '%s' "$required" | cut -d. -f2)
+  major_cur=$(printf '%s' "$cur" | cut -d. -f1)
+  minor_cur=$(printf '%s' "$cur" | cut -d. -f2)
+  case "$major_cur" in ''|*[!0-9]*) return 1 ;; esac
+  case "$minor_cur" in ''|*[!0-9]*) return 1 ;; esac
+  if [ "$major_cur" -gt "$major_req" ]; then return 0; fi
+  if [ "$major_cur" -eq "$major_req" ] && [ "$minor_cur" -ge "$minor_req" ]; then return 0; fi
+  return 1
+}
+
 update_self_script(){
   local tmp_file=""
   local confirm=""
@@ -5573,6 +5731,22 @@ uninstall_reality_node(){
     pause_screen
     return 0
   fi
+
+  # AnyTLS 复用 Reality 的密钥对/ShortID，卸载 Reality 后 AnyTLS 客户端会静默连不上
+  if node_installed anytls; then
+    echo ""
+    echo -e "  ${Y}⚠ 检测到 AnyTLS 节点正在复用 Reality 的密钥对${N}"
+    echo -e "  ${Y}  卸载 Reality 后，AnyTLS 节点的 private_key 将失效，客户端会静默连不上${N}"
+    echo -e "  ${D}  建议：先在「卸载单个节点」里卸载 AnyTLS，再回来卸载 Reality${N}"
+    echo ""
+    local force_uninstall=""
+    read -p "  仍然继续卸载 Reality？(y/N): " force_uninstall
+    if [ "$force_uninstall" != "y" ] && [ "$force_uninstall" != "Y" ]; then
+      echo -e "  已取消"
+      return 0
+    fi
+  fi
+
   echo ""
   read -p "  确认卸载 Reality 节点？(y/N): " confirm
   if [ "$confirm" != "y" ] && [ "$confirm" != "Y" ]; then
@@ -5787,6 +5961,25 @@ generate_hy2_random_port(){
       return 0
     fi
     attempts=$((attempts + 1))
+  done
+  printf '%s' "$p"
+}
+
+# AnyTLS 默认端口生成：避开本机已占端口与 Reality 节点已用端口
+generate_anytls_random_port(){
+  local p attempts=0
+  local reality_port
+  reality_port=$(get_node_value reality Port 2>/dev/null || true)
+  while [ $attempts -lt 30 ]; do
+    p=$(( (RANDOM << 15 | RANDOM) % 45535 + 20000 ))
+    attempts=$((attempts + 1))
+    if [ -n "$reality_port" ] && [ "$p" -eq "$reality_port" ]; then
+      continue
+    fi
+    if ! check_port_in_use "$p"; then
+      printf '%s' "$p"
+      return 0
+    fi
   done
   printf '%s' "$p"
 }
@@ -6654,6 +6847,499 @@ modify_hy2_params(){
   pause_screen
 }
 
+# ─── AnyTLS + Reality 节点（共享 Reality 密钥对） ────────
+# 设计：
+#   * private_key / public_key / short_id 全部复用 reality.info；
+#     anytls.info 只缓存 PublicKey/ShortID 用于生成 Link，不存 PrivateKey
+#   * 必须先安装 Reality 节点；卸载 Reality 时会有联动警告
+#   * sing-box 1.12+ 才支持 type: "anytls"
+#   * 不写 padding_scheme，使用 anytls-go 内置默认填充规则
+install_anytls_node(){
+  local port_input="" sni_input=""
+  local access_ip="" link="" ipv6_link=""
+  local public_ipv4="" public_ipv6=""
+  local install_mode="ipv4" mode_label=""
+  local PORT SNI TAG LISTEN_CHOICE LISTEN_ADDR PASSWORD confirm
+  local default_port reality_sni private_key public_key short_id
+
+  if ! require_root; then return 1; fi
+
+  render_section_header "创建 AnyTLS 节点"
+  echo -e "  ${Y}AnyTLS + Reality（复用 Reality 密钥对，独立端口）${N}"
+  echo -e "  ${Y}直接回车使用括号内默认值${N}"
+  echo ""
+
+  # ── 前置依赖：必须已有 Reality 节点
+  if ! node_installed reality; then
+    echo -e "${R}AnyTLS 节点必须复用 Reality 的密钥对${N}"
+    echo -e "${Y}请先在「创建节点」菜单创建 Reality 节点，再回来创建 AnyTLS${N}"
+    pause_screen
+    return 1
+  fi
+
+  # ── sing-box 必须已安装且 >= 1.12
+  if ! is_singbox_installed; then
+    echo ""
+    echo -e "${Y}==> 安装 sing-box...${N}"
+    if ! install_singbox; then
+      echo ""
+      echo -e "${R}sing-box 安装失败，请检查上方输出${N}"
+      pause_screen
+      return 1
+    fi
+  fi
+  if ! sb_version_at_least 1.12; then
+    local cur_ver
+    cur_ver=$(get_current_singbox_version)
+    echo ""
+    echo -e "${R}AnyTLS 协议需要 sing-box ≥ 1.12，当前版本: ${cur_ver:-未知}${N}"
+    echo -e "${Y}请先在「节点 / 内核管理 → 升级 sing-box 内核」中升级后再创建 AnyTLS 节点${N}"
+    pause_screen
+    return 1
+  fi
+
+  if node_installed anytls; then
+    echo -e "${Y}检测到已存在 AnyTLS 节点，继续将覆盖原节点配置${N}"
+    read -p "  继续？(y/N): " confirm
+    if [ "$confirm" != "y" ] && [ "$confirm" != "Y" ]; then
+      echo -e "  已取消"
+      return 0
+    fi
+  fi
+
+  # ── 端口（默认随机，避开 reality 端口与已占端口）
+  default_port=$(generate_anytls_random_port)
+  while true; do
+    read -p "  端口 (${default_port}): " port_input
+    PORT="${port_input:-$default_port}"
+    if ! validate_port "$PORT"; then
+      echo -e "${R}端口必须是 1-65535 的数字${N}"
+      continue
+    fi
+    PORT=$((10#$PORT))
+    local reality_port
+    reality_port=$(get_node_value reality Port 2>/dev/null || true)
+    if [ -n "$reality_port" ] && [ "$PORT" -eq "$reality_port" ]; then
+      echo -e "${R}端口与 Reality 节点冲突（Reality 已使用 ${reality_port}）${N}"
+      continue
+    fi
+    if check_port_in_use "$PORT"; then
+      echo -e "${R}端口 ${PORT} 已被其他服务占用${N}"
+      local force_port=""
+      read -p "  仍然使用此端口？(y/N): " force_port
+      if [ "$force_port" != "y" ] && [ "$force_port" != "Y" ]; then
+        continue
+      fi
+    fi
+    break
+  done
+
+  # ── SNI（默认沿用 Reality 的 SNI，保持指纹一致）
+  reality_sni=$(get_node_value reality SNI 2>/dev/null || true)
+  while true; do
+    read -p "  域名 (${reality_sni:-www.ucla.edu}): " sni_input
+    sni_input="${sni_input:-${reality_sni:-www.ucla.edu}}"
+    SNI=$(sanitize_sni "$sni_input")
+    if [ -n "$SNI" ]; then
+      break
+    fi
+    echo -e "${R}域名不能为空，且不能只包含引号或换行${N}"
+  done
+
+  read -p "  节点名称 (anytls): " TAG
+  TAG="${TAG:-anytls}"
+
+  echo -e "  监听模式："
+  echo "    1) 仅 IPv4 入站 + 仅 IPv4 出站 - 0.0.0.0（默认）"
+  echo "    2) 双栈入站 + 仅 IPv4 出站 - ::"
+  echo "    3) 仅 IPv6 入站 + 仅 IPv4 出站"
+  read -p "  请选择 (1): " LISTEN_CHOICE
+  case "$LISTEN_CHOICE" in
+    2) LISTEN_ADDR="::"; install_mode="dualstack" ;;
+    3) LISTEN_ADDR=""; install_mode="ipv6-in-ipv4-out" ;;
+    *) LISTEN_ADDR="0.0.0.0"; install_mode="ipv4" ;;
+  esac
+
+  if [ "$install_mode" = "ipv6-in-ipv4-out" ]; then
+    public_ipv6=$(detect_primary_ipv6)
+    if [ -z "$public_ipv6" ]; then
+      echo ""
+      echo -e "${R}未检测到可用的 IPv6 地址，无法使用“仅 IPv6 入站 + 仅 IPv4 出站”模式${N}"
+      pause_screen
+      return 1
+    fi
+  fi
+
+  echo -e "${Y}==> 复用 Reality 密钥对...${N}"
+  private_key=$(get_node_value reality PrivateKey 2>/dev/null || true)
+  public_key=$(get_node_value reality PublicKey 2>/dev/null || true)
+  short_id=$(get_node_value reality ShortID 2>/dev/null || true)
+  if [ -z "$private_key" ] || [ -z "$public_key" ] || [ -z "$short_id" ]; then
+    echo ""
+    echo -e "${R}Reality 节点信息不完整（缺少 PrivateKey / PublicKey / ShortID）${N}"
+    echo -e "${Y}请在「修改 Reality 参数」中重新生成密钥对后再试${N}"
+    pause_screen
+    return 1
+  fi
+
+  echo -e "${Y}==> 生成 AnyTLS 用户密码...${N}"
+  PASSWORD=$(cat /proc/sys/kernel/random/uuid)
+
+  public_ipv4=${public_ipv4:-$(detect_primary_ipv4)}
+  public_ipv6=${public_ipv6:-$(detect_primary_ipv6)}
+
+  case "$install_mode" in
+    ipv6-in-ipv4-out)
+      access_ip="$public_ipv6"
+      LISTEN_ADDR="$public_ipv6"
+      if [ -z "$access_ip" ]; then
+        echo ""
+        echo -e "${R}未检测到可用的 IPv6 地址${N}"
+        pause_screen
+        return 1
+      fi
+      ;;
+    dualstack)
+      access_ip="${public_ipv4:-$public_ipv6}"
+      if [ -z "$access_ip" ]; then
+        echo ""
+        echo -e "${R}未检测到可用的 IPv4 / IPv6 地址${N}"
+        pause_screen
+        return 1
+      fi
+      ;;
+    *)
+      access_ip="$public_ipv4"
+      if [ -z "$access_ip" ]; then
+        echo ""
+        echo -e "${R}未检测到可用的 IPv4 地址，请检查网络环境${N}"
+        pause_screen
+        return 1
+      fi
+      ;;
+  esac
+
+  mode_label=$(describe_install_mode "$install_mode")
+
+  echo -e "${Y}==> 写入配置...${N}"
+  ensure_jq || { pause_screen; return 1; }
+
+  local inbound_json
+  inbound_json=$(jq -n \
+    --arg listen "$LISTEN_ADDR" \
+    --argjson port "$PORT" \
+    --arg password "$PASSWORD" \
+    --arg sni "$SNI" \
+    --arg priv "$private_key" \
+    --arg sid "$short_id" '{
+      type: "anytls",
+      tag: "anytls-in",
+      listen: $listen,
+      listen_port: $port,
+      users: [{name: "default", password: $password}],
+      tls: {
+        enabled: true,
+        server_name: $sni,
+        reality: {
+          enabled: true,
+          handshake: {server: $sni, server_port: 443},
+          private_key: $priv,
+          short_id: [$sid]
+        }
+      }
+    }')
+
+  if ! config_add_inbound "$inbound_json"; then
+    echo -e "${R}写入 inbound 失败${N}"
+    pause_screen
+    return 1
+  fi
+
+  echo -e "${Y}==> 校验并启动...${N}"
+  if ! config_check_and_restart; then
+    echo ""
+    echo -e "${R}sing-box 校验或重启失败${N}"
+    pause_screen
+    return 1
+  fi
+
+  node_apply_firewall_for_mode "$PORT" tcp "$install_mode"
+  print_firewall_hint "$PORT" tcp "AnyTLS 节点入站"
+
+  link=$(build_anytls_link "$PASSWORD" "$access_ip" "$PORT" "$SNI" "$public_key" "$short_id" "$TAG" 2>/dev/null || true)
+  if [ "$install_mode" = "dualstack" ] && [ -n "$public_ipv6" ] && [ "$public_ipv6" != "$access_ip" ]; then
+    ipv6_link=$(build_anytls_link "$PASSWORD" "$public_ipv6" "$PORT" "$SNI" "$public_key" "$short_id" "${TAG}-ipv6" 2>/dev/null || true)
+  fi
+
+  ensure_nodes_dir
+  cat > "$(node_info_path anytls)" <<EOF
+Type=anytls
+Tag=$TAG
+Mode=$install_mode
+ListenAddr=$LISTEN_ADDR
+Port=$PORT
+SNI=$SNI
+Password=$PASSWORD
+PublicKey=$public_key
+ShortID=$short_id
+IP=$access_ip
+Link=$link
+EOF
+
+  register_sb_command || true
+
+  echo ""
+  echo -e "  ${G}╔══════════════════════════════════════════════════════╗${N}"
+  echo -e "  ${G}║${N}  ${B}${W}${APP_NAME}${N}  ${G}AnyTLS 节点创建完成${N}                        ${G}║${N}"
+  echo -e "  ${G}╚══════════════════════════════════════════════════════╝${N}"
+  echo -e "  模式      : ${C}$mode_label${N}"
+  echo -e "  Password  : ${C}$PASSWORD${N}"
+  echo -e "  PublicKey : ${C}$public_key${N} ${D}(共享自 Reality)${N}"
+  echo -e "  IP        : ${C}$access_ip${N}"
+  echo -e "  端口      : ${C}$PORT${N} ${D}(TCP)${N}"
+  echo -e "  SNI       : ${C}$SNI${N}"
+  if [ -n "$link" ]; then
+    echo ""
+    echo -e "  ${B}客户端链接：${N}"
+    echo -e "  ${G}$link${N}"
+    print_qrcode "$link"
+  fi
+  if [ -n "$ipv6_link" ]; then
+    echo ""
+    echo -e "  ${B}IPv6 客户端链接：${N}"
+    echo -e "  ${G}$ipv6_link${N}"
+    print_qrcode "$ipv6_link"
+  fi
+  echo ""
+  echo -e "  ${Y}注意：AnyTLS + Reality 仅 sing-box 1.12+ / Xray-core 25.x+ 客户端支持${N}"
+  echo -e "  ${D}      Mihomo / Clash 系客户端目前不支持${N}"
+  echo -e "  信息已保存至 ${Y}$(node_info_path anytls)${N}"
+  pause_screen
+}
+
+uninstall_anytls_node(){
+  local confirm
+  if ! node_installed anytls; then
+    echo -e "${Y}AnyTLS 节点未安装${N}"
+    pause_screen
+    return 0
+  fi
+  echo ""
+  read -p "  确认卸载 AnyTLS 节点？(y/N): " confirm
+  if [ "$confirm" != "y" ] && [ "$confirm" != "Y" ]; then
+    echo -e "  已取消"
+    return 0
+  fi
+
+  # 必须在 remove_node_info 之前撤防火墙规则，否则读不到 Mode/Port
+  local at_port at_mode
+  at_port=$(get_node_value anytls Port 2>/dev/null || true)
+  at_mode=$(get_node_value anytls Mode 2>/dev/null || echo ipv4)
+  if [ -n "$at_port" ]; then
+    node_revoke_firewall_for_mode "$at_port" tcp "$at_mode"
+  fi
+
+  config_remove_inbound_by_tag "anytls-in" || true
+  config_remove_inbound_chain "anytls-in" || true
+  config_remove_outbound_by_tag "chain-anytls-out" || true
+  remove_node_info anytls
+  remove_chain_info anytls
+  post_uninstall_service_step
+  echo -e "${G}AnyTLS 节点已卸载${N}"
+  pause_screen
+}
+
+modify_anytls_params(){
+  local new_port="" new_sni="" new_pw=""
+  local cur_port cur_sni cur_pw backup_path="" confirm
+
+  if ! require_root; then return 1; fi
+  if ! require_singbox_installed; then return 1; fi
+  if ! node_installed anytls; then
+    echo ""
+    echo -e "${R}未发现 AnyTLS 节点信息${N}"
+    pause_screen
+    return 1
+  fi
+  if [ ! -f "$CONFIG_PATH" ]; then
+    echo ""
+    echo -e "${R}未找到配置文件：$CONFIG_PATH${N}"
+    pause_screen
+    return 1
+  fi
+
+  cur_port=$(get_node_value anytls Port 2>/dev/null || true)
+  cur_sni=$(get_node_value anytls SNI 2>/dev/null || true)
+  cur_pw=$(get_node_value anytls Password 2>/dev/null || true)
+
+  echo ""
+  echo -e "  ${B}${C}修改 AnyTLS 节点参数${N}  ${D}直接回车保留当前值${N}"
+  echo -e "  ${D}（密钥对与 ShortID 由 Reality 节点统一管理，本菜单不修改）${N}"
+  render_divider
+
+  while true; do
+    read -p "  端口 (${cur_port:-当前未知}): " new_port
+    new_port="${new_port:-$cur_port}"
+    if ! validate_port "$new_port"; then
+      echo -e "${R}端口必须是 1-65535 的数字${N}"
+      continue
+    fi
+    new_port=$((10#$new_port))
+    # 与 reality 端口冲突检查
+    local reality_port
+    reality_port=$(get_node_value reality Port 2>/dev/null || true)
+    if [ -n "$reality_port" ] && [ "$new_port" -eq "$reality_port" ]; then
+      echo -e "${R}端口与 Reality 节点冲突（Reality 当前 ${reality_port}）${N}"
+      continue
+    fi
+    break
+  done
+
+  while true; do
+    read -p "  SNI 域名 (${cur_sni:-当前未知}): " new_sni
+    new_sni="${new_sni:-$cur_sni}"
+    new_sni=$(sanitize_sni "$new_sni")
+    if [ -n "$new_sni" ]; then break; fi
+    echo -e "${R}SNI 不能为空${N}"
+  done
+
+  read -p "  Password (回车保留当前 / 输入 new 重新随机生成): " new_pw
+  case "$new_pw" in
+    new|NEW)
+      new_pw=$(cat /proc/sys/kernel/random/uuid)
+      echo -e "  ${D}新 Password：$new_pw${N}"
+      ;;
+    "") new_pw="$cur_pw" ;;
+  esac
+  if [ -z "$new_pw" ]; then
+    echo -e "${R}Password 无效${N}"
+    pause_screen
+    return 1
+  fi
+
+  echo ""
+  echo -e "  即将应用："
+  echo -e "    端口     ${cur_port:-?} ${D}→${N} ${C}${new_port}${N}"
+  echo -e "    SNI      ${cur_sni:-?} ${D}→${N} ${C}${new_sni}${N}"
+  if [ "$new_pw" != "$cur_pw" ]; then
+    echo -e "    Password ${cur_pw:-?} ${D}→${N} ${C}${new_pw}${N}"
+  else
+    echo -e "    Password ${D}保留${N}"
+  fi
+  read -p "  确认？(y/N): " confirm
+  if [ "$confirm" != "y" ] && [ "$confirm" != "Y" ]; then
+    echo -e "  已取消"
+    return 0
+  fi
+
+  # 备份配置
+  backup_path="${CONFIG_PATH}.$(date +%Y%m%d-%H%M%S).bak"
+  cp "$CONFIG_PATH" "$backup_path" 2>/dev/null || true
+
+  ensure_jq || { pause_screen; return 1; }
+
+  local tmp jq_filter
+  tmp=$(mktemp)
+  jq_filter='(.inbounds[] | select(.tag == "anytls-in"))
+       |= (.listen_port = ($port | tonumber)
+           | .users[0].password = $pw
+           | .tls.server_name = $sni
+           | .tls.reality.handshake.server = $sni)'
+  if ! jq --arg port "$new_port" \
+          --arg sni "$new_sni" \
+          --arg pw "$new_pw" \
+          "$jq_filter" "$CONFIG_PATH" > "$tmp" 2>/dev/null; then
+    rm -f "$tmp"
+    echo -e "${R}配置写入失败（jq 过滤错误）${N}"
+    pause_screen
+    return 1
+  fi
+  mv "$tmp" "$CONFIG_PATH"
+
+  if ! config_check_and_restart; then
+    echo ""
+    echo -e "${R}sing-box 校验或重启失败，已保留备份：${backup_path}${N}"
+    pause_screen
+    return 1
+  fi
+
+  # 防火墙：撤旧放新
+  local cur_mode
+  cur_mode=$(get_node_value anytls Mode 2>/dev/null || echo ipv4)
+  if [ -n "$cur_port" ] && [ "$cur_port" != "$new_port" ]; then
+    node_revoke_firewall_for_mode "$cur_port" tcp "$cur_mode"
+    node_apply_firewall_for_mode "$new_port" tcp "$cur_mode"
+    print_firewall_hint "$new_port" tcp "AnyTLS 节点新端口"
+  fi
+
+  # 更新 info
+  set_node_value anytls Port "$new_port"
+  set_node_value anytls SNI "$new_sni"
+  set_node_value anytls Password "$new_pw"
+
+  # 重生成 Link
+  local cur_ip cur_tag pub sid new_link ipv6_new_link
+  cur_ip=$(get_node_value anytls IP 2>/dev/null || true)
+  cur_tag=$(get_node_value anytls Tag 2>/dev/null || echo anytls)
+  pub=$(get_node_value anytls PublicKey 2>/dev/null || true)
+  sid=$(get_node_value anytls ShortID 2>/dev/null || true)
+  new_link=$(build_anytls_link "$new_pw" "$cur_ip" "$new_port" "$new_sni" "$pub" "$sid" "${cur_tag:-anytls}" 2>/dev/null || true)
+  ipv6_new_link=$(build_dualstack_ipv6_link_for_node anytls 2>/dev/null || true)
+  [ -n "$new_link" ] && set_node_value anytls Link "$new_link"
+
+  echo ""
+  echo -e "${G}AnyTLS 节点参数已更新并重启服务${N}"
+  if [ -n "$new_link" ]; then
+    echo ""
+    echo -e "  ${B}新客户端链接：${N}"
+    echo -e "  ${G}$new_link${N}"
+    print_qrcode "$new_link"
+  fi
+  if [ -n "$ipv6_new_link" ]; then
+    echo ""
+    echo -e "  ${B}新 IPv6 客户端链接：${N}"
+    echo -e "  ${G}$ipv6_new_link${N}"
+    print_qrcode "$ipv6_new_link"
+  fi
+  pause_screen
+}
+
+# 当 Reality 节点重新生成密钥对+ShortID 后，同步更新已存在的 AnyTLS 节点
+# 用法：sync_anytls_to_reality_keys <new_private_key> <new_public_key> <new_short_id>
+sync_anytls_to_reality_keys(){
+  local new_pri="$1" new_pub="$2" new_sid="$3"
+  if ! node_installed anytls; then return 0; fi
+  [ -n "$new_pri" ] && [ -n "$new_pub" ] && [ -n "$new_sid" ] || return 1
+  ensure_jq || return 1
+  [ -f "$CONFIG_PATH" ] || return 1
+
+  local tmp jq_filter
+  tmp=$(mktemp)
+  jq_filter='(.inbounds[] | select(.tag == "anytls-in"))
+       |= (.tls.reality.private_key = $pri
+           | .tls.reality.short_id = [$sid])'
+  if ! jq --arg pri "$new_pri" --arg sid "$new_sid" \
+          "$jq_filter" "$CONFIG_PATH" > "$tmp" 2>/dev/null; then
+    rm -f "$tmp"
+    return 1
+  fi
+  mv "$tmp" "$CONFIG_PATH"
+
+  set_node_value anytls PublicKey "$new_pub"
+  set_node_value anytls ShortID "$new_sid"
+
+  # 重生成 Link（密钥变了，旧 Link 失效）
+  local pw ip port sni tag new_link
+  pw=$(get_node_value anytls Password 2>/dev/null || true)
+  ip=$(get_node_value anytls IP 2>/dev/null || true)
+  port=$(get_node_value anytls Port 2>/dev/null || true)
+  sni=$(get_node_value anytls SNI 2>/dev/null || true)
+  tag=$(get_node_value anytls Tag 2>/dev/null || echo anytls)
+  new_link=$(build_anytls_link "$pw" "$ip" "$port" "$sni" "$new_pub" "$new_sid" "$tag" 2>/dev/null || true)
+  [ -n "$new_link" ] && set_node_value anytls Link "$new_link"
+  return 0
+}
+
 # ─── 完整卸载脚本 ─────────────────────────────────────
 # 清理范围：节点 inbound、节点防火墙端口、sing-box 服务与软件包、
 #          /etc/sing-box（含 nodes/、certs/、备份）、
@@ -6667,7 +7353,7 @@ uninstall_script_completely(){
   render_section_header "卸载脚本"
   echo ""
   echo -e "  ${R}此操作将清除以下内容（不可恢复）：${N}"
-  echo -e "    ${L}·${N} 所有 sing-box 节点（Reality / Hysteria2）及其防火墙端口"
+  echo -e "    ${L}·${N} 所有 sing-box 节点（Reality / Hysteria2 / AnyTLS）及其防火墙端口"
   echo -e "    ${L}·${N} sing-box 服务、软件包与 ${C}/etc/sing-box${N} 整个目录"
   echo -e "    ${L}·${N} ${C}${INFO_PATH}${N} 与 ${C}${SCRIPT_PATH}${N}"
   echo ""
@@ -6692,6 +7378,9 @@ uninstall_script_completely(){
       port=$(get_node_value "$node" Port 2>/dev/null || true)
       case "$type" in
         reality)
+          [ -n "$port" ] && deny_port_in_firewall "$port" tcp
+          ;;
+        anytls)
           [ -n "$port" ] && deny_port_in_firewall "$port" tcp
           ;;
         hy2)
@@ -6832,6 +7521,7 @@ render_node_card_block(){
   case "$type" in
     reality) label="Reality    " ;;   # 11 可见列：7 + 4 sp
     hy2)     label="Hysteria2  " ;;   # 11 可见列：9 + 2 sp
+    anytls)  label="AnyTLS     " ;;   # 11 可见列：6 + 5 sp
     *)       label=$(printf '%-11s' "$type") ;;
   esac
 
@@ -6960,6 +7650,8 @@ render_main_menu_card(){
   render_card_blank
   render_node_card_block hy2
   render_card_blank
+  render_node_card_block anytls
+  render_card_blank
   render_tcp_card_line
   render_initcwnd_card_line
   render_card_blank
@@ -6971,12 +7663,24 @@ show_node_install_menu(){
     render_section_header "创建节点"
     render_menu_item 1 "创建 Reality 节点$(node_installed reality && echo "  ${D}(已安装，将覆盖)${N}")"
     render_menu_item 2 "创建 Hysteria2 节点$(node_installed hy2 && echo "  ${D}(已安装，将覆盖)${N}")"
+    if node_installed reality; then
+      render_menu_item 3 "创建 AnyTLS 节点$(node_installed anytls && echo "  ${D}(已安装，将覆盖)${N}")"
+    else
+      echo -e "  ${D}3) 创建 AnyTLS 节点  (需先创建 Reality)${N}"
+    fi
     render_menu_item 0 "返回上级"
     render_divider
     read -p "  请输入序号: " choice
     case $choice in
       1) install_reality_node; return ;;
       2) install_hy2_node; return ;;
+      3)
+        if node_installed reality; then
+          install_anytls_node; return
+        else
+          notify_invalid_choice
+        fi
+        ;;
       0) return ;;
       *) notify_invalid_choice ;;
     esac
@@ -6996,12 +7700,18 @@ show_node_uninstall_menu(){
     else
       echo -e "  ${D}2) Hysteria2 未安装${N}"
     fi
+    if node_installed anytls; then
+      render_menu_item 3 "卸载 AnyTLS 节点"
+    else
+      echo -e "  ${D}3) AnyTLS 未安装${N}"
+    fi
     render_menu_item 0 "返回上级"
     render_divider
     read -p "  请输入序号: " choice
     case $choice in
       1) node_installed reality && uninstall_reality_node; return ;;
       2) node_installed hy2 && uninstall_hy2_node; return ;;
+      3) node_installed anytls && uninstall_anytls_node; return ;;
       0) return ;;
       *) notify_invalid_choice ;;
     esac
@@ -7044,7 +7754,7 @@ upgrade_singbox_kernel(){
 show_node_manage_menu(){
   while true; do
     render_section_header "节点 / 内核管理"
-    render_menu_item 1 "创建节点 (Reality / Hysteria2)"
+    render_menu_item 1 "创建节点 (Reality / Hysteria2 / AnyTLS)"
     render_menu_item 2 "卸载单个节点"
     render_menu_item 3 "升级 sing-box 内核"
     render_menu_item 4 "链式代理设置 (中转机)"
@@ -7067,6 +7777,7 @@ inbound_tag_for_type(){
   case "$1" in
     reality) printf 'reality-in' ;;
     hy2)     printf 'hy2-in' ;;
+    anytls)  printf 'anytls-in' ;;
     *)       return 1 ;;
   esac
 }
