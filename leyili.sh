@@ -8104,52 +8104,69 @@ ipv6_rotation_state_path(){
   printf '%s/state.json' "$IPV6_ROTATION_STATE_DIR"
 }
 
-# ─── R3: 把 IPv6 简写形式展开为完整 8 段 ───────────────────────
-# 输入: 2a12:a304:4:9b8::a   或   2001:db8::   或   ::1
-# 输出: 完整 8 段，冒号分隔（不带 /N 前缀长度）
+# ─── R3: 把 IPv6 简写形式展开为完整 8 段 + 每段去前导零 ─────────
+# 输入: 2a12:a304:4:9b8::a   或   2001:db8::   或   2a12:...:06c9
+# 输出: 完整 8 段，冒号分隔，每段去前导零（与 ip 工具规范化对齐）
+# 重要: 必须去前导零，否则 R9 二次验证会误判（ip add 接受 06c9，
+#       ip show 输出 6c9，字符串不等导致 R9 失败）
 ipv6_rotation_expand_ipv6(){
   local addr="$1"
   addr="${addr%/*}"
 
+  local raw
   case "$addr" in
-    *::*) ;;
-    *) printf '%s' "$addr"; return 0 ;;
+    *::*)
+      local left="${addr%%::*}"
+      local right="${addr##*::}"
+      local left_n=0 right_n=0
+
+      if [ -n "$left" ]; then
+        left_n=$(awk -v s="$left" 'BEGIN { print split(s, _, ":") }')
+      fi
+      if [ -n "$right" ]; then
+        right_n=$(awk -v s="$right" 'BEGIN { print split(s, _, ":") }')
+      fi
+
+      local zero_n=$((8 - left_n - right_n))
+      if [ "$zero_n" -lt 1 ]; then
+        return 1
+      fi
+
+      local middle="" i
+      for ((i=0; i<zero_n; i++)); do
+        if [ -n "$middle" ]; then
+          middle="${middle}:0"
+        else
+          middle="0"
+        fi
+      done
+
+      if [ -n "$left" ] && [ -n "$right" ]; then
+        raw="${left}:${middle}:${right}"
+      elif [ -n "$left" ]; then
+        raw="${left}:${middle}"
+      elif [ -n "$right" ]; then
+        raw="${middle}:${right}"
+      else
+        raw="0:0:0:0:0:0:0:0"
+      fi
+      ;;
+    *)
+      raw="$addr"
+      ;;
   esac
 
-  local left="${addr%%::*}"
-  local right="${addr##*::}"
-  local left_n=0 right_n=0
-
-  if [ -n "$left" ]; then
-    left_n=$(awk -v s="$left" 'BEGIN { print split(s, _, ":") }')
-  fi
-  if [ -n "$right" ]; then
-    right_n=$(awk -v s="$right" 'BEGIN { print split(s, _, ":") }')
-  fi
-
-  local zero_n=$((8 - left_n - right_n))
-  if [ "$zero_n" -lt 1 ]; then
-    return 1
-  fi
-
-  local middle="" i
-  for ((i=0; i<zero_n; i++)); do
-    if [ -n "$middle" ]; then
-      middle="${middle}:0"
-    else
-      middle="0"
-    fi
-  done
-
-  if [ -n "$left" ] && [ -n "$right" ]; then
-    printf '%s:%s:%s' "$left" "$middle" "$right"
-  elif [ -n "$left" ]; then
-    printf '%s:%s' "$left" "$middle"
-  elif [ -n "$right" ]; then
-    printf '%s:%s' "$middle" "$right"
-  else
-    printf '0:0:0:0:0:0:0:0'
-  fi
+  # 每段去前导零，与 ip 工具的规范化形式保持一致
+  printf '%s' "$raw" | awk -F: '{
+    out = ""
+    for (i = 1; i <= NF; i++) {
+      seg = $i
+      sub(/^0+/, "", seg)
+      if (seg == "") seg = "0"
+      out = (i == 1) ? seg : out ":" seg
+    }
+    printf "%s", out
+  }'
 }
 
 # ─── R2: 探测 IPv6 默认路由所在网卡（多级 fallback） ─────────────
@@ -8514,6 +8531,8 @@ ipv6_rotation_addr_bind(){
   # R9: 内核可能"无错"但实际未生效（罕见，例如商家网络限制）
   if ! ipv6_rotation_addr_exists_on_iface "$addr" "$iface"; then
     echo "  ${R}R9 二次验证失败：地址绑定后未在网卡上生效${N}" >&2
+    # 即使 R9 验证失败，ip add 本身可能已成功（避免残留）
+    ip -6 addr del "$addr/64" dev "$iface" 2>/dev/null || true
     return 3
   fi
   return 0
@@ -8917,6 +8936,9 @@ _ipv6r_selftest(){
   echo "[5] expand_ipv6 2001:db8::           = $(ipv6_rotation_expand_ipv6 '2001:db8::')"
   echo "[6] expand_ipv6 ::                   = $(ipv6_rotation_expand_ipv6 '::')"
   echo "[7] expand_ipv6 a:b:c:d:e:f:1:2      = $(ipv6_rotation_expand_ipv6 'a:b:c:d:e:f:1:2')"
+  echo "[7b] 前导零规范化测试 (06c9 → 6c9):"
+  echo "      expand 2a12:a304:4:9b8:b8f1:8587:ae19:06c9 = $(ipv6_rotation_expand_ipv6 '2a12:a304:4:9b8:b8f1:8587:ae19:06c9')"
+  echo "      期望:                                       2a12:a304:4:9b8:b8f1:8587:ae19:6c9"
   iface=$(ipv6_rotation_detect_interface 2>/dev/null) || iface="(未探到)"
   echo "[8] detect_interface = $iface"
   prefix=$(ipv6_rotation_detect_prefix 2>/dev/null) || prefix="(未探到)"
