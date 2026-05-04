@@ -8232,6 +8232,39 @@ ipv6_rotation_detect_prefix(){
   printf '%s' "$prefix"
 }
 
+# ─── 探测「原节点 IPv6 地址」（用于防碰撞 + UI 动态显示） ───────
+# 用户可能在 VPS 控制面板自定义 IP（::a / ::1234 / ::8888 ...）
+# 不能硬编码 ::a，必须动态从网卡读
+# 输入: iface [exclude_addr]
+# 输出: 第一条 ≠ exclude 的公网 /64 地址（规范化）；找不到返回 1
+ipv6_rotation_detect_native_addr(){
+  local iface="$1" exclude_addr="$2"
+  if [ -z "$iface" ]; then
+    return 1
+  fi
+
+  local exclude_canonical=""
+  if [ -n "$exclude_addr" ]; then
+    exclude_canonical=$(ipv6_rotation_expand_ipv6 "$exclude_addr")
+  fi
+
+  local addr canonical
+  while IFS= read -r addr; do
+    [ -z "$addr" ] && continue
+    if is_private_ipv6 "$addr"; then
+      continue
+    fi
+    canonical=$(ipv6_rotation_expand_ipv6 "$addr") || continue
+    if [ -n "$exclude_canonical" ] && [ "$canonical" = "$exclude_canonical" ]; then
+      continue
+    fi
+    printf '%s' "$canonical"
+    return 0
+  done < <(ip -6 addr show dev "$iface" scope global 2>/dev/null \
+    | awk '/inet6 / && $2 ~ /\/64$/ { sub("/.*", "", $2); print $2 }')
+  return 1
+}
+
 # ─── 生成随机 64 位主机部分（4 段，每段 4 位 hex） ───────────────
 # 输出: aabb:ccdd:eeff:0011 形式
 ipv6_rotation_random_host64(){
@@ -8668,13 +8701,21 @@ ipv6_rotation_rotate_now(){
   current_state=$(ipv6_rotation_state_validate)
   old_addr=$(printf '%s' "$current_state" | jq -r '.current_rotated.address // empty')
 
-  # 生成新地址（最多 3 次防碰撞 ::a / 旧地址）
-  local known_addr="${prefix}:0:0:0:a"
-  local new_host new_addr attempt=0
+  # 生成新地址（最多 3 次防碰撞：原节点地址 / 旧轮换地址）
+  # 原节点地址动态探测，兼容用户在控制面板自定义 IPv6 的情况
+  local native_canonical old_canonical=""
+  native_canonical=$(ipv6_rotation_detect_native_addr "$iface" "$old_addr" 2>/dev/null)
+  if [ -n "$old_addr" ]; then
+    old_canonical=$(ipv6_rotation_expand_ipv6 "$old_addr")
+  fi
+
+  local new_host new_addr new_canonical attempt=0
   while [ $attempt -lt 3 ]; do
     new_host=$(ipv6_rotation_random_host64) || return 2
     new_addr=$(ipv6_rotation_compose_addr "$prefix" "$new_host")
-    if [ "$new_addr" != "$known_addr" ] && [ "$new_addr" != "$old_addr" ]; then
+    new_canonical=$(ipv6_rotation_expand_ipv6 "$new_addr")
+    if [ "$new_canonical" != "$native_canonical" ] \
+       && [ "$new_canonical" != "$old_canonical" ]; then
       break
     fi
     attempt=$((attempt + 1))
@@ -8741,7 +8782,10 @@ ipv6_rotation_rotate_now(){
     echo -e "  ${G}$url${N}"
   fi
   echo ""
-  echo -e "  ${Y}注意：${N}原节点 (::a) 保持工作；旧轮换链接已立即失效"
+  echo -e "  ${Y}注意：${N}"
+  echo -e "  ${D}• 原节点（您 VPS 原始 IPv6 地址）保持工作，原 URL 仍可用作保底${N}"
+  echo -e "  ${D}• 旧轮换链接已立即失效${N}"
+  echo -e "  ${D}• 新地址是临时绑定，${B}VPS 重启后会消失${N}${D}，需重新轮换${N}"
   echo ""
   return 0
 }
@@ -8755,7 +8799,7 @@ ipv6_rotation_show_current(){
 
   echo ""
   if [ -z "$addr" ]; then
-    echo -e "  ${Y}当前未轮换${N}，节点使用原始地址 ::a 提供服务"
+    echo -e "  ${Y}当前未轮换${N}，节点使用原始 IPv6 地址提供服务"
     echo ""
     return 0
   fi
@@ -8799,7 +8843,7 @@ ipv6_rotation_reset(){
 
   echo ""
   echo -e "  将解绑当前轮换地址：${C}$addr${N}"
-  echo -e "  原始地址 ${C}::a${N} 不受影响"
+  echo -e "  原始 IPv6 地址不受影响（重置后 eth0 上只剩原始地址，原 URL 仍可用）"
   read -p "  确认重置？(y/N): " confirm
   case "$confirm" in
     [yY]|[yY][eE][sS]) ;;
@@ -8817,7 +8861,7 @@ ipv6_rotation_reset(){
     return 2
   fi
 
-  echo -e "  ${G}已重置${N}，节点已回退到原始地址 ::a 提供服务"
+  echo -e "  ${G}已重置${N}，节点已回退到原始 IPv6 地址提供服务"
   return 0
 }
 
@@ -8903,7 +8947,7 @@ ipv6_rotation_with_lock(){
 
 # ─── S8: 菜单挂载（节点管理菜单第 5 项调用此函数） ──────────────
 ipv6_rotation_menu(){
-  local state addr status_label status_color
+  local state addr status_label status_color iface native_addr
   while true; do
     state=$(ipv6_rotation_state_validate 2>/dev/null)
     addr=$(printf '%s' "$state" | jq -r '.current_rotated.address // empty' 2>/dev/null)
@@ -8916,15 +8960,31 @@ ipv6_rotation_menu(){
       status_color="$Y"
     fi
 
+    # 动态探测原节点地址（兼容用户在 VPS 控制面板自定义 IPv6 的情况）
+    iface=$(ipv6_rotation_detect_interface 2>/dev/null)
+    native_addr=$(ipv6_rotation_detect_native_addr "$iface" "$addr" 2>/dev/null)
+    [ -z "$native_addr" ] && native_addr="(未探测到)"
+
     clear
     render_section_header "IPv6 Reality 地址轮换"
     echo -e "  当前状态     : ${status_color}${status_label}${N}"
     if [ -n "$addr" ]; then
       echo -e "  当前轮换地址 : ${C}$addr${N}"
     else
-      echo -e "  当前轮换地址 : ${D}（无，使用原始 ::a）${N}"
+      echo -e "  当前轮换地址 : ${D}（无，使用原始地址）${N}"
     fi
-    echo -e "  原始节点地址 : ${C}::a${N} ${D}(始终保留)${N}"
+    echo -e "  原始节点地址 : ${C}${native_addr}${N} ${D}(始终保留)${N}"
+    render_divider
+    echo -e "  ${B}设计说明（重要，请先看一眼）${N}"
+    echo -e "  ${D}• 原始 IPv6 地址（如上方"原始节点地址"）由 VPS 系统${N}"
+    echo -e "  ${D}  配置自动给（绿云后台），脚本不动它。重启后仍在，${N}"
+    echo -e "  ${D}  作为保底入口（即使您改了原 IP 这里会自动跟随）。${N}"
+    echo -e "  ${D}• 轮换地址是临时绑定（${C}ip -6 addr add${D}），不写配置${N}"
+    echo -e "  ${D}  文件，VPS 重启后会消失，需重新轮换。${N}"
+    echo -e "  ${D}• 轮换中网卡上同时有 ${C}2${D} 条全局 IPv6（原始 + 轮换）${N}"
+    echo -e "  ${D}  是预期设计，不是 bug。${N}"
+    echo -e "  ${D}• 原 URL 永远可用作保底；轮换 URL 在按 ${C}1${D} 重新轮换${N}"
+    echo -e "  ${D}  或按 ${C}3${D} 重置后立即失效。${N}"
     render_divider
     render_menu_item 1 "立即轮换（生成新地址 + 链接）"
     render_menu_item 2 "查看当前轮换地址 + 链接"
@@ -9106,13 +9166,20 @@ _ipv6r_selftest(){
     return 0
   fi
   test_addr=$(ipv6_rotation_compose_addr "$prefix" "$test_host")
-  known_addr="${prefix}:0:0:0:a"
 
-  echo "[24] addr_exists_on_iface 校验已知 ::a (展开后=${known_addr})"
-  if ipv6_rotation_addr_exists_on_iface "$known_addr" "$iface"; then
-    echo "      → ✅ 找到（规范化展开对比成功，能匹配 :: 简写形式）"
+  # 用 detect_native_addr 动态探测原始地址（兼容用户自定义 IP）
+  local known_addr
+  known_addr=$(ipv6_rotation_detect_native_addr "$iface" 2>/dev/null)
+
+  if [ -z "$known_addr" ]; then
+    echo "[24] addr_exists_on_iface 校验原始地址：跳过（未探测到）"
   else
-    echo "      → ❌ 未找到（展开对比逻辑可能有问题）"
+    echo "[24] addr_exists_on_iface 校验原始地址 (展开后=${known_addr})"
+    if ipv6_rotation_addr_exists_on_iface "$known_addr" "$iface"; then
+      echo "      → ✅ 找到（规范化展开对比成功，能匹配 :: 简写形式）"
+    else
+      echo "      → ❌ 未找到（展开对比逻辑可能有问题）"
+    fi
   fi
 
   echo "[25] addr_exists_on_iface 校验未绑定的随机地址应不在"
