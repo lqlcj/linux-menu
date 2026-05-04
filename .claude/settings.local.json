@@ -45,7 +45,8 @@
       "Bash(sed -n '5255,5268p' \"C:/Users/leyili/Desktop/linux-menu/linux-menu/leyili.sh\")",
       "Bash(sed -n '6515,6535p' \"C:/Users/leyili/Desktop/linux-menu/linux-menu/leyili.sh\")",
       "WebFetch(domain:blog.cloudflare.com)",
-      "Bash(git *)"
+      "Bash(git *)",
+      "WebFetch(domain:github.com)"
     ]
   }
 }
