@@ -8241,11 +8241,148 @@ ipv6_rotation_compose_addr(){
   printf '%s:%s' "$prefix" "$host"
 }
 
+# ─── S2: 状态文件 CRUD ────────────────────────────────────────
+# 设计: 仅提供原子读写，不绑死 schema 字段语义（节点字段由 S3 用 jq 改）
+# 鲁棒性: R5 失败回滚、R6 损坏差异化提示、R7 version 字段
+
+# 输出空状态模板（schema v1）
+ipv6_rotation_state_template_json(){
+  cat <<'EOF'
+{
+  "version": 1,
+  "prefix": null,
+  "interface": null,
+  "node_snapshot": null,
+  "current_rotated": null
+}
+EOF
+}
+
+# 确保状态目录存在并加固权限（含 UUID 等敏感数据）
+ipv6_rotation_state_dir_ensure(){
+  local dir
+  dir=$(ipv6_rotation_state_dir)
+  if [ ! -d "$dir" ]; then
+    mkdir -p "$dir" || return 1
+  fi
+  chmod 700 "$dir" 2>/dev/null || true
+  return 0
+}
+
+# 读 state.json
+# 文件不存在 → stdout 输出空模板，返回 0
+# JSON 损坏    → 不输出，返回 1（由 validate 处理修复）
+# 正常         → cat 内容，返回 0
+ipv6_rotation_state_load(){
+  local path
+  path=$(ipv6_rotation_state_path)
+
+  if [ ! -f "$path" ]; then
+    ipv6_rotation_state_template_json
+    return 0
+  fi
+
+  if ! jq -e . "$path" >/dev/null 2>&1; then
+    return 1
+  fi
+
+  cat "$path"
+  return 0
+}
+
+# 校验 + 自动修复
+# 不存在 → 输出模板，返回 0
+# 损坏   → 备份为 state.json.bak.<ts> + 输出模板，返回 2 (R6)
+# 缺关键字段 → 同上
+# 正常   → cat 内容，返回 0
+ipv6_rotation_state_validate(){
+  local path
+  path=$(ipv6_rotation_state_path)
+
+  if [ ! -f "$path" ]; then
+    ipv6_rotation_state_template_json
+    return 0
+  fi
+
+  local needs_repair=0
+  if ! jq -e . "$path" >/dev/null 2>&1; then
+    needs_repair=1
+  else
+    # version 字段必须存在且为数字
+    local v
+    v=$(jq -r 'if (.version | type) == "number" then .version else empty end' "$path" 2>/dev/null)
+    if [ -z "$v" ]; then
+      needs_repair=1
+    fi
+  fi
+
+  if [ "$needs_repair" -eq 1 ]; then
+    local ts backup
+    ts=$(date +%Y%m%d%H%M%S)
+    backup="${path}.bak.${ts}"
+    mv -f "$path" "$backup" 2>/dev/null || true
+    ipv6_rotation_state_template_json
+    return 2
+  fi
+
+  cat "$path"
+  return 0
+}
+
+# 原子写入 state.json
+# stdin: 完整 state JSON
+# 流程: jq 解析校验 → 写 .tmp → 备份现有为 .bak → mv .tmp 到正式 → chmod 600
+ipv6_rotation_state_save(){
+  ipv6_rotation_state_dir_ensure || return 1
+  local path tmp bak
+  path=$(ipv6_rotation_state_path)
+  tmp="${path}.tmp"
+  bak="${path}.bak"
+
+  # jq 既校验也美化输出（同时阻止把垃圾内容写盘）
+  if ! jq . > "$tmp" 2>/dev/null; then
+    rm -f "$tmp"
+    return 1
+  fi
+
+  if [ -f "$path" ]; then
+    cp -f "$path" "$bak" 2>/dev/null || true
+  fi
+
+  if ! mv -f "$tmp" "$path"; then
+    rm -f "$tmp"
+    return 1
+  fi
+
+  chmod 600 "$path" 2>/dev/null || true
+  return 0
+}
+
+# 幂等初始化：仅写入/刷新 prefix + interface 元数据
+# 不触碰 node_snapshot / current_rotated（避免覆盖正在用的轮换）
+# 输入: prefix iface
+ipv6_rotation_state_init(){
+  local prefix="$1" iface="$2"
+  if [ -z "$prefix" ] || [ -z "$iface" ]; then
+    return 1
+  fi
+
+  local current
+  current=$(ipv6_rotation_state_validate)
+  # validate 返回 2 (损坏并重建) 也算 ok，current 此时是模板
+
+  printf '%s' "$current" \
+    | jq --arg prefix "$prefix" --arg iface "$iface" \
+        '.prefix = $prefix | .interface = $iface' \
+    | ipv6_rotation_state_save
+}
+
 # ─── 自检入口：dry-run 打印各底层函数输出 ──────────────────────
 # 用法: bash leyili.sh _ipv6r_selftest
 # 不挂载到菜单，仅用于开发期手动验证
 _ipv6r_selftest(){
   local iface prefix host addr
+  echo "=== S1: 底层工具函数 ==="
   echo "[1] state_dir  = $(ipv6_rotation_state_dir)"
   echo "[2] state_path = $(ipv6_rotation_state_path)"
   echo "[3] expand_ipv6 2a12:a304:4:9b8::a   = $(ipv6_rotation_expand_ipv6 '2a12:a304:4:9b8::a')"
@@ -8263,6 +8400,82 @@ _ipv6r_selftest(){
     addr=$(ipv6_rotation_compose_addr "$prefix" "$host")
     echo "[11] compose_addr    = $addr"
   fi
+
+  echo ""
+  echo "=== S2: 状态文件 CRUD ==="
+  if ! command -v jq >/dev/null 2>&1; then
+    echo "[S2] jq 未安装，S2 测试跳过（apt install jq 后重跑）"
+    return 0
+  fi
+  if [ "$prefix" = "(未探到)" ] || [ "$iface" = "(未探到)" ]; then
+    echo "[S2] prefix/iface 缺失，S2 测试跳过"
+    return 0
+  fi
+
+  local sample_path saved_before=0
+  sample_path=$(ipv6_rotation_state_path)
+
+  # 备份用户已有 state（测试结束恢复，避免污染本机）
+  if [ -f "$sample_path" ]; then
+    cp -f "$sample_path" "${sample_path}.selftest.before" 2>/dev/null && saved_before=1
+    rm -f "$sample_path" "${sample_path}.bak"
+  fi
+  rm -f "${sample_path}.bak."* 2>/dev/null || true
+
+  echo "[12] state_load (文件不存在) →"
+  ipv6_rotation_state_load | jq -c . | sed 's/^/      /'
+
+  echo "[13] state_init prefix=$prefix iface=$iface"
+  if ipv6_rotation_state_init "$prefix" "$iface"; then
+    echo "      → 成功，文件内容："
+    cat "$sample_path" | jq -c . | sed 's/^/      /'
+  else
+    echo "      → 失败"
+  fi
+
+  echo "[14] state_load (文件存在) →"
+  ipv6_rotation_state_load | jq -c '{version, prefix, interface}' | sed 's/^/      /'
+
+  echo "[15] 幂等性: 再次调 state_init 同参数"
+  ipv6_rotation_state_init "$prefix" "$iface" && echo "      → 成功（应不报错）"
+
+  echo "[16] state_validate (人为损坏 → 自动备份重建)"
+  echo "garbage}{(}~~~" > "$sample_path"
+  local out rc bak_count
+  out=$(ipv6_rotation_state_validate)
+  rc=$?
+  echo "      返回码: $rc (期望 2)"
+  echo "      恢复输出: $(printf '%s' "$out" | jq -c .)"
+  bak_count=$(ls -1 "${sample_path}.bak."* 2>/dev/null | wc -l)
+  echo "      .bak.<ts> 备份文件数: $bak_count (期望 ≥1)"
+
+  echo "[17] state_validate (缺 version 字段)"
+  echo '{"foo":"bar"}' > "$sample_path"
+  out=$(ipv6_rotation_state_validate)
+  rc=$?
+  echo "      返回码: $rc (期望 2)"
+
+  echo "[18] state_save (写非法 JSON 应失败)"
+  if echo "not-json" | ipv6_rotation_state_save; then
+    echo "      → 异常：竟然成功了（应失败）"
+  else
+    echo "      → 正确拒绝非法 JSON"
+  fi
+
+  echo "[19] 文件权限校验"
+  ipv6_rotation_state_template_json | ipv6_rotation_state_save
+  local mode_dir mode_file
+  mode_dir=$(stat -c '%a' "$(ipv6_rotation_state_dir)" 2>/dev/null)
+  mode_file=$(stat -c '%a' "$sample_path" 2>/dev/null)
+  echo "      目录权限: $mode_dir (期望 700)"
+  echo "      文件权限: $mode_file (期望 600)"
+
+  # 测试结束清理
+  rm -f "$sample_path" "${sample_path}.bak" "${sample_path}.bak."* 2>/dev/null || true
+  if [ "$saved_before" -eq 1 ]; then
+    mv -f "${sample_path}.selftest.before" "$sample_path" 2>/dev/null || true
+  fi
+  echo "[20] 测试后清理完成（已恢复原 state，如有）"
 }
 
 show_menu(){
