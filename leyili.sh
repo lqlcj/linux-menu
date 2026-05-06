@@ -9,7 +9,6 @@ CONFIG_PATH="/etc/sing-box/config.json"
 INFO_PATH="/root/proxy-info.txt"
 NODES_DIR="/etc/sing-box/nodes"
 CERTS_DIR="/etc/sing-box/certs"
-CHAINS_DIR="/etc/sing-box/chains"
 APP_NAME="Leyili"
 COMMAND_NAME="sb"
 SCRIPT_PATH="/usr/local/bin/${COMMAND_NAME}"
@@ -22,6 +21,12 @@ SWAP_SIZE="2G"
 SWAP_SIZE_MB="2048"
 SWAP_SYSCTL_PATH="/etc/sysctl.d/99-swap-tuning.conf"
 SWAPPINESS_VALUE="10"
+
+REALM_BIN_PATH="/usr/local/bin/realm-bin"
+REALM_CONFIG_DIR="/etc/realm"
+REALM_CONFIG_PATH="/etc/realm/config.toml"
+REALM_SERVICE_PATH="/etc/systemd/system/realm.service"
+REALM_DOWNLOAD_BASE="https://github.com/zhboner/realm/releases/latest/download"
 SYSTEM_TIMEZONE="Asia/Shanghai"
 BASIC_TOOLS_PACKAGES="curl wget git vim htop unzip net-tools"
 SSHD_CONFIG_PATH="/etc/ssh/sshd_config"
@@ -1574,87 +1579,6 @@ config_remove_outbound_by_tag(){
   mv "$tmp" "$CONFIG_PATH"
 }
 
-# 把 inbound -> outbound 的 route 规则替换或追加
-config_set_inbound_chain(){
-  local inbound_tag="$1" outbound_tag="$2"
-  ensure_jq || return 1
-  config_ensure_skeleton || return 1
-  local tmp
-  tmp=$(mktemp)
-  if ! jq --arg ib "$inbound_tag" --arg ob "$outbound_tag" '
-    .route = (.route // {rules: [], final: "direct-out"})
-    | .route.rules = (
-        ((.route.rules // []) | map(
-          if (.inbound // []) | type == "array" and (. | index($ib))
-          then empty else . end
-        ))
-        + [{inbound: [$ib], outbound: $ob}]
-      )
-  ' "$CONFIG_PATH" > "$tmp" 2>/dev/null; then
-    rm -f "$tmp"
-    return 1
-  fi
-  mv "$tmp" "$CONFIG_PATH"
-}
-
-# 删除某 inbound 对应的所有 route 规则（恢复到走 final=direct-out）
-config_remove_inbound_chain(){
-  local inbound_tag="$1"
-  ensure_jq || return 1
-  [ -f "$CONFIG_PATH" ] || return 0
-  local tmp
-  tmp=$(mktemp)
-  if ! jq --arg ib "$inbound_tag" '
-    .route = (.route // {rules: [], final: "direct-out"})
-    | .route.rules = (
-        (.route.rules // []) | map(
-          if ((.inbound // []) | type == "array" and (. | index($ib)))
-          then empty else . end
-        )
-      )
-  ' "$CONFIG_PATH" > "$tmp" 2>/dev/null; then
-    rm -f "$tmp"
-    return 1
-  fi
-  mv "$tmp" "$CONFIG_PATH"
-}
-
-# 查询某 inbound 当前的出站 tag（没规则返回空）
-config_get_inbound_outbound(){
-  local inbound_tag="$1"
-  ensure_jq || return 1
-  [ -f "$CONFIG_PATH" ] || return 1
-  jq -r --arg ib "$inbound_tag" '
-    (.route.rules // [])
-    | map(select((.inbound // []) | type == "array" and (. | index($ib))))
-    | (.[0].outbound // "")
-  ' "$CONFIG_PATH" 2>/dev/null
-}
-
-# ─── chain.info 存储 ─────────────────────────────────
-ensure_chains_dir(){
-  mkdir -p "$CHAINS_DIR" 2>/dev/null || true
-}
-
-chain_info_path(){
-  printf '%s' "$CHAINS_DIR/$1.info"
-}
-
-chain_installed(){
-  [ -f "$(chain_info_path "$1")" ]
-}
-
-get_chain_value(){
-  local type="$1" key="$2" f
-  f=$(chain_info_path "$type")
-  [ -f "$f" ] || return 1
-  grep -m1 "^${key}=" "$f" | cut -d= -f2-
-}
-
-remove_chain_info(){
-  rm -f "$(chain_info_path "$1")"
-}
-
 config_check_and_restart(){
   if ! sing-box check -c "$CONFIG_PATH"; then
     return 1
@@ -1968,296 +1892,6 @@ build_hy2_link(){
     "$password" "$server_part" "$query" "$tag"
 }
 
-# ─── 链接解析（中转机用） ───────────────────────────
-url_decode(){
-  local data="${1//+/ }"
-  printf '%b' "${data//%/\\x}"
-}
-
-# 把 URL query 串拆成 KEY=VALUE 行（已 url-decode）
-parse_query_string(){
-  local q="$1" pair k v
-  local -a pairs=()
-  IFS='&' read -ra pairs <<<"$q"
-  for pair in "${pairs[@]}"; do
-    k="${pair%%=*}"
-    v="${pair#*=}"
-    [ -z "$k" ] && continue
-    printf '%s=%s\n' "$k" "$(url_decode "$v")"
-  done
-}
-
-# 输入：vless:// 或 hysteria2:// 或 anytls:// 链接
-# 输出：KEY=VALUE 行（Type / Host / Port / Tag 是通用字段，其余协议特有）
-parse_node_link(){
-  local url="$1"
-  if [ -z "$url" ]; then return 1; fi
-
-  local proto rest userinfo hostport query frag host port
-  case "$url" in
-    vless://*)
-      proto="vless"
-      rest="${url#vless://}"
-      ;;
-    hysteria2://*)
-      proto="hy2"
-      rest="${url#hysteria2://}"
-      ;;
-    hy2://*)
-      proto="hy2"
-      rest="${url#hy2://}"
-      ;;
-    anytls://*)
-      proto="anytls"
-      rest="${url#anytls://}"
-      ;;
-    *)
-      return 1
-      ;;
-  esac
-
-  # 拆 #fragment
-  if [[ "$rest" == *"#"* ]]; then
-    frag="${rest#*#}"
-    rest="${rest%%#*}"
-    frag=$(url_decode "$frag")
-  fi
-  # 拆 ?query
-  if [[ "$rest" == *"?"* ]]; then
-    query="${rest#*\?}"
-    rest="${rest%%\?*}"
-  fi
-  # 切除可能的路径段（如 anytls://pwd@host:port/  这种带斜杠的标准形式）
-  if [[ "$rest" == */* ]]; then
-    rest="${rest%%/*}"
-  fi
-  # 拆 user@host:port
-  if [[ "$rest" == *"@"* ]]; then
-    userinfo="${rest%@*}"
-    hostport="${rest##*@}"
-    userinfo=$(url_decode "$userinfo")
-  else
-    hostport="$rest"
-  fi
-  # 拆 host:port，IPv6 用 [host]:port
-  case "$hostport" in
-    \[*\]:*)
-      host="${hostport#\[}"
-      host="${host%%\]:*}"
-      port="${hostport##*\]:}"
-      ;;
-    *:*)
-      host="${hostport%:*}"
-      port="${hostport##*:}"
-      ;;
-    *)
-      host="$hostport"
-      port=""
-      ;;
-  esac
-
-  if [ -z "$host" ] || [ -z "$port" ]; then
-    return 1
-  fi
-  if ! [[ "$port" =~ ^[0-9]+$ ]]; then
-    return 1
-  fi
-
-  # 通用输出
-  printf 'Tag=%s\n' "${frag:-target}"
-  printf 'Host=%s\n' "$host"
-  printf 'Port=%s\n' "$port"
-
-  if [ "$proto" = "vless" ]; then
-    printf 'Type=reality\n'
-    printf 'UUID=%s\n' "$userinfo"
-    # 解析 query
-    local kv
-    while IFS= read -r kv; do
-      [ -z "$kv" ] && continue
-      local k="${kv%%=*}" v="${kv#*=}"
-      case "$k" in
-        sni)        printf 'SNI=%s\n' "$v" ;;
-        pbk)        printf 'PublicKey=%s\n' "$v" ;;
-        sid)        printf 'ShortID=%s\n' "$v" ;;
-        flow)       printf 'Flow=%s\n' "$v" ;;
-        security)   printf 'Security=%s\n' "$v" ;;
-        type)       printf 'Network=%s\n' "$v" ;;
-        fp)         printf 'Fingerprint=%s\n' "$v" ;;
-      esac
-    done < <(parse_query_string "${query:-}")
-  elif [ "$proto" = "anytls" ]; then
-    printf 'Type=anytls\n'
-    printf 'Password=%s\n' "$userinfo"
-    local kv
-    while IFS= read -r kv; do
-      [ -z "$kv" ] && continue
-      local k="${kv%%=*}" v="${kv#*=}"
-      case "$k" in
-        sni)        printf 'SNI=%s\n' "$v" ;;
-        pbk)        printf 'PublicKey=%s\n' "$v" ;;
-        sid)        printf 'ShortID=%s\n' "$v" ;;
-        security)   printf 'Security=%s\n' "$v" ;;
-        fp)         printf 'Fingerprint=%s\n' "$v" ;;
-        insecure)   printf 'Insecure=%s\n' "$v" ;;
-      esac
-    done < <(parse_query_string "${query:-}")
-  else
-    printf 'Type=hy2\n'
-    printf 'Password=%s\n' "$userinfo"
-    local kv
-    while IFS= read -r kv; do
-      [ -z "$kv" ] && continue
-      local k="${kv%%=*}" v="${kv#*=}"
-      case "$k" in
-        sni)            printf 'SNI=%s\n' "$v" ;;
-        insecure)       printf 'Insecure=%s\n' "$v" ;;
-        obfs)           printf 'Obfs=%s\n' "$v" ;;
-        obfs-password)  printf 'ObfsPassword=%s\n' "$v" ;;
-      esac
-    done < <(parse_query_string "${query:-}")
-  fi
-
-  return 0
-}
-
-# 用解析出的字段（KEY=VALUE 行）+ 期望的 outbound tag，组装一个 sing-box outbound 对象 (JSON)。
-# 用法：build_chain_outbound_from_link <link> <outbound_tag>
-build_chain_outbound_from_link(){
-  local link="$1" outbound_tag="$2"
-  local fields type host port sni
-  fields=$(parse_node_link "$link") || return 1
-
-  type=$(printf '%s\n' "$fields" | sed -n 's/^Type=//p' | head -1)
-  host=$(printf '%s\n' "$fields" | sed -n 's/^Host=//p' | head -1)
-  port=$(printf '%s\n' "$fields" | sed -n 's/^Port=//p' | head -1)
-  sni=$(printf '%s\n' "$fields" | sed -n 's/^SNI=//p' | head -1)
-
-  if [ -z "$type" ] || [ -z "$host" ] || [ -z "$port" ]; then
-    return 1
-  fi
-
-  ensure_jq || return 1
-
-  case "$type" in
-    reality)
-      local uuid pubk sid flow
-      uuid=$(printf '%s\n' "$fields" | sed -n 's/^UUID=//p' | head -1)
-      pubk=$(printf '%s\n' "$fields" | sed -n 's/^PublicKey=//p' | head -1)
-      sid=$(printf '%s\n' "$fields" | sed -n 's/^ShortID=//p' | head -1)
-      flow=$(printf '%s\n' "$fields" | sed -n 's/^Flow=//p' | head -1)
-      flow="${flow:-xtls-rprx-vision}"
-      if [ -z "$uuid" ] || [ -z "$pubk" ] || [ -z "$sid" ] || [ -z "$sni" ]; then
-        return 1
-      fi
-      jq -n \
-        --arg tag "$outbound_tag" \
-        --arg server "$host" \
-        --argjson port "$port" \
-        --arg uuid "$uuid" \
-        --arg flow "$flow" \
-        --arg sni "$sni" \
-        --arg pbk "$pubk" \
-        --arg sid "$sid" '
-        {
-          type: "vless",
-          tag: $tag,
-          server: $server,
-          server_port: $port,
-          uuid: $uuid,
-          flow: $flow,
-          domain_strategy: "ipv4_only",
-          tls: {
-            enabled: true,
-            server_name: $sni,
-            utls: {enabled: true, fingerprint: "chrome"},
-            reality: {
-              enabled: true,
-              public_key: $pbk,
-              short_id: $sid
-            }
-          }
-        }'
-      ;;
-    hy2)
-      local password insecure obfs obfs_pw
-      password=$(printf '%s\n' "$fields" | sed -n 's/^Password=//p' | head -1)
-      insecure=$(printf '%s\n' "$fields" | sed -n 's/^Insecure=//p' | head -1)
-      insecure="${insecure:-0}"
-      obfs=$(printf '%s\n' "$fields" | sed -n 's/^Obfs=//p' | head -1)
-      obfs_pw=$(printf '%s\n' "$fields" | sed -n 's/^ObfsPassword=//p' | head -1)
-      if [ -z "$password" ] || [ -z "$sni" ]; then
-        return 1
-      fi
-      local insecure_bool="false"
-      [ "$insecure" = "1" ] && insecure_bool="true"
-      local obfs_json="null"
-      if [ -n "$obfs" ] && [ "$obfs" != "none" ] && [ -n "$obfs_pw" ]; then
-        obfs_json=$(jq -n --arg t "$obfs" --arg p "$obfs_pw" '{type: $t, password: $p}')
-      fi
-      jq -n \
-        --arg tag "$outbound_tag" \
-        --arg server "$host" \
-        --argjson port "$port" \
-        --arg password "$password" \
-        --arg sni "$sni" \
-        --argjson insecure "$insecure_bool" \
-        --argjson obfs "$obfs_json" '
-        ({
-          type: "hysteria2",
-          tag: $tag,
-          server: $server,
-          server_port: $port,
-          password: $password,
-          domain_strategy: "ipv4_only",
-          tls: {
-            enabled: true,
-            server_name: $sni,
-            insecure: $insecure,
-            alpn: ["h3"]
-          }
-        }) + (if $obfs == null then {} else {obfs: $obfs} end)'
-      ;;
-    anytls)
-      local password pubk sid
-      password=$(printf '%s\n' "$fields" | sed -n 's/^Password=//p' | head -1)
-      pubk=$(printf '%s\n' "$fields" | sed -n 's/^PublicKey=//p' | head -1)
-      sid=$(printf '%s\n' "$fields" | sed -n 's/^ShortID=//p' | head -1)
-      if [ -z "$password" ] || [ -z "$pubk" ] || [ -z "$sid" ] || [ -z "$sni" ]; then
-        return 1
-      fi
-      jq -n \
-        --arg tag "$outbound_tag" \
-        --arg server "$host" \
-        --argjson port "$port" \
-        --arg password "$password" \
-        --arg sni "$sni" \
-        --arg pbk "$pubk" \
-        --arg sid "$sid" '
-        {
-          type: "anytls",
-          tag: $tag,
-          server: $server,
-          server_port: $port,
-          password: $password,
-          domain_strategy: "ipv4_only",
-          tls: {
-            enabled: true,
-            server_name: $sni,
-            utls: {enabled: true, fingerprint: "chrome"},
-            reality: {
-              enabled: true,
-              public_key: $pbk,
-              short_id: $sid
-            }
-          }
-        }'
-      ;;
-    *)
-      return 1
-      ;;
-  esac
-}
 
 # 由节点 info 文件构造链接（dispatcher）
 build_link_for_node(){
@@ -5763,10 +5397,7 @@ uninstall_reality_node(){
   fi
 
   config_remove_inbound_by_tag "reality-in" || true
-  config_remove_inbound_chain "reality-in" || true
-  config_remove_outbound_by_tag "chain-reality-out" || true
   remove_node_info reality
-  remove_chain_info reality
   post_uninstall_service_step
   echo -e "${G}Reality 节点已卸载${N}"
   pause_screen
@@ -6464,10 +6095,7 @@ uninstall_hy2_node(){
   fi
 
   config_remove_inbound_by_tag "hy2-in" || true
-  config_remove_inbound_chain "hy2-in" || true
-  config_remove_outbound_by_tag "chain-hy2-out" || true
   remove_node_info hy2
-  remove_chain_info hy2
   rm -f "$CERTS_DIR/hy2.crt" "$CERTS_DIR/hy2.key" 2>/dev/null || true
   post_uninstall_service_step
   echo -e "${G}Hysteria2 节点已卸载${N}"
@@ -7140,10 +6768,7 @@ uninstall_anytls_node(){
   fi
 
   config_remove_inbound_by_tag "anytls-in" || true
-  config_remove_inbound_chain "anytls-in" || true
-  config_remove_outbound_by_tag "chain-anytls-out" || true
   remove_node_info anytls
-  remove_chain_info anytls
   post_uninstall_service_step
   echo -e "${G}AnyTLS 节点已卸载${N}"
   pause_screen
@@ -7355,6 +6980,9 @@ uninstall_script_completely(){
   echo -e "  ${R}此操作将清除以下内容（不可恢复）：${N}"
   echo -e "    ${L}·${N} 所有 sing-box 节点（Reality / Hysteria2 / AnyTLS）及其防火墙端口"
   echo -e "    ${L}·${N} sing-box 服务、软件包与 ${C}/etc/sing-box${N} 整个目录"
+  if realm_is_installed; then
+    echo -e "    ${L}·${N} Realm 中转服务、所有转发规则与 ${C}${REALM_CONFIG_DIR}${N} 目录"
+  fi
   echo -e "    ${L}·${N} ${C}${INFO_PATH}${N} 与 ${C}${SCRIPT_PATH}${N}"
   echo ""
   echo -e "  ${D}保留：SSH 配置 / 用户账户 / sudoers / 自动更新 / IPv6 防火墙规则 / 1Panel${N}"
@@ -7434,7 +7062,13 @@ uninstall_script_completely(){
   rm -f "$SAGERNET_SOURCES" "$SAGERNET_KEYRING"
   DEBIAN_FRONTEND=noninteractive apt-get update -qq >/dev/null 2>&1 || true
 
-  # 3. 脚本痕迹
+  # 3. Realm 中转（如已装）
+  if realm_is_installed; then
+    echo -e "${Y}==> 卸载 Realm 中转服务...${N}"
+    realm_uninstall >/dev/null 2>&1 || true
+  fi
+
+  # 4. 脚本痕迹
   echo -e "${Y}==> 清理脚本本体与 legacy 信息文件...${N}"
   rm -f "$INFO_PATH"
   rm -f "$SCRIPT_PATH"
@@ -7542,18 +7176,12 @@ render_node_card_block(){
   [ "$gap" -lt 1 ] && gap=1
   gap_str=$(printf '%*s' "$gap" '')
 
-  # 附加信息：HY2 端口跳跃 / 链式中转
+  # 附加信息：HY2 端口跳跃
   local extra=""
   if [ "$type" = "hy2" ]; then
     local hop_v
     hop_v=$(get_node_value "$type" PortHop 2>/dev/null || echo 0)
     [ "$hop_v" = "1" ] && extra="  ${C}+hop${N}"
-  fi
-  if chain_installed "$type"; then
-    local target_host target_port
-    target_host=$(get_chain_value "$type" TargetHost 2>/dev/null || true)
-    target_port=$(get_chain_value "$type" TargetPort 2>/dev/null || true)
-    extra="${extra}  ${Y}↳中转→${target_host:-?}:${target_port:-?}${N}"
   fi
 
   # 第一行：协议名 + 已安装 + :端口 + IP + 附加
@@ -7640,6 +7268,24 @@ render_initcwnd_card_line(){
 }
 
 # 主菜单卡片：标题栏 + 协议块 + 系统调优行
+render_realm_card_line(){
+  local label="Realm 中转 "  # 11 可见列
+  if ! realm_is_installed; then
+    return  # 未安装时不显示这一行（保持卡片简洁）
+  fi
+  local ver status status_str count
+  ver=$(realm_get_version 2>/dev/null)
+  [ -z "$ver" ] && ver="?"
+  status=$(systemctl is-active realm 2>/dev/null || echo "未知")
+  if [ "$status" = "active" ]; then
+    status_str="${G}运行中${N}"
+  else
+    status_str="${R}${status}${N}"
+  fi
+  count=$(realm_count_rules 2>/dev/null || echo 0)
+  render_card_line "   ${C}${label}${N}${G}已安装${N} ${D}·${N} ${C}v${ver}${N} ${D}·${N} ${status_str} ${D}·${N} ${C}${count}${N} ${D}条规则${N}"
+}
+
 render_main_menu_card(){
   local ver status status_str title
   if is_singbox_installed; then
@@ -7666,6 +7312,7 @@ render_main_menu_card(){
   render_card_blank
   render_tcp_card_line
   render_initcwnd_card_line
+  render_realm_card_line
   render_card_blank
   render_card_bottom
 }
@@ -7769,8 +7416,7 @@ show_node_manage_menu(){
     render_menu_item 1 "创建节点 (Reality / Hysteria2 / AnyTLS)"
     render_menu_item 2 "卸载单个节点"
     render_menu_item 3 "升级 sing-box 内核"
-    render_menu_item 4 "链式代理设置 (中转机)"
-    render_menu_item 5 "IPv6 Reality 地址轮换"
+    render_menu_item 4 "IPv6 Reality 地址轮换"
     render_menu_item 0 "返回上级"
     render_divider
     read -p "  请输入序号: " choice
@@ -7778,320 +7424,584 @@ show_node_manage_menu(){
       1) show_node_install_menu ;;
       2) show_node_uninstall_menu ;;
       3) upgrade_singbox_kernel ;;
-      4) show_chain_menu ;;
-      5) ipv6_rotation_menu ;;
+      4) ipv6_rotation_menu ;;
       0) return ;;
       *) notify_invalid_choice ;;
     esac
   done
 }
 
-# ─── 链式代理（中转机） ──────────────────────────────
-inbound_tag_for_type(){
-  case "$1" in
-    reality) printf 'reality-in' ;;
-    hy2)     printf 'hy2-in' ;;
-    anytls)  printf 'anytls-in' ;;
-    *)       return 1 ;;
+# ═══════════════════════════════════════════════════════════════════════
+# Realm 中转管理模块
+# ─────────────────────────────────────────────────────────────────────
+# 用途   : 在中转机上跑纯端口转发（透传，不解密），把流量原样送到落地机
+# 二进制 : zhboner/realm（Rust 实现，支持 TCP+UDP）
+# 配置   : /etc/realm/config.toml ，TOML 格式，[[endpoints]] 数组
+# 服务   : realm.service（独立 systemd unit，与 sing-box 互不干扰）
+# 边界   : 不做加密隧道 / 负载均衡 / 端口段转发；这些进阶功能请用 realm-xwPF
+# 适用   : 客户端 → 中转机(realm) → 落地机(sing-box) → 互联网
+#          客户端 SNI/UUID/pbk 全部用落地机的，realm 不参与加密握手
+# ═══════════════════════════════════════════════════════════════════════
+
+# ─── 底层探测 ─────────────────────────────────────────
+realm_is_installed(){
+  [ -x "$REALM_BIN_PATH" ] && [ -f "$REALM_SERVICE_PATH" ]
+}
+
+realm_detect_arch(){
+  local m
+  m=$(uname -m 2>/dev/null || echo unknown)
+  case "$m" in
+    x86_64|amd64)   printf 'x86_64' ;;
+    aarch64|arm64)  printf 'aarch64' ;;
+    *)              return 1 ;;
   esac
 }
 
-# 返回 "直连" / "中转→host:port (type)" / 空（节点不存在）
-chain_describe(){
-  local type="$1"
-  if ! node_installed "$type"; then
-    printf ''
-    return
+realm_get_version(){
+  if [ -x "$REALM_BIN_PATH" ]; then
+    "$REALM_BIN_PATH" -v 2>/dev/null | head -1 | awk '{print $2}'
   fi
-  if ! chain_installed "$type"; then
-    printf '直连'
-    return
-  fi
-  local target_host target_port target_type
-  target_host=$(get_chain_value "$type" TargetHost)
-  target_port=$(get_chain_value "$type" TargetPort)
-  target_type=$(get_chain_value "$type" TargetType)
-  printf '中转→%s:%s (%s)' "${target_host:-?}" "${target_port:-?}" "${target_type:-?}"
 }
 
-# 配置中转：解析链接 → 写 chain.info → 加 outbound → 加路由规则 → 重启
-chain_set(){
-  local inbound_type="$1" link="$2"
-  local inbound_tag outbound_tag
-  inbound_tag=$(inbound_tag_for_type "$inbound_type") || return 1
-  outbound_tag="chain-${inbound_type}-out"
+# 主菜单卡用：返回一行简短状态字符串（已含 ANSI 颜色）
+realm_status_str(){
+  local ver status status_str count
+  if ! realm_is_installed; then
+    return 1
+  fi
+  ver=$(realm_get_version 2>/dev/null)
+  [ -z "$ver" ] && ver="?"
+  status=$(systemctl is-active realm 2>/dev/null || echo unknown)
+  if [ "$status" = "active" ]; then
+    status_str="${G}运行中${N}"
+  else
+    status_str="${R}${status}${N}"
+  fi
+  count=$(realm_count_rules 2>/dev/null || echo 0)
+  printf 'Realm 中转  · v%s · %s · %s 条规则' "$ver" "$status_str" "$count"
+}
 
-  if ! node_installed "$inbound_type"; then
-    echo -e "${R}本机未安装 ${inbound_type} 入站节点${N}"
+require_realm_installed(){
+  if realm_is_installed; then
+    return 0
+  fi
+  echo ""
+  echo -e "${Y}realm 尚未安装，请先在本菜单选择"安装 Realm"${N}"
+  pause_screen
+  return 1
+}
+
+# ─── TOML 操作（纯 awk，不引入新依赖） ─────────────────
+# config.toml 结构：
+#   [network]          ← 全局，恒在
+#   no_tcp = false
+#   use_udp = true
+#
+#   [[endpoints]]      ← 第 1 条规则
+#   listen = "[::]:6666"
+#   remote = "1.2.3.4:443"
+#
+#   [[endpoints]]      ← 第 2 条规则
+#   ...
+
+realm_count_rules(){
+  [ -f "$REALM_CONFIG_PATH" ] || { echo 0; return 0; }
+  grep -c '^\[\[endpoints\]\]' "$REALM_CONFIG_PATH" 2>/dev/null || echo 0
+}
+
+# 列出所有规则，输出: "INDEX|LISTEN|REMOTE"，从 1 开始
+realm_list_rules(){
+  [ -f "$REALM_CONFIG_PATH" ] || return 0
+  awk '
+    BEGIN { idx = 0; listen = ""; remote = "" }
+    /^\[\[endpoints\]\]/ {
+      if (idx > 0) printf "%d|%s|%s\n", idx, listen, remote
+      idx++
+      listen = ""; remote = ""
+      next
+    }
+    /^[[:space:]]*listen[[:space:]]*=/ {
+      sub(/^[^=]*=[[:space:]]*/, ""); gsub(/"/, ""); listen = $0
+    }
+    /^[[:space:]]*remote[[:space:]]*=/ {
+      sub(/^[^=]*=[[:space:]]*/, ""); gsub(/"/, ""); remote = $0
+    }
+    END {
+      if (idx > 0) printf "%d|%s|%s\n", idx, listen, remote
+    }
+  ' "$REALM_CONFIG_PATH"
+}
+
+# 写 [network] 骨架（首次安装时调用）
+realm_config_skeleton(){
+  mkdir -p "$REALM_CONFIG_DIR"
+  if [ ! -f "$REALM_CONFIG_PATH" ]; then
+    cat > "$REALM_CONFIG_PATH" <<'EOF'
+[network]
+no_tcp = false
+use_udp = true
+EOF
+  fi
+}
+
+# realm_add_rule <listen_str> <remote_ip> <remote_port>
+# listen_str: "[::]:6666" 或 "0.0.0.0:6666"
+realm_add_rule(){
+  local listen="$1" remote_ip="$2" remote_port="$3"
+  realm_config_skeleton
+  cat >> "$REALM_CONFIG_PATH" <<EOF
+
+[[endpoints]]
+listen = "${listen}"
+remote = "${remote_ip}:${remote_port}"
+EOF
+}
+
+# realm_delete_rule <index>  (1-based)
+realm_delete_rule(){
+  local target="$1"
+  case "$target" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  [ -f "$REALM_CONFIG_PATH" ] || return 1
+
+  local backup_path tmp
+  backup_path="${REALM_CONFIG_PATH}.bak.$(date +%Y%m%d%H%M%S)"
+  cp "$REALM_CONFIG_PATH" "$backup_path" 2>/dev/null || true
+  tmp=$(mktemp)
+
+  if ! awk -v target="$target" '
+    BEGIN { idx = 0; skip = 0 }
+    /^\[\[endpoints\]\]/ {
+      idx++
+      if (idx == target) { skip = 1; next }
+      skip = 0
+      print
+      next
+    }
+    /^\[/ {                # 进入新顶级表 → 退出 skip 状态
+      skip = 0
+      print
+      next
+    }
+    {
+      if (skip) next
+      print
+    }
+  ' "$REALM_CONFIG_PATH" > "$tmp"; then
+    rm -f "$tmp"
+    cp "$backup_path" "$REALM_CONFIG_PATH" 2>/dev/null || true
     return 1
   fi
 
-  ensure_jq || return 1
+  mv "$tmp" "$REALM_CONFIG_PATH"
+  cleanup_old_backups "${REALM_CONFIG_PATH}.bak.*" 5 2>/dev/null || true
+  return 0
+}
 
-  # 先解析链接，校验有效
-  local fields target_type target_host target_port target_sni
-  fields=$(parse_node_link "$link") || {
-    echo -e "${R}无法解析链接，请检查格式${N}"
+# 清空所有规则，保留 [network]
+realm_clear_rules(){
+  local backup_path
+  backup_path="${REALM_CONFIG_PATH}.bak.$(date +%Y%m%d%H%M%S)"
+  cp "$REALM_CONFIG_PATH" "$backup_path" 2>/dev/null || true
+  cat > "$REALM_CONFIG_PATH" <<'EOF'
+[network]
+no_tcp = false
+use_udp = true
+EOF
+  cleanup_old_backups "${REALM_CONFIG_PATH}.bak.*" 5 2>/dev/null || true
+}
+
+# ─── 安装 / 卸载 ──────────────────────────────────────
+realm_install(){
+  if ! require_root; then return 1; fi
+
+  if realm_is_installed; then
+    echo -e "${Y}realm 已经安装。如需升级请先卸载再装${N}"
+    return 0
+  fi
+
+  local arch download_url tmpdir tarball
+  arch=$(realm_detect_arch) || {
+    echo -e "${R}不支持的 CPU 架构: $(uname -m)${N}"
     return 1
   }
-  target_type=$(printf '%s\n' "$fields" | sed -n 's/^Type=//p' | head -1)
-  target_host=$(printf '%s\n' "$fields" | sed -n 's/^Host=//p' | head -1)
-  target_port=$(printf '%s\n' "$fields" | sed -n 's/^Port=//p' | head -1)
-  target_sni=$(printf '%s\n' "$fields" | sed -n 's/^SNI=//p' | head -1)
+  download_url="${REALM_DOWNLOAD_BASE}/realm-${arch}-unknown-linux-gnu.tar.gz"
 
-  if [ -z "$target_type" ] || [ -z "$target_host" ] || [ -z "$target_port" ]; then
-    echo -e "${R}链接缺少必要字段${N}"
+  echo -e "${Y}==> 准备依赖（curl / tar）...${N}"
+  if ! command -v curl >/dev/null 2>&1 || ! command -v tar >/dev/null 2>&1; then
+    DEBIAN_FRONTEND=noninteractive apt-get update -qq >/dev/null 2>&1 || true
+    DEBIAN_FRONTEND=noninteractive apt-get install -y curl tar >/dev/null 2>&1 || {
+      echo -e "${R}curl / tar 安装失败，请手动安装后重试${N}"
+      return 1
+    }
+  fi
+
+  tmpdir=$(mktemp -d)
+  tarball="${tmpdir}/realm.tar.gz"
+
+  echo -e "${Y}==> 下载 realm (${arch})...${N}"
+  echo -e "  ${D}${download_url}${N}"
+  if ! curl -fsSL --max-time 60 "$download_url" -o "$tarball"; then
+    echo -e "${R}下载失败，请检查网络（GitHub 访问是否正常）${N}"
+    rm -rf "$tmpdir"
     return 1
   fi
 
-  # 自连环检查（粗略）
-  local my_v4 my_v6
-  my_v4=$(detect_primary_ipv4 2>/dev/null || true)
-  my_v6=$(detect_primary_ipv6 2>/dev/null || true)
-  if [ -n "$target_host" ] && { [ "$target_host" = "$my_v4" ] || [ "$target_host" = "$my_v6" ]; }; then
-    echo ""
-    echo -e "${R}${B}警告：落地机地址 ${target_host} 与本机 IP 相同${N}"
-    echo -e "${Y}这会形成路由回环，sing-box 启动会失败${N}"
-    local confirm_loop
-    read -p "  仍然继续？(y/N): " confirm_loop
-    if [ "$confirm_loop" != "y" ] && [ "$confirm_loop" != "Y" ]; then
-      echo -e "  已取消"
+  echo -e "${Y}==> 解压并安装到 ${REALM_BIN_PATH}...${N}"
+  if ! tar -xzf "$tarball" -C "$tmpdir"; then
+    echo -e "${R}解压失败，文件可能损坏${N}"
+    rm -rf "$tmpdir"
+    return 1
+  fi
+  if [ ! -f "${tmpdir}/realm" ]; then
+    echo -e "${R}解压后未找到 realm 二进制${N}"
+    rm -rf "$tmpdir"
+    return 1
+  fi
+  install -m 0755 "${tmpdir}/realm" "$REALM_BIN_PATH"
+  rm -rf "$tmpdir"
+
+  if ! "$REALM_BIN_PATH" -h >/dev/null 2>&1; then
+    echo -e "${R}realm 二进制无法执行（可能是 glibc 版本不匹配）${N}"
+    rm -f "$REALM_BIN_PATH"
+    return 1
+  fi
+
+  echo -e "${Y}==> 写入配置骨架 ${REALM_CONFIG_PATH}...${N}"
+  realm_config_skeleton
+
+  echo -e "${Y}==> 写入 systemd 服务 ${REALM_SERVICE_PATH}...${N}"
+  cat > "$REALM_SERVICE_PATH" <<EOF
+[Unit]
+Description=Realm port forwarding service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+Restart=on-failure
+RestartSec=5s
+ExecStart=${REALM_BIN_PATH} -c ${REALM_CONFIG_PATH}
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  systemctl daemon-reload
+  systemctl enable realm >/dev/null 2>&1 || true
+  if systemctl start realm; then
+    echo -e "${G}realm 安装并启动成功${N}"
+  else
+    echo -e "${Y}realm 服务启动失败，可用 journalctl -u realm 查看原因${N}"
+  fi
+
+  echo ""
+  echo -e "  ${G}已就绪。${N}下一步在本菜单"添加转发规则"中加第一条规则。"
+  return 0
+}
+
+realm_uninstall(){
+  if ! require_root; then return 1; fi
+  if ! realm_is_installed; then
+    echo -e "${Y}realm 未安装${N}"
+    return 0
+  fi
+
+  echo -e "${Y}==> 撤销所有规则的防火墙端口...${N}"
+  local rule listen_str port
+  while IFS='|' read -r _ listen_str _; do
+    port=$(printf '%s' "$listen_str" | awk -F: '{print $NF}')
+    if [ -n "$port" ] && [ "$port" -ge 1 ] 2>/dev/null && [ "$port" -le 65535 ] 2>/dev/null; then
+      node_revoke_firewall_for_mode "$port" tcp dualstack >/dev/null 2>&1 || true
+      node_revoke_firewall_for_mode "$port" udp dualstack >/dev/null 2>&1 || true
+    fi
+  done < <(realm_list_rules)
+
+  echo -e "${Y}==> 停止并禁用 realm 服务...${N}"
+  systemctl stop realm >/dev/null 2>&1 || true
+  systemctl disable realm >/dev/null 2>&1 || true
+
+  echo -e "${Y}==> 清理文件...${N}"
+  rm -f "$REALM_SERVICE_PATH"
+  rm -f "$REALM_BIN_PATH"
+  rm -rf "$REALM_CONFIG_DIR"
+  systemctl daemon-reload
+
+  echo -e "${G}realm 已彻底卸载${N}"
+  return 0
+}
+
+# ─── 子菜单交互 ───────────────────────────────────────
+realm_menu_add(){
+  if ! require_realm_installed; then return 1; fi
+
+  local listen_port remote_ip remote_port listen_mode listen_str
+  echo ""
+  echo -e "  ${B}添加转发规则${N}"
+  echo -e "  ${D}（中转机本地监听 → 落地机 IP:端口）${N}"
+  echo ""
+
+  read -p "  本机监听端口 (1-65535): " listen_port
+  if ! validate_port "$listen_port"; then
+    echo -e "${R}端口非法${N}"
+    return 1
+  fi
+
+  # 端口占用检测（事前拦截）
+  if command -v ss >/dev/null 2>&1; then
+    if ss -tlnH "( sport = :$listen_port )" 2>/dev/null | grep -q . \
+       || ss -ulnH "( sport = :$listen_port )" 2>/dev/null | grep -q .; then
+      echo -e "${R}端口 ${listen_port} 已被本机其它进程占用，请换一个${N}"
       return 1
     fi
   fi
 
-  echo -e "${Y}==> 解析落地机信息...${N}"
-  echo -e "  类型 : ${C}${target_type}${N}"
-  echo -e "  地址 : ${C}${target_host}:${target_port}${N}"
-  echo -e "  SNI  : ${C}${target_sni:-未指定}${N}"
-
-  # 构造 outbound JSON
-  local outbound_json
-  outbound_json=$(build_chain_outbound_from_link "$link" "$outbound_tag") || {
-    echo -e "${R}构造 outbound 失败${N}"
-    return 1
-  }
-
-  # 备份配置
-  local backup_path
-  backup_path="${CONFIG_PATH}.bak.$(date +%Y%m%d%H%M%S)"
-  cp "$CONFIG_PATH" "$backup_path" 2>/dev/null || true
-
-  # 写 outbound + 路由规则
-  if ! config_add_outbound "$outbound_json"; then
-    echo -e "${R}写入 outbound 失败${N}"
-    cp "$backup_path" "$CONFIG_PATH" 2>/dev/null || true
+  read -p "  落地机 IP（IPv4 或 IPv6）: " remote_ip
+  remote_ip=$(printf '%s' "$remote_ip" | tr -d '[:space:]')
+  if [ -z "$remote_ip" ]; then
+    echo -e "${R}落地机 IP 不能为空${N}"
     return 1
   fi
-  if ! config_set_inbound_chain "$inbound_tag" "$outbound_tag"; then
-    echo -e "${R}写入路由规则失败${N}"
-    cp "$backup_path" "$CONFIG_PATH" 2>/dev/null || true
-    return 1
+  # IPv6 自动加方括号
+  if [ "${remote_ip#*:}" != "$remote_ip" ] && [ "${remote_ip#\[}" = "$remote_ip" ]; then
+    remote_ip="[${remote_ip}]"
   fi
 
-  # 校验 + 重启
-  echo -e "${Y}==> 校验并重启 sing-box...${N}"
-  if ! sing-box check -c "$CONFIG_PATH" >/dev/null 2>&1; then
-    echo -e "${R}配置校验失败，已恢复备份${N}"
-    cp "$backup_path" "$CONFIG_PATH" 2>/dev/null || true
+  read -p "  落地机端口 (1-65535): " remote_port
+  if ! validate_port "$remote_port"; then
+    echo -e "${R}端口非法${N}"
     return 1
   fi
-  if ! systemctl restart sing-box; then
-    echo -e "${R}sing-box 重启失败，已恢复备份${N}"
-    cp "$backup_path" "$CONFIG_PATH" 2>/dev/null || true
-    return 1
-  fi
-
-  # 持久化 chain.info
-  ensure_chains_dir
-  cat > "$(chain_info_path "$inbound_type")" <<EOF
-TargetType=${target_type}
-TargetHost=${target_host}
-TargetPort=${target_port}
-TargetSNI=${target_sni}
-TargetUUID=$(printf '%s\n' "$fields" | sed -n 's/^UUID=//p' | head -1)
-TargetPubKey=$(printf '%s\n' "$fields" | sed -n 's/^PublicKey=//p' | head -1)
-TargetShortID=$(printf '%s\n' "$fields" | sed -n 's/^ShortID=//p' | head -1)
-TargetPassword=$(printf '%s\n' "$fields" | sed -n 's/^Password=//p' | head -1)
-TargetInsecure=$(printf '%s\n' "$fields" | sed -n 's/^Insecure=//p' | head -1)
-TargetObfs=$(printf '%s\n' "$fields" | sed -n 's/^Obfs=//p' | head -1)
-TargetObfsPassword=$(printf '%s\n' "$fields" | sed -n 's/^ObfsPassword=//p' | head -1)
-EOF
-
-  set_node_value "$inbound_type" Chain "$outbound_tag"
-  cleanup_old_backups "${CONFIG_PATH}.bak.*" 5
 
   echo ""
-  echo -e "${G}已配置：${inbound_type} 入站 → 中转到 ${target_host}:${target_port} (${target_type})${N}"
+  echo -e "  ${B}监听地址类型${N}"
+  echo -e "  ${L}1)${N} ${C}[::]:${listen_port}${N}      ${D}双栈监听（推荐，v4+v6 客户端都能进）${N}"
+  echo -e "  ${L}2)${N} ${C}0.0.0.0:${listen_port}${N}   ${D}仅 v4 监听${N}"
+  read -p "  选择 (默认 1): " listen_mode
+  case "${listen_mode:-1}" in
+    1) listen_str="[::]:${listen_port}" ;;
+    2) listen_str="0.0.0.0:${listen_port}" ;;
+    *) echo -e "${R}选择无效${N}"; return 1 ;;
+  esac
+
+  echo ""
+  echo -e "${Y}==> 写入规则...${N}"
+  if ! realm_add_rule "$listen_str" "$remote_ip" "$remote_port"; then
+    echo -e "${R}写入失败${N}"
+    return 1
+  fi
+
+  echo -e "${Y}==> 放行防火墙端口 ${listen_port} (TCP+UDP, v4+v6)...${N}"
+  node_apply_firewall_for_mode "$listen_port" tcp dualstack
+  node_apply_firewall_for_mode "$listen_port" udp dualstack
+
+  echo -e "${Y}==> 重启 realm 服务...${N}"
+  if systemctl restart realm; then
+    echo -e "${G}规则已生效${N}"
+  else
+    echo -e "${R}realm 重启失败，请用 journalctl -u realm 查看${N}"
+    return 1
+  fi
+
+  echo ""
+  echo -e "  ${G}✓${N} 客户端连接 ${C}本机IP:${listen_port}${N} 即会被转发到 ${C}${remote_ip}:${remote_port}${N}"
+  echo -e "  ${D}提示：客户端的 SNI / UUID / pbk / 密码等加密参数请按落地机配置填${N}"
   return 0
 }
 
-chain_unset(){
-  local inbound_type="$1"
-  local inbound_tag outbound_tag
-  inbound_tag=$(inbound_tag_for_type "$inbound_type") || return 1
-  outbound_tag="chain-${inbound_type}-out"
+realm_menu_view(){
+  if ! require_realm_installed; then return 1; fi
 
-  if ! chain_installed "$inbound_type"; then
-    echo -e "${Y}${inbound_type} 当前未配置中转${N}"
-    return 0
-  fi
-
-  local backup_path
-  backup_path="${CONFIG_PATH}.bak.$(date +%Y%m%d%H%M%S)"
-  cp "$CONFIG_PATH" "$backup_path" 2>/dev/null || true
-
-  config_remove_inbound_chain "$inbound_tag" || true
-  config_remove_outbound_by_tag "$outbound_tag" || true
-
-  echo -e "${Y}==> 校验并重启 sing-box...${N}"
-  if ! sing-box check -c "$CONFIG_PATH" >/dev/null 2>&1; then
-    echo -e "${R}配置校验失败，已恢复备份${N}"
-    cp "$backup_path" "$CONFIG_PATH" 2>/dev/null || true
-    return 1
-  fi
-  if ! systemctl restart sing-box; then
-    echo -e "${R}sing-box 重启失败，已恢复备份${N}"
-    cp "$backup_path" "$CONFIG_PATH" 2>/dev/null || true
-    return 1
-  fi
-
-  remove_chain_info "$inbound_type"
-  set_node_value "$inbound_type" Chain "direct"
-  cleanup_old_backups "${CONFIG_PATH}.bak.*" 5
-
-  echo -e "${G}已恢复：${inbound_type} 入站 → 直连${N}"
-}
-
-# 让用户在已装的 inbound 中挑一个返回类型字符串
-select_inbound_for_chain(){
-  local prompt_label="${1:-请选择入站节点}"
-  local arr=() n input i count
-  while IFS= read -r n; do
-    [ -n "$n" ] && arr+=("$n")
-  done < <(list_installed_nodes)
-  count=${#arr[@]}
+  echo ""
+  echo -e "  ${B}当前转发规则${N}"
+  local count
+  count=$(realm_count_rules)
   if [ "$count" -eq 0 ]; then
-    return 1
+    echo -e "  ${D}（暂无规则，请先"添加转发规则"）${N}"
+  else
+    printf "  ${L}│${N}  %-4s %-26s  %s\n" "ID" "本机监听" "落地"
+    local idx listen_str remote_str
+    while IFS='|' read -r idx listen_str remote_str; do
+      printf "  ${L}│${N}  ${Y}%-4s${N} ${C}%-26s${N}  ${C}%s${N}\n" "$idx" "$listen_str" "$remote_str"
+    done < <(realm_list_rules)
   fi
-  if [ "$count" -eq 1 ]; then
-    printf '%s' "${arr[0]}"
-    return 0
+
+  echo ""
+  echo -e "  ${B}服务状态${N}"
+  local status
+  status=$(systemctl is-active realm 2>/dev/null || echo unknown)
+  if [ "$status" = "active" ]; then
+    echo -e "  ${L}│${N}  ${G}● realm 运行中${N}"
+  else
+    echo -e "  ${L}│${N}  ${R}● realm ${status}${N}  ${D}（用 journalctl -u realm 看日志）${N}"
   fi
-  {
-    echo ""
-    echo "  ${prompt_label}："
-    i=1
-    for n in "${arr[@]}"; do
-      local desc
-      desc=$(chain_describe "$n")
-      echo "    $i) $n  ${desc:+(当前: $desc)}"
-      i=$((i + 1))
-    done
-  } >&2
-  read -p "  请输入序号 (1): " input >&2
-  input="${input:-1}"
-  if [[ "$input" =~ ^[0-9]+$ ]] && [ "$input" -ge 1 ] && [ "$input" -le "$count" ]; then
-    printf '%s' "${arr[$((input - 1))]}"
-    return 0
-  fi
-  return 1
+
+  echo ""
+  echo -e "  ${D}配置文件: ${REALM_CONFIG_PATH}${N}"
+  return 0
 }
 
-show_chain_menu(){
-  local target link confirm
-  if ! require_root; then return 1; fi
-  if ! require_singbox_installed; then return 1; fi
+realm_menu_delete(){
+  if ! require_realm_installed; then return 1; fi
 
-  while true; do
-    render_section_header "链式代理设置（中转机）"
+  local count target listen_str port
+  count=$(realm_count_rules)
+  if [ "$count" -eq 0 ]; then
+    echo -e "${Y}当前没有规则${N}"
+    return 0
+  fi
 
-    # ─── 教程提示 ───
-    echo -e "  ${B}${C}什么是链式代理？${N}"
-    echo -e "  ${D}客户端 → ${C}中转机 A${D} → ${C}落地机 B${D} → 互联网${N}"
-    echo -e "  ${D}用 A 的入站接客户端，A 把流量再转到 B 出网，外面看到的是 B 的 IP。${N}"
-    echo ""
-    echo -e "  ${B}${C}典型流程${N}（两台 VPS 都跑这个脚本）"
-    echo -e "  ${Y}①${N} 落地机 B：装节点 → 主菜单 ${C}4) 查看状态${N} → ${C}7) 查看客户端链接 / 二维码${N} → 复制"
-    echo -e "  ${Y}②${N} 中转机 A：装节点（客户端实际连的就是 A 的这个入站）"
-    echo -e "  ${Y}③${N} 中转机 A：${C}本菜单 → 1) 配置中转${N} → 选入站 → 粘贴 B 的链接"
-    echo -e "  ${Y}④${N} 客户端连 A，访问 ipify.org 应看到 B 的 IP，搞定"
-    echo ""
-    echo -e "  ${D}· 我是中转机？→ 1) 粘贴落地机链接${N}"
-    echo -e "  ${D}· 我是落地机？→ 啥都不用做，3) 把本机链接复制给中转机用即可${N}"
-    echo -e "  ${D}· 每个入站（Reality / HY2）可独立选直连或中转，互不影响${N}"
-    echo -e "  ${D}· 详细教程：HY2-节点搭建说明.md 第十一节${N}"
-    render_divider
+  echo ""
+  echo -e "  ${B}选择要删除的规则${N}"
+  local idx ls rs
+  while IFS='|' read -r idx ls rs; do
+    printf "    ${Y}%s)${N} %s → %s\n" "$idx" "$ls" "$rs"
+  done < <(realm_list_rules)
+  echo ""
+  read -p "  请输入编号 (1-${count}, 回车取消): " target
+  [ -z "$target" ] && { echo -e "  已取消"; return 0; }
+  case "$target" in
+    ''|*[!0-9]*) echo -e "${R}编号非法${N}"; return 1 ;;
+  esac
+  if [ "$target" -lt 1 ] || [ "$target" -gt "$count" ]; then
+    echo -e "${R}编号超出范围${N}"
+    return 1
+  fi
 
-    if [ "$(count_installed_nodes)" -eq 0 ]; then
-      echo -e "  ${Y}本机尚未创建任何入站节点${N}"
-      echo -e "  ${D}请先回到「节点 / 内核管理 → 创建节点」装一个 Reality 或 Hysteria2，${N}"
-      echo -e "  ${D}它们会作为客户端连接的入口，再回来配链路${N}"
-      echo ""
-      pause_screen
-      return 0
+  # 提前抓出该规则的端口，便于撤防火墙
+  listen_str=$(realm_list_rules | awk -F'|' -v t="$target" '$1==t{print $2}')
+  port=$(printf '%s' "$listen_str" | awk -F: '{print $NF}')
+
+  echo -e "${Y}==> 从配置移除规则 ${target}...${N}"
+  if ! realm_delete_rule "$target"; then
+    echo -e "${R}删除失败${N}"
+    return 1
+  fi
+
+  if [ -n "$port" ] && [ "$port" -ge 1 ] 2>/dev/null && [ "$port" -le 65535 ] 2>/dev/null; then
+    echo -e "${Y}==> 撤销防火墙端口 ${port}...${N}"
+    node_revoke_firewall_for_mode "$port" tcp dualstack
+    node_revoke_firewall_for_mode "$port" udp dualstack
+  fi
+
+  echo -e "${Y}==> 重启 realm 服务...${N}"
+  systemctl restart realm >/dev/null 2>&1 || true
+  echo -e "${G}规则 ${target} 已删除${N}"
+  return 0
+}
+
+realm_menu_clear(){
+  if ! require_realm_installed; then return 1; fi
+  local count
+  count=$(realm_count_rules)
+  if [ "$count" -eq 0 ]; then
+    echo -e "${Y}当前没有规则${N}"
+    return 0
+  fi
+
+  echo ""
+  echo -e "  ${R}${B}此操作将清空所有 ${count} 条规则${N}"
+  read -p "  确认？(y/N): " confirm
+  if [ "$confirm" != "y" ] && [ "$confirm" != "Y" ]; then
+    echo -e "  已取消"
+    return 0
+  fi
+
+  # 收集所有端口先撤防火墙
+  echo -e "${Y}==> 撤销所有规则的防火墙端口...${N}"
+  local listen_str port
+  while IFS='|' read -r _ listen_str _; do
+    port=$(printf '%s' "$listen_str" | awk -F: '{print $NF}')
+    if [ -n "$port" ] && [ "$port" -ge 1 ] 2>/dev/null && [ "$port" -le 65535 ] 2>/dev/null; then
+      node_revoke_firewall_for_mode "$port" tcp dualstack >/dev/null 2>&1 || true
+      node_revoke_firewall_for_mode "$port" udp dualstack >/dev/null 2>&1 || true
     fi
+  done < <(realm_list_rules)
 
-    # ─── 当前状态：列每个已装入站的链路 ───
-    echo -e "  ${B}${C}本机入站链路状态${N}"
-    local n desc
-    while IFS= read -r n; do
-      [ -n "$n" ] || continue
-      desc=$(chain_describe "$n")
-      printf "  ${L}│${N}  %-10s ${D}·${N}  %s\n" "$n" "${desc:-未知}"
-    done < <(list_installed_nodes)
+  echo -e "${Y}==> 清空配置...${N}"
+  realm_clear_rules
+
+  echo -e "${Y}==> 重启 realm 服务...${N}"
+  systemctl restart realm >/dev/null 2>&1 || true
+  echo -e "${G}已清空全部规则${N}"
+  return 0
+}
+
+# ─── 顶级菜单 ─────────────────────────────────────────
+show_realm_menu(){
+  while true; do
+    render_section_header "Realm 中转管理"
+
+    echo -e "  ${B}${C}什么是 Realm 中转？${N}"
+    echo -e "  ${D}客户端 → ${C}中转机(realm 透传)${D} → ${C}落地机(sing-box)${D} → 互联网${N}"
+    echo -e "  ${D}realm 只搬运字节，不解密；加密握手在客户端 ↔ 落地机之间端到端完成。${N}"
+    echo ""
+    echo -e "  ${B}${C}使用流程${N}"
+    echo -e "  ${Y}①${N} 落地机 B：装 sing-box 节点 → 复制客户端链接"
+    echo -e "  ${Y}②${N} 中转机 A（本机）：本菜单 ${C}1)${N} 安装 → ${C}2)${N} 加规则（监听端口 → B 的 IP:端口）"
+    echo -e "  ${Y}③${N} 客户端配置：把 IP 改成 A 的，${R}${B}SNI/UUID/pbk 全部用 B 的${N}"
+    echo -e "  ${Y}④${N} 连上访问 ipify.org 应看到 B 的 IP，搞定"
+    echo ""
+    echo -e "  ${D}详细教程见 realm-中转落地指南.md${N}"
     render_divider
-    render_menu_item 1 "配置中转 (选入站 → 粘贴落地机链接)"
-    render_menu_item 2 "取消中转 (选入站 → 恢复直连)"
-    render_menu_item 3 "导出本机入站链接（让别的中转机连本机）"
+
+    if realm_is_installed; then
+      local ver count status
+      ver=$(realm_get_version 2>/dev/null)
+      [ -z "$ver" ] && ver="?"
+      count=$(realm_count_rules)
+      status=$(systemctl is-active realm 2>/dev/null || echo unknown)
+      echo -e "  状态     : ${G}已安装${N}  ${D}v${ver}${N}"
+      if [ "$status" = "active" ]; then
+        echo -e "  服务     : ${G}运行中${N}"
+      else
+        echo -e "  服务     : ${R}${status}${N}"
+      fi
+      echo -e "  规则数量 : ${C}${count}${N} 条"
+    else
+      echo -e "  状态     : ${Y}未安装${N}  ${D}（请先选 1 安装）${N}"
+    fi
+    render_divider
+
+    render_menu_item 1 "安装 Realm"
+    render_menu_item 2 "添加转发规则"
+    render_menu_item 3 "查看规则 / 服务状态"
+    render_menu_item 4 "删除单条规则"
+    render_menu_item 5 "清空全部规则"
+    render_menu_item 6 "重启 realm 服务"
+    render_menu_item 7 "查看实时日志"
+    render_menu_item 8 "卸载 Realm"
     render_menu_item 0 "返回上级"
     render_divider
     read -p "  请输入序号: " choice
     case "$choice" in
-      1)
-        target=$(select_inbound_for_chain "选要配中转的入站") || { echo -e "${R}选择无效${N}"; pause_screen; continue; }
-        echo ""
-        echo -e "  ${B}请粘贴落地机的客户端链接${N}"
-        echo -e "  ${D}（在落地机上跑 sb → 4) 查看状态 → 7) 查看客户端链接 / 二维码 复制）${N}"
-        echo -e "  ${D}支持格式：vless://...reality...   或   hysteria2://...${N}"
-        read -p "  链接: " link
-        link="${link%%[[:space:]]}"
-        if [ -z "$link" ]; then
-          echo -e "${Y}已取消${N}"
-          pause_screen
-          continue
-        fi
-        if chain_installed "$target"; then
-          echo -e "${Y}${target} 已配置中转，将覆盖${N}"
-          read -p "  继续？(y/N): " confirm
-          if [ "$confirm" != "y" ] && [ "$confirm" != "Y" ]; then
-            echo -e "  已取消"
-            pause_screen
-            continue
+      1) realm_install; pause_screen ;;
+      2) realm_menu_add; pause_screen ;;
+      3) realm_menu_view; pause_screen ;;
+      4) realm_menu_delete; pause_screen ;;
+      5) realm_menu_clear; pause_screen ;;
+      6)
+        if require_realm_installed; then
+          if systemctl restart realm; then
+            echo -e "${G}realm 已重启${N}"
+          else
+            echo -e "${R}重启失败，请用 journalctl -u realm 查看${N}"
           fi
         fi
-        chain_set "$target" "$link" || true
         pause_screen
         ;;
-      2)
-        target=$(select_inbound_for_chain "选要取消中转的入站") || { echo -e "${R}选择无效${N}"; pause_screen; continue; }
-        if ! chain_installed "$target"; then
-          echo -e "${Y}${target} 当前是直连，无需取消${N}"
-          pause_screen
-          continue
+      7)
+        if require_realm_installed; then
+          echo -e "${D}（按 Ctrl+C 退出日志）${N}"
+          journalctl -u realm -f --no-pager 2>/dev/null || true
         fi
-        chain_unset "$target" || true
-        pause_screen
         ;;
-      3)
-        show_client_link
-        ;;
-      0)
-        return
-        ;;
-      *)
-        notify_invalid_choice
-        ;;
+      8) realm_uninstall; pause_screen ;;
+      0) return ;;
+      *) notify_invalid_choice ;;
     esac
   done
 }
@@ -9472,12 +9382,13 @@ show_menu(){
     render_menu_item 1 "管理员设置"
     render_menu_item 2 "系统基础设置"
     render_menu_item 3 "${main_action_label}"
-    render_menu_item 4 "查看状态"
-    render_menu_item 5 "Docker 管理"
-    render_menu_item 6 "IPv4 防火墙管理"
-    render_menu_item 7 "IPv6 防火墙管理"
-    render_menu_item 8 "卸载脚本"
-    render_menu_item 9 "更新脚本"
+    render_menu_item 4 "Realm 中转管理"
+    render_menu_item 5 "查看状态"
+    render_menu_item 6 "Docker 管理"
+    render_menu_item 7 "IPv4 防火墙管理"
+    render_menu_item 8 "IPv6 防火墙管理"
+    render_menu_item 9 "卸载脚本"
+    render_menu_item 10 "更新脚本"
     render_menu_item 0 "退出"
     render_divider
     read -p "  请输入序号: " choice
@@ -9497,21 +9408,24 @@ show_menu(){
         fi
         ;;
       4)
-        show_status_menu
+        show_realm_menu
         ;;
       5)
-        show_docker_menu
+        show_status_menu
         ;;
       6)
-        show_ipv4_firewall_menu
+        show_docker_menu
         ;;
       7)
-        show_ipv6_firewall_menu
+        show_ipv4_firewall_menu
         ;;
       8)
-        uninstall_script_completely
+        show_ipv6_firewall_menu
         ;;
       9)
+        uninstall_script_completely
+        ;;
+      10)
         update_self_script
         ;;
       0)
