@@ -46,7 +46,16 @@
       "Bash(sed -n '6515,6535p' \"C:/Users/leyili/Desktop/linux-menu/linux-menu/leyili.sh\")",
       "WebFetch(domain:blog.cloudflare.com)",
       "Bash(git *)",
-      "WebFetch(domain:github.com)"
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:www.nodeseek.com)",
+      "Bash(awk 'NR>=1889 && NR<=1907' leyili.sh)",
+      "Bash(sed -i '1889d' leyili.sh)",
+      "Bash(sed -n '1886,1892p' leyili.sh)",
+      "Bash(curl -fsSL https://api.github.com/repos/playfulsoul/realm-installer)",
+      "Bash(curl -fsSL https://api.github.com/repos/playfulsoul/realm-installer/contents/)",
+      "Bash(curl -fsSL https://raw.githubusercontent.com/playfulsoul/realm-installer/main/install.sh -o /tmp/realm-installer.sh)",
+      "Read(//tmp/**)",
+      "Bash(curl -fsSL https://raw.githubusercontent.com/playfulsoul/realm-installer/main/README.md -o /tmp/realm-installer.md)"
     ]
   }
 }
