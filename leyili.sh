@@ -517,6 +517,21 @@ ip4_detect_conflicts(){
   printf '%s' "${conflicts% }"
 }
 
+# 单独检测 1Panel 是否在场（用于 IPv4 菜单托管接管）
+ip4_detect_1panel(){
+  [ -d /opt/1panel ] && return 0
+  systemctl list-unit-files 2>/dev/null | grep -q '^1panel' && return 0
+  return 1
+}
+
+# 把 IPv4 防火墙交还 1Panel：清掉 INPUT 规则 + 默认策略 ACCEPT，并持久化
+ip4_handover_to_1panel(){
+  iptables -P INPUT ACCEPT 2>/dev/null || return 1
+  iptables -F INPUT 2>/dev/null || return 1
+  ip4_save_rules >/dev/null 2>&1 || true
+  return 0
+}
+
 # ─── 防火墙锁库兜底机制 ──────────────────────────────
 # 验证 sshd 真的在指定端口监听（不依赖 sshd 进程名 grep，更稳）
 verify_sshd_listening_on_port(){
@@ -2184,7 +2199,7 @@ show_ipv6_firewall_menu(){
     render_divider
     render_menu_item 1 "查看当前规则"
     render_menu_item 2 "查看监听 IPv6 的服务"
-    render_menu_item 3 "一键初始化 (放行 SSH/80/443)"
+    render_menu_item 3 "一键关闭所有 IPv6 入站端口"
     render_menu_item 4 "开放端口"
     render_menu_item 5 "关闭端口"
     render_menu_item 6 "紧急放行 (关闭 v6 防火墙)"
@@ -2200,7 +2215,7 @@ show_ipv6_firewall_menu(){
         ip6_view_listening
         ;;
       3)
-        ip6_init_firewall
+        ip6_close_all_inbound
         ;;
       4)
         ip6_open_port
@@ -2276,35 +2291,31 @@ ip6_view_listening(){
   pause_screen
 }
 
-ip6_init_firewall(){
-  local ssh_port confirm
+ip6_close_all_inbound(){
+  local confirm
   local backup_rules="" rb_choice="y" rb_pid="" rb_seconds=180
 
-  ssh_port=$(ip6_detect_ssh_port)
-
   echo ""
-  echo -e "  ${B}${C}一键初始化${N}"
+  echo -e "  ${B}${C}一键关闭所有 IPv6 入站端口${N}"
   render_divider
   echo "  本次会执行："
   echo "    1) 清空当前 IPv6 INPUT 规则"
   echo "    2) 放行回环 lo"
   echo "    3) 放行已建立的连接 (ESTABLISHED, RELATED)"
-  echo "    4) 放行 ICMPv6 (邻居发现等必需)"
-  echo -e "    5) 放行 SSH 端口: ${C}${ssh_port}${N}/tcp  ${D}(自动检测)${N}"
-  echo "    6) 放行 80/tcp"
-  echo "    7) 放行 443/tcp"
-  echo "    8) INPUT 默认策略 = DROP"
-  echo "    9) OUTPUT 保持 ACCEPT"
-  echo "   10) FORWARD 不动 (留给 Docker)"
+  echo "    4) 放行 ICMPv6 (NDP / 邻居发现, IPv6 网络必需)"
+  echo -e "    5) ${R}${B}不放行任何业务端口 (含 SSH/80/443/节点端口)${N}"
+  echo "    6) INPUT 默认策略 = DROP"
+  echo "    7) OUTPUT 保持 ACCEPT (出站不受影响)"
+  echo "    8) FORWARD 不动 (留给 Docker)"
   echo ""
-  echo -e "  ${D}注意：节点端口（Reality TCP / Hysteria2 UDP）不在此初始化范围内，${N}"
-  echo -e "  ${D}      请在初始化完成后到本菜单 ${C}4) 开放端口${N} ${D}里手动放行。${N}"
+  echo -e "  ${Y}效果：外部无法主动连入任何 IPv6 端口；本机 IPv6 出站仍可用，回包能进。${N}"
+  echo -e "  ${D}如需 IPv6 提供 HTTP/HTTPS/SSH 等服务，请改用本菜单 ${C}4) 开放端口${N}${D}。${N}"
   echo ""
 
-  # 锁库前置检查：sshd 必须真的在 ssh_port 上监听
-  if ! verify_sshd_listening_on_port "$ssh_port"; then
-    echo -e "  ${R}${B}严重警告：sshd 未在 ${ssh_port}/tcp 上监听${N}"
-    echo -e "  ${Y}如果你当前是通过 IPv6 SSH 进来的，应用规则可能立即断开${N}"
+  if ip6_check_current_ssh_v6; then
+    echo -e "  ${R}${B}严重警告：你当前 SSH 是 IPv6 进来的${N}"
+    echo -e "  ${R}应用规则后该会话将立即断开 (IPv4 SSH 不受影响)${N}"
+    echo -e "  ${Y}建议先用 IPv4 登录后再操作${N}"
     echo ""
     read -p "  仍要继续吗？输入大写 ${R}YES${N} 强制继续: " confirm
     if [ "$confirm" != "YES" ]; then
@@ -2312,12 +2323,6 @@ ip6_init_firewall(){
       sleep 1
       return 0
     fi
-  fi
-
-  if ip6_check_current_ssh_v6; then
-    echo -e "  ${R}${B}警告：你当前 SSH 是 IPv6 进来的${N}"
-    echo -e "  ${Y}建议先用 IPv4 登录后再操作${N}"
-    echo ""
   fi
 
   read -p "  确认继续？(y/N): " confirm
@@ -2354,58 +2359,21 @@ ip6_init_firewall(){
   ip6tables -A INPUT -i lo -j ACCEPT
   ip6tables -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
   ip6tables -A INPUT -p ipv6-icmp -j ACCEPT
-  ip6tables -A INPUT -p tcp --dport "$ssh_port" -j ACCEPT
-  ip6tables -A INPUT -p tcp --dport 80 -j ACCEPT
-  ip6tables -A INPUT -p tcp --dport 443 -j ACCEPT
   ip6tables -P INPUT DROP
   ip6tables -P OUTPUT ACCEPT
-
-  # 自动恢复 reality / hy2 / anytls 节点主端口放行（IPv6 侧）
-  # 仅在节点 Mode 为 dualstack / ipv6-in-ipv4-out 时需要
-  local node_port node_mode
-  if node_installed reality; then
-    node_port=$(get_node_value reality Port 2>/dev/null || true)
-    node_mode=$(get_node_value reality Mode 2>/dev/null || echo ipv4)
-    if [ -n "$node_port" ] \
-       && { [ "$node_mode" = "dualstack" ] || [ "$node_mode" = "ipv6-in-ipv4-out" ]; }; then
-      ip6tables -C INPUT -p tcp --dport "$node_port" -j ACCEPT 2>/dev/null \
-        || ip6tables -A INPUT -p tcp --dport "$node_port" -j ACCEPT 2>/dev/null || true
-      echo -e "  ${G}已自动恢复 reality 主端口放行 (v6)：${node_port}/tcp${N}"
-    fi
-  fi
-  if node_installed hy2; then
-    node_port=$(get_node_value hy2 Port 2>/dev/null || true)
-    node_mode=$(get_node_value hy2 Mode 2>/dev/null || echo ipv4)
-    if [ -n "$node_port" ] \
-       && { [ "$node_mode" = "dualstack" ] || [ "$node_mode" = "ipv6-in-ipv4-out" ]; }; then
-      ip6tables -C INPUT -p udp --dport "$node_port" -j ACCEPT 2>/dev/null \
-        || ip6tables -A INPUT -p udp --dport "$node_port" -j ACCEPT 2>/dev/null || true
-      echo -e "  ${G}已自动恢复 hy2 主端口放行 (v6)：${node_port}/udp${N}"
-    fi
-  fi
-  if node_installed anytls; then
-    node_port=$(get_node_value anytls Port 2>/dev/null || true)
-    node_mode=$(get_node_value anytls Mode 2>/dev/null || echo ipv4)
-    if [ -n "$node_port" ] \
-       && { [ "$node_mode" = "dualstack" ] || [ "$node_mode" = "ipv6-in-ipv4-out" ]; }; then
-      ip6tables -C INPUT -p tcp --dport "$node_port" -j ACCEPT 2>/dev/null \
-        || ip6tables -A INPUT -p tcp --dport "$node_port" -j ACCEPT 2>/dev/null || true
-      echo -e "  ${G}已自动恢复 anytls 主端口放行 (v6)：${node_port}/tcp${N}"
-    fi
-  fi
 
   if ! ip6_save_rules; then
     echo -e "${Y}规则已生效，但持久化失败，重启后可能丢失${N}"
   fi
 
   echo ""
-  echo -e "${G}IPv6 防火墙已启用${N}"
+  echo -e "${G}所有 IPv6 入站端口已关闭${N}"
 
   if [ "$rb_choice" = "y" ] && [ -n "$backup_rules" ]; then
     rb_pid=$(schedule_iptables_rollback "$rb_seconds" "" "$backup_rules")
     if [ -n "$rb_pid" ]; then
       echo -e "  ${Y}延时回滚守护已启动 (PID ${rb_pid})，${rb_seconds}s 后自动恢复旧规则${N}"
-      echo -e "  ${B}请尽快开新终端验证 SSH 仍可登录，然后执行：${N}"
+      echo -e "  ${B}请尽快开新终端验证 SSH/服务仍可用 (走 IPv4)，然后执行：${N}"
       echo -e "    ${C}kill ${rb_pid} && rm -f ${backup_rules}${N}  ${D}# 取消回滚${N}"
     fi
   fi
@@ -2562,7 +2530,7 @@ ip6_emergency_disable(){
 
 # ─── IPv4 防火墙菜单 ─────────────────────────────────
 show_ipv4_firewall_menu(){
-  local ssh_port conflicts
+  local ssh_port conflicts have_1panel=0 hp_choice
 
   if ! require_root; then
     return 1
@@ -2573,13 +2541,44 @@ show_ipv4_firewall_menu(){
     return 1
   fi
 
+  # 一次性提示：检测到 1Panel 时引导用户清理脚本残留 IPv4 规则
+  if ip4_detect_1panel && [ "${IP4_1PANEL_HANDOFF_PROMPTED:-0}" -ne 1 ]; then
+    echo ""
+    echo -e "  ${R}${B}检测到 1Panel 在管理 IPv4 防火墙${N}"
+    render_divider
+    echo -e "  ${Y}本脚本之前可能下发过 INPUT DROP/ACCEPT 规则，会与 1Panel 冲突${N}"
+    echo -e "  ${D}清理动作：${C}iptables -F INPUT${N} ${D}+ ${C}iptables -P INPUT ACCEPT${N} ${D}并持久化${N}"
+    echo -e "  ${D}清理后 IPv4 入站策略全部交给 1Panel 管理${N}"
+    echo -e "  ${R}注意：会清空 INPUT 链所有规则 (1Panel 通常走 ufw/firewalld，不直接挂 INPUT，一般安全)${N}"
+    echo ""
+    read -p "  立即清理脚本残留 IPv4 规则交还 1Panel？(y/N): " hp_choice
+    if [ "$hp_choice" = "y" ] || [ "$hp_choice" = "Y" ]; then
+      if ip4_handover_to_1panel; then
+        echo -e "  ${G}已清空 INPUT 规则并切回 ACCEPT，IPv4 防火墙由 1Panel 接管${N}"
+      else
+        echo -e "  ${R}清理失败，请手动检查${N}"
+      fi
+    else
+      echo -e "  ${D}已跳过自动清理（菜单仍会禁用写入操作）${N}"
+    fi
+    sleep 1
+    IP4_1PANEL_HANDOFF_PROMPTED=1
+  fi
+
   while true; do
     ssh_port=$(ip6_detect_ssh_port)
     conflicts=$(ip4_detect_conflicts)
+    if ip4_detect_1panel; then
+      have_1panel=1
+    else
+      have_1panel=0
+    fi
 
     render_section_header "IPv4 防火墙管理"
     echo -e "  ${L}│${N}  SSH 端口  ${D}·${N}  ${C}${ssh_port}${N}"
-    if [ -n "$conflicts" ]; then
+    if [ "$have_1panel" -eq 1 ]; then
+      echo -e "  ${L}│${N}  ${R}${B}已托管${N}    ${D}·${N}  ${Y}1Panel 在管理 IPv4 防火墙，本菜单写入操作已禁用${N}"
+    elif [ -n "$conflicts" ]; then
       echo -e "  ${L}│${N}  ${R}${B}冲突警告${N}  ${D}·${N}  ${Y}检测到 ${C}${conflicts}${N}${Y} 在管理 IPv4 防火墙${N}"
       echo -e "  ${L}│${N}  ${D}            本菜单直接改 iptables，可能与上述工具冲突或被覆盖${N}"
     fi
@@ -2587,10 +2586,17 @@ show_ipv4_firewall_menu(){
     render_divider
     render_menu_item 1 "查看当前规则"
     render_menu_item 2 "查看监听 IPv4 的服务"
-    render_menu_item 3 "一键初始化 (放行 SSH/80/443)"
-    render_menu_item 4 "开放端口"
-    render_menu_item 5 "关闭端口"
-    render_menu_item 6 "紧急放行 (关闭 v4 防火墙)"
+    if [ "$have_1panel" -eq 1 ]; then
+      render_menu_item 3 "一键初始化 (放行 SSH/80/443)  ${R}[已禁用·1Panel 托管]${N}"
+      render_menu_item 4 "开放端口  ${R}[已禁用·1Panel 托管]${N}"
+      render_menu_item 5 "关闭端口  ${R}[已禁用·1Panel 托管]${N}"
+      render_menu_item 6 "紧急放行 (关闭 v4 防火墙)  ${R}[已禁用·1Panel 托管]${N}"
+    else
+      render_menu_item 3 "一键初始化 (放行 SSH/80/443)"
+      render_menu_item 4 "开放端口"
+      render_menu_item 5 "关闭端口"
+      render_menu_item 6 "紧急放行 (关闭 v4 防火墙)"
+    fi
     render_menu_item 0 "返回上级"
     render_divider
     read -p "  请输入序号: " choice
@@ -2598,10 +2604,21 @@ show_ipv4_firewall_menu(){
     case $choice in
       1) ip4_view_rules ;;
       2) ip4_view_listening ;;
-      3) ip4_init_firewall ;;
-      4) ip4_open_port ;;
-      5) ip4_close_port ;;
-      6) ip4_emergency_disable ;;
+      3|4|5|6)
+        if [ "$have_1panel" -eq 1 ]; then
+          echo ""
+          echo -e "  ${Y}1Panel 正在管理 IPv4 防火墙，本项已禁用${N}"
+          echo -e "  ${D}请到 1Panel Web 面板「主机 → 防火墙」管理 IPv4 端口策略${N}"
+          pause_screen
+        else
+          case $choice in
+            3) ip4_init_firewall ;;
+            4) ip4_open_port ;;
+            5) ip4_close_port ;;
+            6) ip4_emergency_disable ;;
+          esac
+        fi
+        ;;
       0) return ;;
       *) notify_invalid_choice ;;
     esac
