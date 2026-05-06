@@ -338,7 +338,7 @@ print_firewall_hint(){
 }
 
 ip6_get_input_policy(){
-  ip6tables -L INPUT -n 2>/dev/null | head -n1 | awk '{print $4}'
+  ip6tables -L INPUT -n 2>/dev/null | head -n1 | awk '{gsub(/\)/, "", $4); print $4}'
 }
 
 ip6_list_opened_ports_compact(){
@@ -485,7 +485,7 @@ ip4_save_rules(){
 }
 
 ip4_get_input_policy(){
-  iptables -L INPUT -n 2>/dev/null | head -n1 | awk '{print $4}'
+  iptables -L INPUT -n 2>/dev/null | head -n1 | awk '{gsub(/\)/, "", $4); print $4}'
 }
 
 ip4_check_current_ssh_v4(){
@@ -2240,8 +2240,8 @@ ip6_view_rules(){
   local input_policy output_policy forward_policy opened
 
   input_policy=$(ip6_get_input_policy)
-  output_policy=$(ip6tables -L OUTPUT -n 2>/dev/null | head -n1 | awk '{print $4}')
-  forward_policy=$(ip6tables -L FORWARD -n 2>/dev/null | head -n1 | awk '{print $4}')
+  output_policy=$(ip6tables -L OUTPUT -n 2>/dev/null | head -n1 | awk '{gsub(/\)/, "", $4); print $4}')
+  forward_policy=$(ip6tables -L FORWARD -n 2>/dev/null | head -n1 | awk '{gsub(/\)/, "", $4); print $4}')
 
   echo ""
   echo -e "  ${B}${C}默认策略${N}"
@@ -2629,8 +2629,8 @@ ip4_view_rules(){
   local input_policy output_policy forward_policy opened
 
   input_policy=$(ip4_get_input_policy)
-  output_policy=$(iptables -L OUTPUT -n 2>/dev/null | head -n1 | awk '{print $4}')
-  forward_policy=$(iptables -L FORWARD -n 2>/dev/null | head -n1 | awk '{print $4}')
+  output_policy=$(iptables -L OUTPUT -n 2>/dev/null | head -n1 | awk '{gsub(/\)/, "", $4); print $4}')
+  forward_policy=$(iptables -L FORWARD -n 2>/dev/null | head -n1 | awk '{gsub(/\)/, "", $4); print $4}')
 
   echo ""
   echo -e "  ${B}${C}默认策略${N}"
@@ -7709,14 +7709,14 @@ EOF
 
   systemctl daemon-reload
   systemctl enable realm >/dev/null 2>&1 || true
-  if systemctl start realm; then
-    echo -e "${G}realm 安装并启动成功${N}"
-  else
-    echo -e "${Y}realm 服务启动失败，可用 journalctl -u realm 查看原因${N}"
-  fi
+  # realm 2.9.x 强制要求至少一条 [[endpoints]]，没规则就启动会 panic 并触发 systemd
+  # 重启风暴。这里只 enable 不 start，等用户加第一条规则时由 realm_menu_add
+  # 里的 systemctl restart 拉起。
+  echo -e "${G}realm 二进制 + systemd 单元已就位${N}"
+  echo -e "  ${D}（realm 服务暂未启动：等待你添加第一条转发规则后自动拉起）${N}"
 
   echo ""
-  echo -e "  ${G}已就绪。${N}下一步在本菜单"添加转发规则"中加第一条规则。"
+  echo -e "  ${G}已就绪。${N}下一步在本菜单\"添加转发规则\"中加第一条规则。"
   return 0
 }
 
@@ -8057,7 +8057,7 @@ realm_menu_diagnose(){
     # [4] v4 防火墙
     echo -e "  ${B}[4/7] IPv4 INPUT 防火墙${N}"
     local v4_pol v4_match
-    v4_pol=$(iptables -L INPUT -n 2>/dev/null | head -1 | awk '{print $4}')
+    v4_pol=$(ip4_get_input_policy)
     if [ "$v4_pol" = "ACCEPT" ]; then
       echo -e "    ${G}默认策略 ACCEPT，无需显式放行${N}"
     elif [ "$v4_pol" = "DROP" ]; then
@@ -8075,7 +8075,7 @@ realm_menu_diagnose(){
     # [5] v6 防火墙
     echo -e "  ${B}[5/7] IPv6 INPUT 防火墙${N}"
     local v6_pol v6_match
-    v6_pol=$(ip6tables -L INPUT -n 2>/dev/null | head -1 | awk '{print $4}')
+    v6_pol=$(ip6_get_input_policy)
     if [ "$v6_pol" = "ACCEPT" ]; then
       echo -e "    ${G}默认策略 ACCEPT，无需显式放行${N}"
     elif [ "$v6_pol" = "DROP" ]; then
