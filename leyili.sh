@@ -7739,9 +7739,16 @@ realm_menu_add(){
   if ! require_realm_installed; then return 1; fi
 
   local listen_port remote_ip remote_port listen_mode listen_str
+  local my_v4 my_v6 remote_is_v6
   echo ""
   echo -e "  ${B}添加转发规则${N}"
   echo -e "  ${D}（中转机本地监听 → 落地机 IP:端口）${N}"
+  echo ""
+  echo -e "  ${B}${C}小白须知${N}"
+  echo -e "  ${D}• 监听端口 = 客户端最终连本机的端口（A 对外暴露的）${N}"
+  echo -e "  ${D}• 落地 IP / 端口 = B 落地机自己的 IP 和节点端口${N}"
+  echo -e "  ${D}• 落地是 v4 还是 v6 都行，realm 自动转换${N}"
+  echo -e "  ${D}• realm 不参与加密，客户端的 SNI/UUID/pbk 全部用落地机的${N}"
   echo ""
 
   read -p "  本机监听端口 (1-65535): " listen_port
@@ -7759,14 +7766,37 @@ realm_menu_add(){
     fi
   fi
 
-  read -p "  落地机 IP（IPv4 或 IPv6）: " remote_ip
-  remote_ip=$(printf '%s' "$remote_ip" | tr -d '[:space:]')
+  echo ""
+  echo -e "  ${D}落地机 IP 输入示例：${N}"
+  echo -e "  ${D}  IPv4 : 1.2.3.4${N}"
+  echo -e "  ${D}  IPv6 : 2001:db8::1   ${L}（不用加方括号，脚本会自动加）${N}"
+  read -p "  落地机 IP: " remote_ip
+  remote_ip=$(printf '%s' "$remote_ip" | tr -d '[:space:]' | tr -d '[]')
   if [ -z "$remote_ip" ]; then
     echo -e "${R}落地机 IP 不能为空${N}"
     return 1
   fi
-  # IPv6 自动加方括号
-  if [ "${remote_ip#*:}" != "$remote_ip" ] && [ "${remote_ip#\[}" = "$remote_ip" ]; then
+  # 判定 IPv6（含冒号且非纯数字端口形式）
+  remote_is_v6=0
+  if [ "${remote_ip#*:}" != "$remote_ip" ]; then
+    remote_is_v6=1
+  fi
+
+  # 自连环检查（落地 IP 不能等于本机的 v4 / v6）
+  my_v4=$(detect_primary_ipv4 2>/dev/null || true)
+  my_v6=$(detect_primary_ipv6 2>/dev/null || true)
+  if [ -n "$my_v4" ] && [ "$remote_ip" = "$my_v4" ]; then
+    echo -e "${R}落地 IP ${remote_ip} 与本机 IPv4 相同，会形成自连环${N}"
+    echo -e "${Y}realm 会把流量转给本机自己，CPU 跑满${N}"
+    return 1
+  fi
+  if [ -n "$my_v6" ] && [ "$remote_ip" = "$my_v6" ]; then
+    echo -e "${R}落地 IP ${remote_ip} 与本机 IPv6 相同，会形成自连环${N}"
+    return 1
+  fi
+
+  # IPv6 加方括号
+  if [ "$remote_is_v6" = "1" ]; then
     remote_ip="[${remote_ip}]"
   fi
 
@@ -7777,9 +7807,12 @@ realm_menu_add(){
   fi
 
   echo ""
-  echo -e "  ${B}监听地址类型${N}"
-  echo -e "  ${L}1)${N} ${C}[::]:${listen_port}${N}      ${D}双栈监听（推荐，v4+v6 客户端都能进）${N}"
-  echo -e "  ${L}2)${N} ${C}0.0.0.0:${listen_port}${N}   ${D}仅 v4 监听${N}"
+  echo -e "  ${B}本机监听地址${N}  ${D}（决定客户端能用什么 IP 连进来）${N}"
+  echo -e "  ${L}1)${N} ${C}[::]:${listen_port}${N}      ${D}双栈，v4 和 v6 客户端都能进（推荐）${N}"
+  echo -e "  ${L}2)${N} ${C}0.0.0.0:${listen_port}${N}   ${D}仅 v4，IPv6 客户端连不上${N}"
+  if [ "$remote_is_v6" = "1" ]; then
+    echo -e "  ${D}提示：落地是 IPv6 不影响监听类型，本机有 v4 公网选 1 即可${N}"
+  fi
   read -p "  选择 (默认 1): " listen_mode
   case "${listen_mode:-1}" in
     1) listen_str="[::]:${listen_port}" ;;
@@ -7807,8 +7840,11 @@ realm_menu_add(){
   fi
 
   echo ""
-  echo -e "  ${G}✓${N} 客户端连接 ${C}本机IP:${listen_port}${N} 即会被转发到 ${C}${remote_ip}:${remote_port}${N}"
-  echo -e "  ${D}提示：客户端的 SNI / UUID / pbk / 密码等加密参数请按落地机配置填${N}"
+  echo -e "  ${G}✓${N} 客户端连接 ${C}本机IP:${listen_port}${N} 会被转发到 ${C}${remote_ip}:${remote_port}${N}"
+  if [ "$remote_is_v6" = "1" ]; then
+    echo -e "  ${D}（落地是 IPv6，确认本机能 ping 通 ${remote_ip}：${C}ping6 ${remote_ip#[}${N}${D} 去掉方括号试一下）${N}"
+  fi
+  echo -e "  ${D}提示：客户端的 SNI / UUID / pbk / 密码等加密参数请按${B}落地机${N}${D}配置填${N}"
   return 0
 }
 
@@ -7945,7 +7981,12 @@ show_realm_menu(){
     echo -e "  ${Y}③${N} 客户端配置：把 IP 改成 A 的，${R}${B}SNI/UUID/pbk 全部用 B 的${N}"
     echo -e "  ${Y}④${N} 连上访问 ipify.org 应看到 B 的 IP，搞定"
     echo ""
-    echo -e "  ${D}详细教程见 realm-中转落地指南.md${N}"
+    echo -e "  ${B}${C}IPv6 / 双栈场景（不用懵，看一眼就懂）${N}"
+    echo -e "  ${D}落地机 IP 是 ${C}IPv4${D} 还是 ${C}IPv6${D} 都行，加规则时直接填进去即可。${N}"
+    echo -e "  ${D}监听类型决定客户端能用什么 IP 进来：${C}[::]${D} 双栈通吃，${C}0.0.0.0${D} 仅 v4。${N}"
+    echo -e "  ${D}两件事独立——比如本机选 ${C}[::]${D}（v4+v6 客户端都进）落地写 IPv6，OK。${N}"
+    echo ""
+    echo -e "  ${D}详细教程见 realm-中转落地指南.md（含 IPv6 场景表）${N}"
     render_divider
 
     if realm_is_installed; then
