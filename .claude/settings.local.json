@@ -55,7 +55,17 @@
       "Bash(curl -fsSL https://api.github.com/repos/playfulsoul/realm-installer/contents/)",
       "Bash(curl -fsSL https://raw.githubusercontent.com/playfulsoul/realm-installer/main/install.sh -o /tmp/realm-installer.sh)",
       "Read(//tmp/**)",
-      "Bash(curl -fsSL https://raw.githubusercontent.com/playfulsoul/realm-installer/main/README.md -o /tmp/realm-installer.md)"
+      "Bash(curl -fsSL https://raw.githubusercontent.com/playfulsoul/realm-installer/main/README.md -o /tmp/realm-installer.md)",
+      "Bash(curl *)",
+      "Bash(tar tzf *)",
+      "Bash(tar xzf *)",
+      "Bash(chmod +x /tmp/realm)",
+      "Bash(/tmp/realm --help)",
+      "Bash(python3 -c ' *)",
+      "Bash(python3 *)",
+      "Bash(PYTHONIOENCODING=utf-8 python3 *)",
+      "Bash(PYTHONIOENCODING=utf-8 python3 parse.py)",
+      "Bash(echo \"exit=$?\")"
     ]
   }
 }

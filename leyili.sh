@@ -7983,6 +7983,141 @@ realm_menu_clear(){
   return 0
 }
 
+# ─── 自检诊断 ─────────────────────────────────────────
+# 一次性把 7 类常见故障点的实际状态打印出来，快速定位"链路不通"
+realm_menu_diagnose(){
+  if ! require_realm_installed; then return 1; fi
+
+  local count
+  count=$(realm_count_rules)
+
+  echo ""
+  echo -e "  ${B}${C}Realm 一键自检诊断${N}"
+  render_divider
+
+  # ── [1] 服务状态
+  echo -e "  ${B}[1/7] 服务状态${N}"
+  local status
+  status=$(systemctl is-active realm 2>/dev/null || echo unknown)
+  if [ "$status" = "active" ]; then
+    echo -e "    ${G}● realm: active${N}"
+  else
+    echo -e "    ${R}● realm: ${status}${N}  ${D}(以下是 systemctl status 摘要)${N}"
+    systemctl status realm --no-pager -l 2>&1 | head -12 | sed 's/^/      /'
+  fi
+  echo ""
+
+  # ── [2] 配置文件
+  echo -e "  ${B}[2/7] 配置文件 ${C}${REALM_CONFIG_PATH}${N}"
+  if [ -f "$REALM_CONFIG_PATH" ]; then
+    sed 's/^/      /' "$REALM_CONFIG_PATH"
+  else
+    echo -e "      ${R}配置文件不存在${N}"
+  fi
+  echo ""
+
+  if [ "$count" -eq 0 ]; then
+    echo -e "  ${Y}[3-6] 无转发规则，跳过端口/防火墙/出站连通性检查${N}"
+    echo ""
+  fi
+
+  # ── [3-6] 逐条规则
+  local idx listen_str remote_str listen_port r_host r_port
+  while IFS='|' read -r idx listen_str remote_str; do
+    listen_port=$(printf '%s' "$listen_str" | awk -F: '{print $NF}')
+    # remote 格式：IPv4 = 1.2.3.4:443，IPv6 = [2001:db8::1]:443
+    if [[ "$remote_str" =~ ^\[(.+)\]:([0-9]+)$ ]]; then
+      r_host="${BASH_REMATCH[1]}"
+      r_port="${BASH_REMATCH[2]}"
+    else
+      r_host="${remote_str%:*}"
+      r_port="${remote_str##*:}"
+    fi
+
+    echo -e "  ${B}━━━ 规则 ${Y}${idx}${B}: ${C}${listen_str}${N} ${B}→${N} ${C}${remote_str}${N} ${B}━━━${N}"
+
+    # [3] 监听端口
+    echo -e "  ${B}[3/7] 端口监听情况${N}"
+    local tcp_listen udp_listen
+    tcp_listen=$(ss -tlnH 2>/dev/null | awk -v p=":${listen_port}\$" '$4 ~ p { print "      " $0 }')
+    udp_listen=$(ss -ulnH 2>/dev/null | awk -v p=":${listen_port}\$" '$4 ~ p { print "      " $0 }')
+    if [ -n "$tcp_listen" ]; then
+      echo -e "    ${G}TCP ✓ 已监听${N}"
+      echo "$tcp_listen"
+    else
+      echo -e "    ${R}TCP ✗ 未监听 ${listen_port}${N}  ${D}(realm 未起来 / 配置没生效)${N}"
+    fi
+    if [ -n "$udp_listen" ]; then
+      echo -e "    ${G}UDP ✓ 已监听${N}"
+      echo "$udp_listen"
+    else
+      echo -e "    ${Y}UDP ✗ 未监听 ${listen_port}${N}  ${D}(Hy2/QUIC 必需; Reality/AnyTLS 不需要)${N}"
+    fi
+
+    # [4] v4 防火墙
+    echo -e "  ${B}[4/7] IPv4 INPUT 防火墙${N}"
+    local v4_pol v4_match
+    v4_pol=$(iptables -L INPUT -n 2>/dev/null | head -1 | awk '{print $4}')
+    if [ "$v4_pol" = "ACCEPT" ]; then
+      echo -e "    ${G}默认策略 ACCEPT，无需显式放行${N}"
+    elif [ "$v4_pol" = "DROP" ]; then
+      v4_match=$(iptables -nL INPUT 2>/dev/null | awk -v p="dpt:${listen_port}\$" '$0 ~ p { print "      " $0 }')
+      if [ -n "$v4_match" ]; then
+        echo -e "    ${G}默认 DROP, 已显式放行 ${listen_port}${N}"
+        echo "$v4_match"
+      else
+        echo -e "    ${R}默认 DROP 但未放行 ${listen_port}/tcp${N}"
+      fi
+    else
+      echo -e "    ${Y}默认策略未知: ${v4_pol:-?}${N}"
+    fi
+
+    # [5] v6 防火墙
+    echo -e "  ${B}[5/7] IPv6 INPUT 防火墙${N}"
+    local v6_pol v6_match
+    v6_pol=$(ip6tables -L INPUT -n 2>/dev/null | head -1 | awk '{print $4}')
+    if [ "$v6_pol" = "ACCEPT" ]; then
+      echo -e "    ${G}默认策略 ACCEPT，无需显式放行${N}"
+    elif [ "$v6_pol" = "DROP" ]; then
+      v6_match=$(ip6tables -nL INPUT 2>/dev/null | awk -v p="dpt:${listen_port}\$" '$0 ~ p { print "      " $0 }')
+      if [ -n "$v6_match" ]; then
+        echo -e "    ${G}默认 DROP, 已显式放行 ${listen_port}${N}"
+        echo "$v6_match"
+      else
+        echo -e "    ${R}默认 DROP 但未放行 ${listen_port}/tcp${N}  ${D}(v6 客户端进不来)${N}"
+      fi
+    else
+      echo -e "    ${Y}默认策略未知: ${v6_pol:-?}${N}"
+    fi
+
+    # [6] 出站连通性
+    echo -e "  ${B}[6/7] 中转机 → 落地机 ${C}${r_host}:${r_port}${N} ${B}TCP 出站${N}"
+    if command -v nc >/dev/null 2>&1; then
+      if timeout 6 nc -z -w 5 "$r_host" "$r_port" >/dev/null 2>&1; then
+        echo -e "    ${G}✓ TCP 出站可达 (落地机端口能接受)${N}"
+      else
+        echo -e "    ${R}✗ TCP 出站不通${N}  ${D}(落地机 sing-box 没起 / 落地防火墙 / 路由 / 安全组)${N}"
+      fi
+    else
+      echo -e "    ${Y}nc 命令不可用，跳过出站连通性检查${N}"
+    fi
+    echo ""
+
+  done < <(realm_list_rules)
+
+  # ── [7] 日志
+  echo -e "  ${B}[7/7] realm 最近 30 行日志${N}"
+  if journalctl -u realm --no-pager -n 30 2>/dev/null | sed 's/^/      /'; then
+    :
+  else
+    echo -e "      ${Y}journalctl 读取失败${N}"
+  fi
+  echo ""
+
+  echo -e "  ${D}诊断完成。把以上输出全部贴给开发者即可定位问题。${N}"
+  return 0
+}
+
 # ─── 顶级菜单 ─────────────────────────────────────────
 show_realm_menu(){
   while true; do
@@ -8031,7 +8166,8 @@ show_realm_menu(){
     render_menu_item 5 "清空全部规则"
     render_menu_item 6 "重启 realm 服务"
     render_menu_item 7 "查看实时日志"
-    render_menu_item 8 "卸载 Realm"
+    render_menu_item 8 "一键自检诊断"
+    render_menu_item 9 "卸载 Realm"
     render_menu_item 0 "返回上级"
     render_divider
     read -p "  请输入序号: " choice
@@ -8057,7 +8193,8 @@ show_realm_menu(){
           journalctl -u realm -f --no-pager 2>/dev/null || true
         fi
         ;;
-      8) realm_uninstall; pause_screen ;;
+      8) realm_menu_diagnose; pause_screen ;;
+      9) realm_uninstall; pause_screen ;;
       0) return ;;
       *) notify_invalid_choice ;;
     esac
