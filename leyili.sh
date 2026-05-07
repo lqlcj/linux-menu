@@ -8149,17 +8149,195 @@ show_update_menu(){
   done
 }
 
+check_reality_dest_domain(){
+  local domain ips ip ipn org cdn_match handshake proto x25 alpn cipher
+  local cert_san cert_match=0 san san_value suffix
+  local any_fail=0 fastest=999 t i testip
+  local CDN_BLACKLIST="Cloudflare|Fastly|Akamai|CloudFront|Amazon|Microsoft|Google|Azure|Incapsula|Imperva"
+
+  echo ""
+  read -p "  请输入要测试的域名（如 www.osaka-u.ac.jp，回车取消）: " domain
+  domain=$(echo "$domain" | tr -d ' \t\r\n')
+  if [ -z "$domain" ]; then
+    return 0
+  fi
+  if ! printf '%s' "$domain" | grep -qE '^[a-zA-Z0-9._-]+$'; then
+    echo -e "${R}  域名格式不合法（仅允许字母、数字、点、横线、下划线）${N}"
+    pause_screen
+    return 1
+  fi
+
+  echo ""
+  render_section_header "Reality 域名检测：$domain"
+  echo ""
+
+  # 1. DNS 解析
+  echo -e "  ${B}[1/6] DNS 解析${N}"
+  ips=$(getent ahosts "$domain" 2>/dev/null | awk '{print $1}' | sort -u)
+  if [ -z "$ips" ]; then
+    echo -e "    ${R}✗ DNS 解析失败${N}"
+    echo ""
+    render_divider
+    echo -e "  ${R}✗ 不可用 — DNS 解析失败${N}"
+    echo ""
+    pause_screen
+    return 1
+  fi
+  ipn=$(echo "$ips" | wc -l | tr -d ' ')
+  ip=$(echo "$ips" | head -1)
+  if [ "$ipn" -le 3 ]; then
+    echo -e "    ${G}✓${N} 解析到 ${C}${ipn}${N} 个 IP："
+  else
+    echo -e "    ${Y}△${N} 解析到 ${C}${ipn}${N} 个 IP（>3 个有踩死 IP 风险）："
+  fi
+  echo "$ips" | sed 's/^/      /'
+
+  # 2. ASN / 归属
+  echo ""
+  echo -e "  ${B}[2/6] IP 归属（首个 IP）${N}"
+  org=$(curl -s --max-time 5 "https://ipinfo.io/$ip/org" 2>/dev/null | tr -d '\n')
+  if [ -z "$org" ]; then
+    echo -e "    ${Y}? 无法查询 ipinfo.io（VPS 网络受限），跳过${N}"
+    org="未知"
+  elif echo "$org" | grep -qiE "$CDN_BLACKLIST"; then
+    cdn_match=$(echo "$org" | grep -ioE "$CDN_BLACKLIST" | head -1)
+    echo -e "    ${R}✗ $org${N}"
+    echo -e "    ${R}  → 命中 CDN/云厂商黑名单（${cdn_match}）${N}"
+  else
+    echo -e "    ${G}✓ $org${N}"
+  fi
+
+  # 3. TCP 443 通断（所有 IP）
+  echo ""
+  echo -e "  ${B}[3/6] TCP 443 通断${N}"
+  for testip in $ips; do
+    if timeout 3 bash -c "echo > /dev/tcp/$testip/443" 2>/dev/null; then
+      echo -e "    ${G}✓${N} $testip"
+    else
+      echo -e "    ${R}✗${N} $testip"
+      any_fail=1
+    fi
+  done
+
+  # 4. TLS 1.3 + X25519 + ALPN
+  echo ""
+  echo -e "  ${B}[4/6] TLS 1.3 + X25519 + ALPN（IP=${ip}）${N}"
+  handshake=$(echo | timeout 5 openssl s_client -connect "$ip:443" -servername "$domain" \
+                -tls1_3 -groups X25519 -alpn h2,http/1.1 2>/dev/null)
+  proto=$(echo "$handshake" | grep -m1 -oE 'TLSv1\.[0-9]+')
+  x25=$(echo "$handshake" | grep -q 'X25519' && echo yes || echo no)
+  alpn=$(echo "$handshake" | grep -m1 -oE 'ALPN protocol: \S+' | awk '{print $3}')
+  cipher=$(echo "$handshake" | grep -m1 -oE 'Cipher\s*:\s*\S+' | awk -F'[: ]+' '{print $NF}')
+
+  if [ "$proto" = "TLSv1.3" ]; then
+    echo -e "    ${G}✓${N} Protocol: TLSv1.3"
+  else
+    echo -e "    ${R}✗${N} Protocol: ${proto:-握手失败} ${R}(reality 强制 TLS 1.3)${N}"
+  fi
+  if [ "$x25" = "yes" ]; then
+    echo -e "    ${G}✓${N} X25519 密钥交换支持"
+  else
+    echo -e "    ${R}✗${N} X25519 ${R}不支持（reality 默认密钥交换）${N}"
+  fi
+  case "$alpn" in
+    h2)        echo -e "    ${G}✓${N} ALPN: h2 (HTTP/2，最现代)" ;;
+    http/1.1)  echo -e "    ${Y}△${N} ALPN: http/1.1 (可用但伪装稍弱)" ;;
+    "")        echo -e "    ${Y}△${N} ALPN: 未协商" ;;
+    *)         echo -e "    ${Y}△${N} ALPN: $alpn" ;;
+  esac
+  if [ -n "$cipher" ]; then
+    echo -e "    ${C}  Cipher: $cipher${N}"
+  fi
+
+  # 5. 证书 SAN
+  echo ""
+  echo -e "  ${B}[5/6] 证书 SAN 是否覆盖该域名${N}"
+  cert_san=$(echo | timeout 5 openssl s_client -connect "$ip:443" -servername "$domain" 2>/dev/null \
+              | openssl x509 -noout -ext subjectAltName 2>/dev/null \
+              | grep -oE 'DNS:[^,]+' | tr -d ' ' | head -10)
+  if [ -n "$cert_san" ]; then
+    while IFS= read -r san; do
+      san_value=${san#DNS:}
+      if [ "$san_value" = "$domain" ]; then
+        cert_match=1
+        break
+      fi
+      case "$san_value" in
+        \*.*)
+          suffix=${san_value#\*.}
+          case "$domain" in
+            *.$suffix) cert_match=1; break ;;
+          esac
+          ;;
+      esac
+    done <<EOF
+$cert_san
+EOF
+    if [ "$cert_match" = "1" ]; then
+      echo -e "    ${G}✓${N} 证书覆盖该域名"
+    else
+      echo -e "    ${Y}△${N} 证书 SAN 未明确覆盖："
+    fi
+    echo "$cert_san" | head -3 | sed 's/^/      /'
+  else
+    echo -e "    ${Y}△${N} 无法读取证书 SAN"
+  fi
+
+  # 6. TCP 握手延迟
+  echo ""
+  echo -e "  ${B}[6/6] TCP 握手延迟（3 次取最快）${N}"
+  for i in 1 2 3; do
+    t=$(curl -o /dev/null -s --max-time 4 --resolve "$domain:443:$ip" \
+        -w '%{time_connect}' "https://$domain/" 2>/dev/null)
+    if [ -n "$t" ]; then
+      echo -e "    第 $i 次: ${C}${t}s${N}"
+      if awk "BEGIN { exit !($t < $fastest) }" 2>/dev/null; then
+        fastest=$t
+      fi
+    else
+      echo -e "    第 $i 次: ${R}失败${N}"
+    fi
+  done
+
+  # 综合评级
+  echo ""
+  render_divider
+  echo -e "  ${B}综合判定${N}"
+  if [ -n "$cdn_match" ]; then
+    echo -e "    ${R}✗ 不可用 — 命中 CDN/云厂商黑名单（$cdn_match）${N}"
+  elif [ "$proto" != "TLSv1.3" ] || [ "$x25" != "yes" ]; then
+    echo -e "    ${R}✗ 不可用 — TLS 1.3 + X25519 不满足${N}"
+  elif [ "$any_fail" = "1" ]; then
+    echo -e "    ${Y}△ 慎用 — 有 IP 不通，可能成为定时炸弹（参考 tmu.ac.jp 案例）${N}"
+  elif [ "$ipn" -gt 3 ]; then
+    echo -e "    ${Y}△ 慎用 — IP 数量较多（${ipn} 个），未来踩死 IP 风险偏高${N}"
+  elif [ "$alpn" != "h2" ]; then
+    echo -e "    ${Y}△ 可用 — 但 ALPN 是 ${alpn:-未协商}，伪装稍弱${N}"
+  elif [ "$cert_match" != "1" ]; then
+    echo -e "    ${Y}△ 可用 — 但证书 SAN 未覆盖该域名${N}"
+  else
+    echo -e "    ${G}✓ 完美 — 全部硬指标通过，建议作为 reality dest${N}"
+  fi
+  if [ "$fastest" != "999" ]; then
+    echo -e "    最快延迟: ${C}${fastest}s${N}"
+  fi
+  echo ""
+  pause_screen
+}
+
 show_node_manage_menu(){
   while true; do
     render_section_header "节点管理"
     render_menu_item 1 "创建节点 (Reality / Hysteria2 / AnyTLS / TUIC)"
     render_menu_item 2 "卸载单个节点"
+    render_menu_item 3 "Reality 域名检测工具"
     render_menu_item 0 "返回上级"
     render_divider
     read -p "  请输入序号: " choice
     case $choice in
       1) show_node_install_menu ;;
       2) show_node_uninstall_menu ;;
+      3) check_reality_dest_domain ;;
       0) return ;;
       *) notify_invalid_choice ;;
     esac
