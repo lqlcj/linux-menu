@@ -8459,14 +8459,25 @@ warp_reregister_account(){
 }
 
 # 解析 wgcf-profile.conf，输出 KEY=VALUE 行供 eval 使用
-# 注意：用 [[:space:]] 替代 \s（mawk 不支持 \s），并通过 sub 保留 base64 尾部的 =
+# 兼容两种格式：
+#   - 旧版：两条独立 Address 行（v4 一条、v6 一条）
+#   - wgcf v2.2.30+：一条 Address 行，v4/v6 用逗号分隔
 warp_parse_profile(){
   local f="$WARP_WGCF_PROFILE"
   [ -f "$f" ] || { warp_log_err "wgcf 配置缺失：$f"; return 1; }
-  local pk v4 v6
+  local pk addr_blob v4 v6 one
   pk=$(awk '/^[[:space:]]*PrivateKey[[:space:]]*=/ {sub(/^[^=]*=[[:space:]]*/, ""); print; exit}' "$f" | tr -d ' \r')
-  v4=$(awk '/^[[:space:]]*Address[[:space:]]*=/ && $0 !~ /:/ {sub(/^[^=]*=[[:space:]]*/, ""); print; exit}' "$f" | tr -d ' \r')
-  v6=$(awk '/^[[:space:]]*Address[[:space:]]*=/ && $0 ~  /:/ {sub(/^[^=]*=[[:space:]]*/, ""); print; exit}' "$f" | tr -d ' \r')
+  # 收集所有 Address 行（不带 ; exit），合并后按逗号拆，逐段按是否含 ':' 分流到 v4/v6
+  addr_blob=$(awk '/^[[:space:]]*Address[[:space:]]*=/ {sub(/^[^=]*=[[:space:]]*/, ""); print}' "$f" | tr -d '\r')
+  while IFS= read -r one; do
+    one="${one//[[:space:]]/}"
+    [ -z "$one" ] && continue
+    if [[ "$one" == *:* ]]; then
+      [ -z "$v6" ] && v6="$one"
+    else
+      [ -z "$v4" ] && v4="$one"
+    fi
+  done < <(printf '%s\n' "$addr_blob" | tr ',' '\n')
   if [ -z "$pk" ] || [ -z "$v4" ]; then
     warp_log_err "解析 wgcf 配置失败（缺 PrivateKey 或 IPv4 Address）"
     warp_log_err "请检查：cat $f"
