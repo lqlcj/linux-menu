@@ -14,6 +14,7 @@ COMMAND_NAME="sb"
 SCRIPT_PATH="/usr/local/bin/${COMMAND_NAME}"
 SELF_INSTALL_URL="${SELF_INSTALL_URL:-https://raw.githubusercontent.com/lqlcj/linux-menu/main/leyili.sh}"
 TCP_TUNING_PATH="/etc/sysctl.d/99-proxy-optimized.conf"
+QUIC_TUNING_PATH="/etc/sysctl.d/99-quic-optimized.conf"
 INITCWND_SERVICE_PATH="/etc/systemd/system/initcwnd.service"
 INITCWND_VALUE="24"
 SWAPFILE_PATH="/swapfile"
@@ -2116,7 +2117,7 @@ show_system_menu(){
     render_menu_item 2 "启用自动更新"
     render_menu_item 3 "校正系统时间"
     render_menu_item 4 "安装基础工具"
-    render_menu_item 5 "一键网络优化 (TCP + initcwnd)"
+    render_menu_item 5 "网络优化"
     render_menu_item 6 "查看网络优化状态"
     render_menu_item 7 "添加 SWAP (2G)"
     render_menu_item 0 "返回上级"
@@ -4151,10 +4152,183 @@ remove_tcp_tuning(){
   pause_screen
 }
 
+apply_quic_tuning(){
+  local region="${1:-us-west}"
+  local mem_tier="${2:-2g}"
+  local region_label buffer_max mem_label
+
+  if ! require_root; then return 1; fi
+
+  case "$region" in
+    hk)      region_label="香港" ;;
+    jp)      region_label="日本" ;;
+    us-west) region_label="美西" ;;
+    eu)      region_label="欧洲" ;;
+    *)
+      echo -e "${R}未知地区: $region${N}"
+      return 1
+      ;;
+  esac
+
+  case "${region}_${mem_tier}" in
+    hk_1g)       buffer_max=16777216  ;;
+    hk_2g)       buffer_max=33554432  ;;
+    hk_4g)       buffer_max=33554432  ;;
+    hk_8g)       buffer_max=67108864  ;;
+    jp_1g)       buffer_max=16777216  ;;
+    jp_2g)       buffer_max=33554432  ;;
+    jp_4g)       buffer_max=67108864  ;;
+    jp_8g)       buffer_max=67108864  ;;
+    us-west_1g)  buffer_max=25165824  ;;
+    us-west_2g)  buffer_max=67108864  ;;
+    us-west_4g)  buffer_max=100663296 ;;
+    us-west_8g)  buffer_max=134217728 ;;
+    eu_1g)       buffer_max=33554432  ;;
+    eu_2g)       buffer_max=67108864  ;;
+    eu_4g)       buffer_max=134217728 ;;
+    eu_8g)       buffer_max=134217728 ;;
+    *)
+      echo -e "${R}未知组合: ${region}/${mem_tier}${N}"
+      return 1
+      ;;
+  esac
+
+  case "$mem_tier" in
+    1g)  mem_label="1GB"  ;;
+    2g)  mem_label="2GB"  ;;
+    4g)  mem_label="4GB"  ;;
+    8g)  mem_label="8GB+" ;;
+    *)   mem_label="$mem_tier" ;;
+  esac
+
+  echo ""
+  echo -e "${Y}==> 写入 ${region_label}/${mem_label} QUIC/UDP 参数优化配置 (上限 $((buffer_max/1024/1024))M)...${N}"
+
+  cat > "$QUIC_TUNING_PATH" <<EOF
+# leyili-quic-profile: region=${region} mem_tier=${mem_tier}
+# 由 leyili.sh QUIC/UDP 协议优化生成 (${region_label} / ${mem_label})
+# 与 99-proxy-optimized.conf 配合使用，互不冲突；服务对象：TUIC / Hysteria2
+
+# --- UDP socket 缓冲区 (QUIC 性能命根子) ---
+# QUIC 在用户态做拥塞控制，内核缓冲区只负责暂存，过小直接 packet drop
+# sing-box 启动若日志出现 "failed to sufficiently increase receive buffer size"
+# 说明这两个值未生效
+net.core.rmem_max = ${buffer_max}
+net.core.wmem_max = ${buffer_max}
+net.core.rmem_default = 1048576
+net.core.wmem_default = 1048576
+
+# --- 网卡入队深度 (TCP/UDP 共享，取较大值兼容) ---
+net.core.netdev_max_backlog = 32768
+
+# --- conntrack (NAT 环境下 UDP 流易爆表，1M 条目 ≈ 200MB 内存) ---
+# 容器/LXC 内可能写不进去，sysctl -p 失败时由上层提示
+net.netfilter.nf_conntrack_max = 1048576
+net.netfilter.nf_conntrack_udp_timeout = 60
+net.netfilter.nf_conntrack_udp_timeout_stream = 180
+EOF
+
+  echo -e "${Y}==> 应用 sysctl 配置...${N}"
+  if ! sysctl -p "$QUIC_TUNING_PATH"; then
+    echo -e "${R}QUIC 参数应用失败，请检查内核兼容性或 sysctl 输出${N}"
+    echo -e "${D}（容器/LXC 环境下 nf_conntrack_* 可能不可写，属正常现象）${N}"
+    return 1
+  fi
+
+  return 0
+}
+
+remove_quic_tuning(){
+  local confirm=""
+
+  if ! require_root; then
+    return 1
+  fi
+
+  if [ ! -f "$QUIC_TUNING_PATH" ]; then
+    echo ""
+    echo -e "${Y}未检测到 QUIC 优化配置，无需移除${N}"
+    pause_screen
+    return 0
+  fi
+
+  echo ""
+  echo -e "${Y}==> 即将移除 ${C}$QUIC_TUNING_PATH${N}${Y}，并通过 sysctl --system 复位参数${N}"
+  read -p "  确认继续？(y/N): " confirm
+  if [ "$confirm" != "y" ] && [ "$confirm" != "Y" ]; then
+    echo -e "  已取消"
+    sleep 1
+    return 0
+  fi
+
+  rm -f "$QUIC_TUNING_PATH"
+
+  sysctl --system >/dev/null 2>&1 || true
+
+  echo ""
+  echo -e "${G}QUIC 优化已移除（UDP 缓冲区将回落至 99-proxy-optimized.conf 或内核默认值）${N}"
+  pause_screen
+}
+
+apply_quic_optimization(){
+  local region="$1"
+  local mem_tier="$2"
+  local region_label mem_label
+  local buffer_max
+
+  if ! require_root; then return 1; fi
+
+  case "$region" in
+    hk)      region_label="香港" ;;
+    jp)      region_label="日本" ;;
+    us-west) region_label="美西" ;;
+    eu)      region_label="欧洲" ;;
+    *)
+      echo -e "${R}未知地区: $region${N}"
+      pause_screen
+      return 1
+      ;;
+  esac
+
+  case "$mem_tier" in
+    1g)  mem_label="1GB"  ;;
+    2g)  mem_label="2GB"  ;;
+    4g)  mem_label="4GB"  ;;
+    8g)  mem_label="8GB+" ;;
+    *)
+      echo -e "${R}未知内存档: $mem_tier${N}"
+      pause_screen
+      return 1
+      ;;
+  esac
+
+  if ! apply_quic_tuning "$region" "$mem_tier"; then
+    echo -e "${R}QUIC 调优失败，已中止${N}"
+    pause_screen
+    return 1
+  fi
+
+  buffer_max=$(awk -F'=' '/^[[:space:]]*net\.core\.rmem_max/ { gsub(/[[:space:]]/, "", $2); print $2; exit }' "$QUIC_TUNING_PATH" 2>/dev/null)
+
+  echo ""
+  echo -e "${G}✓ QUIC/UDP 协议优化完成${N}"
+  echo -e "  地区        : ${C}$region_label${N}"
+  echo -e "  内存档位    : ${C}$mem_label${N}"
+  if [ -n "$buffer_max" ] && [ "$buffer_max" -gt 0 ] 2>/dev/null; then
+    echo -e "  rmem/wmem   : ${C}$((buffer_max / 1024 / 1024))M${N}"
+  fi
+  echo -e "  配置文件    : ${C}$QUIC_TUNING_PATH${N}"
+  echo ""
+  echo -e "  ${D}提示：调优生效后建议重启 sing-box 让 TUIC/HY2 重新分配缓冲区${N}"
+  echo -e "  ${D}      systemctl restart sing-box${N}"
+  pause_screen
+}
+
 apply_initcwnd_optimization(){
   local route_line route_spec ip_bin current_route
   local initcwnd_value="${1:-$INITCWND_VALUE}"
   local quiet="${2:-0}"
+
 
   if ! require_root; then return 1; fi
 
@@ -4381,11 +4555,35 @@ apply_network_optimization(){
 }
 
 show_network_optimization_menu(){
+  local choice
+
+  while true; do
+    render_section_header "网络优化"
+    render_menu_item 1 "TCP 调优 + initcwnd"
+    render_menu_item 2 "QUIC/UDP 协议优化"
+    render_menu_item 3 "移除 TCP 调优"
+    render_menu_item 4 "移除 QUIC 调优"
+    render_menu_item 0 "返回上级"
+    render_divider
+    read -p "  请输入序号: " choice
+
+    case "$choice" in
+      1) show_tcp_optimization_picker ;;
+      2) show_quic_optimization_picker ;;
+      3) remove_tcp_tuning ;;
+      4) remove_quic_tuning ;;
+      0) return ;;
+      *) notify_invalid_choice ;;
+    esac
+  done
+}
+
+show_tcp_optimization_picker(){
   local region region_choice region_label mem_choice mem_tier
   local detected_mem_kb detected_mem_gb
 
   while true; do
-    render_section_header "一键网络优化（TCP + initcwnd）"
+    render_section_header "TCP 调优 + initcwnd"
     render_menu_item 1 "香港   ${D}(RTT≈80ms,  BDP≈10M)${N}"
     render_menu_item 2 "日本   ${D}(RTT≈120ms, BDP≈15M)${N}"
     render_menu_item 3 "美西   ${D}(RTT≈200ms, BDP≈25M)${N}"
@@ -4431,7 +4629,65 @@ show_network_optimization_menu(){
       esac
 
       apply_network_optimization "$region" "$mem_tier"
-      break
+      return
+    done
+  done
+}
+
+show_quic_optimization_picker(){
+  local region region_choice region_label mem_choice mem_tier
+  local detected_mem_kb detected_mem_gb
+
+  while true; do
+    render_section_header "QUIC/UDP 协议优化"
+    echo -e "  ${D}面向 TUIC / Hysteria2，调整 UDP 缓冲区与 conntrack${N}"
+    echo ""
+    render_menu_item 1 "香港   ${D}(亚洲低延迟)${N}"
+    render_menu_item 2 "日本   ${D}(亚洲低延迟)${N}"
+    render_menu_item 3 "美西   ${D}(跨太平洋高 BDP)${N}"
+    render_menu_item 4 "欧洲   ${D}(欧亚高延迟)${N}"
+    render_menu_item 0 "返回上级"
+    render_divider
+    read -p "  请选择地区: " region_choice
+
+    case "$region_choice" in
+      1) region="hk";      region_label="香港" ;;
+      2) region="jp";      region_label="日本" ;;
+      3) region="us-west"; region_label="美西" ;;
+      4) region="eu";      region_label="欧洲" ;;
+      0) return ;;
+      *) notify_invalid_choice; continue ;;
+    esac
+
+    while true; do
+      render_section_header "${region_label} · 选择内存档位"
+
+      detected_mem_kb=$(awk '/MemTotal/ {print $2}' /proc/meminfo 2>/dev/null)
+      if [ -n "$detected_mem_kb" ] && [ "$detected_mem_kb" -gt 0 ]; then
+        detected_mem_gb=$(awk -v kb="$detected_mem_kb" 'BEGIN { printf "%.1f", kb / 1024 / 1024 }')
+        echo -e "  ${D}当前检测到内存: ${detected_mem_gb} GB（仅供参考，请按实际选择）${N}"
+        echo ""
+      fi
+
+      render_menu_item 1 "1 GB     ${D}缓冲上限 $(_buffer_label_for "$region" 1g)${N}"
+      render_menu_item 2 "2 GB     ${D}缓冲上限 $(_buffer_label_for "$region" 2g)${N}"
+      render_menu_item 3 "4 GB     ${D}缓冲上限 $(_buffer_label_for "$region" 4g)${N}"
+      render_menu_item 4 "8 GB+    ${D}缓冲上限 $(_buffer_label_for "$region" 8g)${N}"
+      render_menu_item 0 "返回选择地区"
+      render_divider
+      read -p "  请选择内存档位: " mem_choice
+
+      case "$mem_choice" in
+        1) mem_tier="1g" ;;
+        2) mem_tier="2g" ;;
+        3) mem_tier="4g" ;;
+        4) mem_tier="8g" ;;
+        0) break ;;
+        *) notify_invalid_choice; continue ;;
+      esac
+
+      apply_quic_optimization "$region" "$mem_tier"
+      return
     done
   done
 }
@@ -4534,6 +4790,55 @@ show_network_optimization_status(){
   echo -e "  notsent   : ${C}$tcp_notsent${N}"
   echo -e "  fin_timeout : ${C}$tcp_fin_timeout${N}"
   echo -e "  keepalive : ${C}$tcp_keepalive${N}"
+  echo ""
+
+  local quic_config_status quic_profile_text="未配置"
+  local quic_rmem_max quic_wmem_max
+  local conntrack_max conntrack_count
+  if [ -f "$QUIC_TUNING_PATH" ]; then
+    quic_config_status="已存在"
+    local quic_profile_line region mem_tier region_label="" mem_label=""
+    quic_profile_line=$(awk '/^# leyili-quic-profile:/ { print; exit }' "$QUIC_TUNING_PATH" 2>/dev/null)
+    if [ -n "$quic_profile_line" ]; then
+      region=$(printf '%s\n' "$quic_profile_line" | sed -n 's/.*region=\([a-z-]\+\).*/\1/p')
+      mem_tier=$(printf '%s\n' "$quic_profile_line" | sed -n 's/.*mem_tier=\([a-z0-9]\+\).*/\1/p')
+      case "$region" in
+        hk)      region_label="香港" ;;
+        jp)      region_label="日本" ;;
+        us-west) region_label="美西" ;;
+        eu)      region_label="欧洲" ;;
+      esac
+      case "$mem_tier" in
+        1g) mem_label="1GB"  ;;
+        2g) mem_label="2GB"  ;;
+        4g) mem_label="4GB"  ;;
+        8g) mem_label="8GB+" ;;
+      esac
+      if [ -n "$region_label" ] && [ -n "$mem_label" ]; then
+        quic_profile_text="${region_label} / ${mem_label}"
+      fi
+    fi
+  else
+    quic_config_status="未写入"
+  fi
+
+  quic_rmem_max=$(sysctl -n net.core.rmem_max 2>/dev/null || echo "")
+  quic_wmem_max=$(sysctl -n net.core.wmem_max 2>/dev/null || echo "")
+
+  echo -e "  ${B}QUIC/UDP 参数状态${N}"
+  echo -e "  配置文件  : ${C}$quic_config_status${N} (${QUIC_TUNING_PATH})"
+  echo -e "  配置档位  : ${C}$quic_profile_text${N}"
+  if [ -n "$quic_rmem_max" ] && [ "$quic_rmem_max" -gt 0 ] 2>/dev/null; then
+    echo -e "  rmem_max  : ${C}$((quic_rmem_max / 1024 / 1024))M${N}"
+  fi
+  if [ -n "$quic_wmem_max" ] && [ "$quic_wmem_max" -gt 0 ] 2>/dev/null; then
+    echo -e "  wmem_max  : ${C}$((quic_wmem_max / 1024 / 1024))M${N}"
+  fi
+  if [ -r /proc/sys/net/netfilter/nf_conntrack_max ]; then
+    conntrack_max=$(cat /proc/sys/net/netfilter/nf_conntrack_max 2>/dev/null || echo "?")
+    conntrack_count=$(cat /proc/sys/net/netfilter/nf_conntrack_count 2>/dev/null || echo "?")
+    echo -e "  conntrack : ${C}${conntrack_count}${N} / ${C}${conntrack_max}${N}"
+  fi
   pause_screen
 }
 
@@ -7338,7 +7643,7 @@ sync_anytls_to_reality_keys(){
 #          legacy /root/proxy-info.txt、/usr/local/bin/sb。
 # 不动：SSH 端口/sshd 配置、用户账户、sudoers、自动更新策略、
 #        IPv6 防火墙菜单规则、1Panel、apt 基础工具、
-#        TCP 网络优化、initcwnd 持久化服务、本脚本创建的 SWAP。
+#        TCP 网络优化、QUIC 协议优化、initcwnd 持久化服务、本脚本创建的 SWAP。
 uninstall_script_completely(){
   if ! require_root; then return 1; fi
 
@@ -7353,7 +7658,7 @@ uninstall_script_completely(){
   echo -e "    ${L}·${N} ${C}${INFO_PATH}${N} 与 ${C}${SCRIPT_PATH}${N}"
   echo ""
   echo -e "  ${D}保留：SSH 配置 / 用户账户 / sudoers / 自动更新 / IPv6 防火墙规则 / 1Panel${N}"
-  echo -e "  ${D}保留：TCP 网络优化 / initcwnd 持久化服务 / 本脚本创建的 SWAP${N}"
+  echo -e "  ${D}保留：TCP 网络优化 / QUIC 协议优化 / initcwnd 持久化服务 / 本脚本创建的 SWAP${N}"
   echo ""
   read -p "  确认卸载？(y/N): " confirm
   if [ "$confirm" != "y" ] && [ "$confirm" != "Y" ]; then
@@ -7593,6 +7898,43 @@ render_tcp_card_line(){
   fi
 }
 
+# QUIC 调优行（单排）
+render_quic_card_line(){
+  local label="QUIC 调优  "  # 11 可见列
+  if [ ! -f "$QUIC_TUNING_PATH" ]; then
+    render_card_line "   ${C}${label}${N}${D}未启用${N}"
+    return
+  fi
+  local profile_line region="" mem_tier="" region_label="" mem_label=""
+  profile_line=$(awk '/^# leyili-quic-profile:/ { print; exit }' "$QUIC_TUNING_PATH" 2>/dev/null)
+  if [ -n "$profile_line" ]; then
+    region=$(printf '%s\n' "$profile_line" | sed -n 's/.*region=\([a-z-]\+\).*/\1/p')
+    mem_tier=$(printf '%s\n' "$profile_line" | sed -n 's/.*mem_tier=\([a-z0-9]\+\).*/\1/p')
+    case "$region" in
+      hk)      region_label="香港" ;;
+      jp)      region_label="日本" ;;
+      us-west) region_label="美西" ;;
+      eu)      region_label="欧洲" ;;
+    esac
+    case "$mem_tier" in
+      1g) mem_label="1G"  ;;
+      2g) mem_label="2G"  ;;
+      4g) mem_label="4G"  ;;
+      8g) mem_label="8G+" ;;
+    esac
+  fi
+  local rmem_max rmem_label="?"
+  rmem_max=$(sysctl -n net.core.rmem_max 2>/dev/null || echo "")
+  if [ -n "$rmem_max" ] && [ "$rmem_max" -gt 0 ] 2>/dev/null; then
+    rmem_label="$((rmem_max / 1024 / 1024))M"
+  fi
+  if [ -n "$region_label" ] && [ -n "$mem_label" ]; then
+    render_card_line "   ${C}${label}${N}${G}已启用${N} ${D}·${N} ${C}${region_label}/${mem_label}${N} ${D}·${N} ${D}rmem=${rmem_label}${N}"
+  else
+    render_card_line "   ${C}${label}${N}${G}已启用${N} ${D}·${N} ${D}rmem=${rmem_label}${N}"
+  fi
+}
+
 # initcwnd 行（单排）
 render_initcwnd_card_line(){
   local label="initcwnd   "  # 11 可见列
@@ -7670,6 +8012,7 @@ render_main_menu_card(){
   render_node_card_block tuic
   render_card_blank
   render_tcp_card_line
+  render_quic_card_line
   render_initcwnd_card_line
   render_realm_card_line
   render_card_blank
