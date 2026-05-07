@@ -66,7 +66,8 @@
       "Bash(PYTHONIOENCODING=utf-8 python3 *)",
       "Bash(PYTHONIOENCODING=utf-8 python3 parse.py)",
       "Bash(echo \"exit=$?\")",
-      "Bash(awk NR>=8870 && NR<=8890 {printf \"%d: %s\\\\n\", NR, $0} *)"
+      "Bash(awk NR>=8870 && NR<=8890 {printf \"%d: %s\\\\n\", NR, $0} *)",
+      "Bash(awk NR>=7080 && NR<=7200 {printf \"%4d: %s\\\\n\", NR, $0} *)"
     ]
   }
 }
