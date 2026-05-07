@@ -8372,10 +8372,10 @@ show_node_manage_menu(){
 # 边界   : 只对通过 sing-box 入站节点转发的流量生效，不影响 VPS 本机直连
 # ═══════════════════════════════════════════════════════════════════════
 
-warp_log_ok()   { echo -e "  ${G}✓${N} $*"; }
-warp_log_info() { echo -e "  ${C}●${N} $*"; }
-warp_log_warn() { echo -e "  ${Y}⚠${N} $*"; }
-warp_log_err()  { echo -e "  ${R}✗${N} $*"; }
+warp_log_ok()   { echo -e "  ${G}✓${N} $*" >&2; }
+warp_log_info() { echo -e "  ${C}●${N} $*" >&2; }
+warp_log_warn() { echo -e "  ${Y}⚠${N} $*" >&2; }
+warp_log_err()  { echo -e "  ${R}✗${N} $*" >&2; }
 
 warp_detect_arch(){
   case "$(uname -m)" in
@@ -8459,15 +8459,17 @@ warp_reregister_account(){
 }
 
 # 解析 wgcf-profile.conf，输出 KEY=VALUE 行供 eval 使用
+# 注意：用 [[:space:]] 替代 \s（mawk 不支持 \s），并通过 sub 保留 base64 尾部的 =
 warp_parse_profile(){
   local f="$WARP_WGCF_PROFILE"
   [ -f "$f" ] || { warp_log_err "wgcf 配置缺失：$f"; return 1; }
   local pk v4 v6
-  pk=$(awk -F= '/^\s*PrivateKey\s*=/ {sub(/^[[:space:]]*/,"",$2); print $2; exit}' "$f" | tr -d ' \r')
-  v4=$(awk '/^\s*Address\s*=/ && $0 !~ /:/ {sub(/^[[:space:]]*Address[[:space:]]*=[[:space:]]*/,""); print; exit}' "$f" | tr -d ' \r')
-  v6=$(awk '/^\s*Address\s*=/ && $0 ~ /:/  {sub(/^[[:space:]]*Address[[:space:]]*=[[:space:]]*/,""); print; exit}' "$f" | tr -d ' \r')
+  pk=$(awk '/^[[:space:]]*PrivateKey[[:space:]]*=/ {sub(/^[^=]*=[[:space:]]*/, ""); print; exit}' "$f" | tr -d ' \r')
+  v4=$(awk '/^[[:space:]]*Address[[:space:]]*=/ && $0 !~ /:/ {sub(/^[^=]*=[[:space:]]*/, ""); print; exit}' "$f" | tr -d ' \r')
+  v6=$(awk '/^[[:space:]]*Address[[:space:]]*=/ && $0 ~  /:/ {sub(/^[^=]*=[[:space:]]*/, ""); print; exit}' "$f" | tr -d ' \r')
   if [ -z "$pk" ] || [ -z "$v4" ]; then
     warp_log_err "解析 wgcf 配置失败（缺 PrivateKey 或 IPv4 Address）"
+    warp_log_err "请检查：cat $f"
     return 1
   fi
   printf 'WARP_PRIVATE_KEY=%s\n' "$pk"
