@@ -6663,7 +6663,7 @@ install_anytls_node(){
     cur_ver=$(get_current_singbox_version)
     echo ""
     echo -e "${R}AnyTLS 协议需要 sing-box ≥ 1.12，当前版本: ${cur_ver:-未知}${N}"
-    echo -e "${Y}请先在「节点 / 内核管理 → 升级 sing-box 内核」中升级后再创建 AnyTLS 节点${N}"
+    echo -e "${Y}请先在「主菜单 → 更新管理 → 升级 sing-box 内核」中升级后再创建 AnyTLS 节点${N}"
     pause_screen
     return 1
   fi
@@ -8120,19 +8120,46 @@ upgrade_singbox_kernel(){
   fi
 }
 
+show_update_menu(){
+  local choice cur_ver kernel_label
+  while true; do
+    if command -v sing-box >/dev/null 2>&1; then
+      cur_ver=$(get_current_singbox_version)
+      if [ -n "$cur_ver" ]; then
+        kernel_label="升级 sing-box 内核  ${D}(当前: v${cur_ver})${N}"
+      else
+        kernel_label="升级 sing-box 内核  ${D}(版本未知)${N}"
+      fi
+    else
+      kernel_label="升级 sing-box 内核  ${D}(未安装)${N}"
+    fi
+
+    render_section_header "更新管理"
+    render_menu_item 1 "更新脚本"
+    render_menu_item 2 "$kernel_label"
+    render_menu_item 0 "返回上级"
+    render_divider
+    read -p "  请输入序号: " choice
+    case $choice in
+      1) update_self_script ;;
+      2) upgrade_singbox_kernel ;;
+      0) return ;;
+      *) notify_invalid_choice ;;
+    esac
+  done
+}
+
 show_node_manage_menu(){
   while true; do
-    render_section_header "节点 / 内核管理"
+    render_section_header "节点管理"
     render_menu_item 1 "创建节点 (Reality / Hysteria2 / AnyTLS / TUIC)"
     render_menu_item 2 "卸载单个节点"
-    render_menu_item 3 "升级 sing-box 内核"
     render_menu_item 0 "返回上级"
     render_divider
     read -p "  请输入序号: " choice
     case $choice in
       1) show_node_install_menu ;;
       2) show_node_uninstall_menu ;;
-      3) upgrade_singbox_kernel ;;
       0) return ;;
       *) notify_invalid_choice ;;
     esac
@@ -8899,7 +8926,7 @@ show_menu(){
     migrate_legacy_info
 
     if is_singbox_installed && [ "$(count_installed_nodes)" -gt 0 ]; then
-      main_action_label="节点 / 内核管理"
+      main_action_label="节点管理"
     else
       main_action_label="创建节点"
     fi
@@ -8915,7 +8942,7 @@ show_menu(){
     render_menu_item 6 "IPv4 防火墙管理"
     render_menu_item 7 "IPv6 防火墙管理"
     render_menu_item 8 "卸载脚本"
-    render_menu_item 9 "更新脚本"
+    render_menu_item 9 "更新管理"
     render_menu_item 0 "退出"
     render_divider
     read -p "  请输入序号: " choice
@@ -8950,7 +8977,7 @@ show_menu(){
         uninstall_script_completely
         ;;
       9)
-        update_self_script
+        show_update_menu
         ;;
       0)
         exit 0
