@@ -8674,6 +8674,82 @@ warp_do_reregister(){
   pause_screen
 }
 
+# 切换 WARP 接入点 IP/端口（影响落到哪个 Cloudflare PoP）
+warp_do_switch_endpoint(){
+  require_root || return 1
+  warp_config_has_outbound || { warp_log_warn "请先安装 WARP"; pause_screen; return 1; }
+  ensure_jq || return 1
+
+  render_section_header "${WARP_APP_NAME} - 切换 Endpoint 节点"
+
+  local cur_host cur_port
+  cur_host=$(jq -r --arg tag "$WARP_OUTBOUND_TAG" \
+    '.endpoints[] | select(.tag == $tag) | .peers[0].address' "$CONFIG_PATH" 2>/dev/null)
+  cur_port=$(jq -r --arg tag "$WARP_OUTBOUND_TAG" \
+    '.endpoints[] | select(.tag == $tag) | .peers[0].port' "$CONFIG_PATH" 2>/dev/null)
+  render_info_line "当前 endpoint" "${C}${cur_host}:${cur_port}${N}"
+  echo ""
+  echo -e "  ${D}免费 WARP 没法严格选区，但 endpoint IP 决定连到哪个 Cloudflare PoP，${N}"
+  echo -e "  ${D}间接影响出口区域。德国出口的话强烈建议先试 188.114.* 系列。${N}"
+  echo ""
+  render_menu_item 1 "162.159.192.1:2408 ${D}（默认 anycast，多数人在用）${N}"
+  render_menu_item 2 "162.159.193.10:2408 ${D}（备选 anycast）${N}"
+  render_menu_item 3 "188.114.96.0:2408 ${D}（亚太地区命中率较高）${N}"
+  render_menu_item 4 "188.114.97.0:2408 ${D}（亚太地区命中率较高）${N}"
+  render_menu_item 5 "engage.cloudflareclient.com:2408 ${D}（DNS 解析的 anycast）${N}"
+  render_menu_item 6 "自定义 IP:端口 ${D}（用 endpoint 扫描工具找到的最佳 IP）${N}"
+  render_menu_item 0 "返回"
+  render_divider
+
+  local choice host port
+  read -r -p "  请选择: " choice
+  case "$choice" in
+    1) host="162.159.192.1";   port="2408" ;;
+    2) host="162.159.193.10";  port="2408" ;;
+    3) host="188.114.96.0";    port="2408" ;;
+    4) host="188.114.97.0";    port="2408" ;;
+    5) host="engage.cloudflareclient.com"; port="2408" ;;
+    6)
+      read -r -p "  Endpoint IP 或域名: " host
+      read -r -p "  端口 [2408]: " port
+      port="${port:-2408}"
+      ;;
+    0) return ;;
+    *) notify_invalid_choice; pause_screen; return ;;
+  esac
+
+  if [ -z "$host" ]; then
+    warp_log_warn "host 为空，已取消"
+    pause_screen
+    return
+  fi
+  case "$port" in
+    ''|*[!0-9]*) warp_log_err "端口非法：$port"; pause_screen; return ;;
+  esac
+
+  warp_jq_apply '
+    .endpoints = ((.endpoints // []) | map(
+      if .tag == $tag then
+        .peers[0].address = $h
+        | .peers[0].port = ($p | tonumber)
+      else . end
+    ))
+  ' --arg tag "$WARP_OUTBOUND_TAG" --arg h "$host" --arg p "$port" \
+    || { warp_log_err "写入失败（sing-box 校验未通过）"; pause_screen; return 1; }
+
+  if config_check_and_restart; then
+    warp_log_ok "已切换到 ${host}:${port}，sing-box 已重启"
+    echo ""
+    warp_log_info "${B}如何确认是否换区成功${N}"
+    echo -e "  ${D}1.${N} 在客户端打开 https://www.cloudflare.com/cdn-cgi/trace"
+    echo -e "  ${D}2.${N} 看 ${C}loc=${N} 字段，${C}colo=${N} 字段（colo 是 PoP 代号）"
+    echo -e "  ${D}3.${N} 想要的区没出来就回菜单换下一个 endpoint，或选 3 重新注册账号"
+  else
+    warp_log_err "sing-box 重启失败，请用 journalctl -u sing-box 查看"
+  fi
+  pause_screen
+}
+
 warp_do_status(){
   render_section_header "${WARP_APP_NAME} - 状态"
 
@@ -8771,6 +8847,7 @@ show_warp_menu(){
       render_menu_item 1 "查看状态"
       render_menu_item 2 "测试连通性"
       render_menu_item 3 "重新注册 WARP 账号 ${D}（换 WARP IP）${N}"
+      render_menu_item 4 "切换 Endpoint 节点 ${D}（换 PoP / 试图换出口区域）${N}"
       render_menu_item 9 "卸载"
     else
       render_menu_item 1 "安装 ${WARP_APP_NAME}"
@@ -8793,6 +8870,7 @@ show_warp_menu(){
       1) warp_do_status ;;
       2) render_section_header "${WARP_APP_NAME} - 测试"; warp_do_test; pause_screen ;;
       3) warp_do_reregister ;;
+      4) warp_do_switch_endpoint ;;
       9) warp_do_uninstall ;;
       0) return ;;
       *) notify_invalid_choice ;;
