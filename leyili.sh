@@ -8413,16 +8413,43 @@ warp_install_wgcf(){
 
 warp_register_account(){
   mkdir -p "$WARP_DIR"
+  # 三种状态：
+  #  - 两个文件都在  → 跳过
+  #  - 只有 account 在 → 只跑 generate
+  #  - 都没有         → register + generate
   if [ -f "$WARP_WGCF_ACCOUNT" ] && [ -f "$WARP_WGCF_PROFILE" ]; then
     return 0
   fi
-  warp_log_info "向 Cloudflare 注册 WARP 账号..."
-  (
-    cd "$WARP_DIR" || exit 1
-    yes | "$WARP_WGCF_BIN" register --accept-tos >/dev/null 2>&1
-  ) || { warp_log_err "wgcf register 失败"; return 1; }
-  ( cd "$WARP_DIR" && "$WARP_WGCF_BIN" generate >/dev/null 2>&1 ) \
-    || { warp_log_err "wgcf generate 失败"; return 1; }
+
+  local log
+  log=$(mktemp)
+
+  if [ ! -f "$WARP_WGCF_ACCOUNT" ]; then
+    warp_log_info "向 Cloudflare 注册 WARP 账号..."
+    if ! ( cd "$WARP_DIR" && "$WARP_WGCF_BIN" register --accept-tos ) >"$log" 2>&1; then
+      warp_log_err "wgcf register 失败，原始输出："
+      sed 's/^/    /' "$log"
+      echo ""
+      echo -e "  ${D}排查建议：${N}"
+      echo -e "  ${D}1) 手动跑：cd ${WARP_DIR} && ${WARP_WGCF_BIN} register --accept-tos${N}"
+      echo -e "  ${D}2) 若提示 429/Too Many Requests，等 5 分钟再试（Cloudflare 限流）${N}"
+      echo -e "  ${D}3) 若提示 TLS/handshake 错误，检查时间是否同步：date${N}"
+      rm -f "$log"
+      return 1
+    fi
+    warp_log_ok "账号已注册：${WARP_WGCF_ACCOUNT}"
+  else
+    warp_log_info "已存在 wgcf-account.toml，跳过 register"
+  fi
+
+  warp_log_info "生成 WireGuard 配置..."
+  if ! ( cd "$WARP_DIR" && "$WARP_WGCF_BIN" generate ) >"$log" 2>&1; then
+    warp_log_err "wgcf generate 失败，原始输出："
+    sed 's/^/    /' "$log"
+    rm -f "$log"
+    return 1
+  fi
+  rm -f "$log"
   warp_log_ok "WARP 账号已生成：${WARP_WGCF_PROFILE}"
 }
 
