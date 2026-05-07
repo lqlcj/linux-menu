@@ -1501,7 +1501,7 @@ EOF
                       ]
                       else .dns.servers end)
     | .dns.strategy = (.dns.strategy // "ipv4_only")
-    | .inbounds = ((.inbounds // []) | map(select(.tag == "reality-in" or .tag == "hy2-in" or .tag == "anytls-in")))
+    | .inbounds = ((.inbounds // []) | map(select(.tag == "reality-in" or .tag == "hy2-in" or .tag == "anytls-in" or .tag == "tuic-in")))
     | .outbounds = (if ((.outbounds // []) | length) == 0
                     then [{"type":"direct","tag":"direct-out","domain_resolver":"cloudflare"}]
                     else (.outbounds | map(
@@ -1907,6 +1907,27 @@ build_hy2_link(){
     "$password" "$server_part" "$query" "$tag"
 }
 
+build_tuic_link(){
+  # build_tuic_link <uuid> <password> <ip> <port> <sni> <insecure 0|1> <congestion_control> <tag>
+  local uuid="$1"
+  local password="$2"
+  local ip="$3"
+  local port="$4"
+  local sni="$5"
+  local insecure="${6:-0}"
+  local cc="${7:-bbr}"
+  local tag="${8:-tuic}"
+
+  if [ -z "$uuid" ] || [ -z "$password" ] || [ -z "$ip" ] || [ -z "$port" ]; then
+    return 1
+  fi
+
+  local host
+  host=$(url_encode_host "$ip")
+  printf 'tuic://%s:%s@%s:%s?sni=%s&alpn=h3&congestion_control=%s&allow_insecure=%s#%s\n' \
+    "$uuid" "$password" "$host" "$port" "${sni:-}" "$cc" "$insecure" "$tag"
+}
+
 
 # 由节点 info 文件构造链接（dispatcher）
 build_link_for_node(){
@@ -1950,6 +1971,14 @@ build_link_for_node(){
       pubk=$(get_node_value "$type" PublicKey 2>/dev/null || true)
       sid=$(get_node_value "$type" ShortID 2>/dev/null || true)
       build_anytls_link "$password" "$ip" "$port" "$sni" "$pubk" "$sid" "$tag"
+      ;;
+    tuic)
+      local uuid password insecure cc
+      uuid=$(get_node_value "$type" UUID 2>/dev/null || true)
+      password=$(get_node_value "$type" Password 2>/dev/null || true)
+      insecure=$(get_node_value "$type" Insecure 2>/dev/null || echo 0)
+      cc=$(get_node_value "$type" CongestionControl 2>/dev/null || echo bbr)
+      build_tuic_link "$uuid" "$password" "$ip" "$port" "$sni" "$insecure" "$cc" "$tag"
       ;;
     *)
       return 1
@@ -2807,6 +2836,16 @@ ip4_init_firewall(){
       iptables -C INPUT -p tcp --dport "$node_port" -j ACCEPT 2>/dev/null \
         || iptables -A INPUT -p tcp --dport "$node_port" -j ACCEPT 2>/dev/null || true
       echo -e "  ${G}已自动恢复 anytls 主端口放行：${node_port}/tcp${N}"
+    fi
+  fi
+  if node_installed tuic; then
+    node_port=$(get_node_value tuic Port 2>/dev/null || true)
+    node_mode=$(get_node_value tuic Mode 2>/dev/null || echo ipv4)
+    if [ -n "$node_port" ] \
+       && { [ "$node_mode" = "ipv4" ] || [ "$node_mode" = "dualstack" ]; }; then
+      iptables -C INPUT -p udp --dport "$node_port" -j ACCEPT 2>/dev/null \
+        || iptables -A INPUT -p udp --dport "$node_port" -j ACCEPT 2>/dev/null || true
+      echo -e "  ${G}已自动恢复 tuic 主端口放行：${node_port}/udp${N}"
     fi
   fi
 
@@ -3910,6 +3949,7 @@ modify_node_params(){
     reality) modify_reality_params ;;
     hy2)     modify_hy2_params ;;
     anytls)  modify_anytls_params ;;
+    tuic)    modify_tuic_params ;;
     *)
       echo -e "${R}未知节点类型: $node_type${N}"
       pause_screen
@@ -5412,6 +5452,30 @@ generate_self_signed_cert_for_hy2(){
   printf '%s\n%s' "$crt" "$key"
 }
 
+generate_self_signed_cert_for_tuic(){
+  local sni="$1"
+  ensure_nodes_dir
+  local crt="$CERTS_DIR/tuic.crt"
+  local key="$CERTS_DIR/tuic.key"
+  if ! command -v openssl >/dev/null 2>&1; then
+    echo -e "${R}未找到 openssl${N}"
+    return 1
+  fi
+  if ! openssl ecparam -genkey -name prime256v1 -out "$key" 2>/dev/null; then
+    if ! openssl genrsa -out "$key" 2048 >/dev/null 2>&1; then
+      echo -e "${R}私钥生成失败${N}"
+      return 1
+    fi
+  fi
+  if ! openssl req -new -x509 -days 3650 -key "$key" -out "$crt" \
+       -subj "/CN=${sni}" >/dev/null 2>&1; then
+    echo -e "${R}自签证书生成失败${N}"
+    return 1
+  fi
+  chmod 600 "$key"
+  printf '%s\n%s' "$crt" "$key"
+}
+
 install_hy2_node(){
   local port_input="" sni_input=""
   local PORT SNI TAG LISTEN_CHOICE LISTEN_ADDR install_mode="ipv4"
@@ -6518,6 +6582,293 @@ EOF
   pause_screen
 }
 
+install_tuic_node(){
+  local port_input="" sni_input=""
+  local PORT SNI TAG LISTEN_CHOICE LISTEN_ADDR install_mode="ipv4"
+  local cert_choice cert_source="self" acme_email=""
+  local UUID PASSWORD cc_choice CC="bbr"
+  local public_ipv4="" public_ipv6="" access_ip=""
+  local link="" ipv6_link="" mode_label="" confirm
+  local cert_paths cert_path key_path
+
+  if ! require_root; then return 1; fi
+
+  render_section_header "创建 TUIC v5 节点"
+  echo -e "  ${Y}直接回车使用括号内默认值${N}"
+  echo ""
+
+  if node_installed tuic; then
+    echo -e "${Y}检测到已存在 TUIC 节点，继续将覆盖原节点配置${N}"
+    read -p "  继续？(y/N): " confirm
+    if [ "$confirm" != "y" ] && [ "$confirm" != "Y" ]; then
+      echo -e "  已取消"
+      return 0
+    fi
+  fi
+
+  # 端口（默认随机高位 UDP，复用 hy2 的端口生成器）
+  local default_port
+  default_port=$(generate_hy2_random_port)
+  while true; do
+    read -p "  端口 (${default_port}, 回车随机): " port_input
+    PORT="${port_input:-$default_port}"
+    if validate_port "$PORT"; then
+      PORT=$((10#$PORT))
+      break
+    fi
+    echo -e "${R}端口必须是 1-65535 的数字${N}"
+  done
+
+  # 节点名
+  read -p "  节点名称 (tuic): " TAG
+  TAG="${TAG:-tuic}"
+
+  # 监听模式
+  echo -e "  监听模式："
+  echo "    1) 仅 IPv4 入站 + 仅 IPv4 出站 - 0.0.0.0（默认）"
+  echo "    2) 双栈入站 + 仅 IPv4 出站 - ::"
+  echo "    3) 仅 IPv6 入站 + 仅 IPv4 出站"
+  read -p "  请选择 (1): " LISTEN_CHOICE
+  case "$LISTEN_CHOICE" in
+    2) LISTEN_ADDR="::"; install_mode="dualstack" ;;
+    3) LISTEN_ADDR=""; install_mode="ipv6-in-ipv4-out" ;;
+    *) LISTEN_ADDR="0.0.0.0"; install_mode="ipv4" ;;
+  esac
+
+  if [ "$install_mode" = "ipv6-in-ipv4-out" ]; then
+    public_ipv6=$(detect_primary_ipv6)
+    if [ -z "$public_ipv6" ]; then
+      echo ""
+      echo -e "${R}未检测到可用的 IPv6 地址，无法使用“仅 IPv6 入站 + 仅 IPv4 出站”模式${N}"
+      pause_screen
+      return 1
+    fi
+  fi
+
+  # 证书来源
+  echo -e "  证书来源："
+  echo "    1) 自签证书（推荐，客户端 insecure=1）（默认）"
+  echo "    2) ACME 自动签发（需要真实域名 + 80 端口可用）"
+  read -p "  请选择 (1): " cert_choice
+  case "$cert_choice" in
+    2) cert_source="acme" ;;
+    *) cert_source="self" ;;
+  esac
+
+  # SNI / 域名
+  if [ "$cert_source" = "acme" ]; then
+    while true; do
+      read -p "  真实域名（已解析到本机）: " sni_input
+      sni_input="${sni_input:-}"
+      SNI=$(sanitize_sni "$sni_input")
+      if [ -n "$SNI" ]; then break; fi
+      echo -e "${R}ACME 模式必须提供真实域名${N}"
+    done
+    while true; do
+      read -p "  ACME 邮箱: " acme_email
+      if [ -n "$acme_email" ] && printf '%s' "$acme_email" | grep -q "@"; then break; fi
+      echo -e "${R}邮箱不能为空，且必须包含 @${N}"
+    done
+  else
+    while true; do
+      read -p "  伪装 SNI (bing.com): " sni_input
+      sni_input="${sni_input:-bing.com}"
+      SNI=$(sanitize_sni "$sni_input")
+      if [ -n "$SNI" ]; then break; fi
+      echo -e "${R}SNI 不能为空${N}"
+    done
+  fi
+
+  # 拥塞控制
+  echo -e "  拥塞控制算法："
+  echo "    1) bbr   （默认，推荐，多数场景速度最快）"
+  echo "    2) cubic （对 TCP 友好，与其他流量并存时更平稳）"
+  read -p "  请选择 (1): " cc_choice
+  case "$cc_choice" in
+    2) CC="cubic" ;;
+    *) CC="bbr" ;;
+  esac
+
+  if ! is_singbox_installed; then
+    echo ""
+    echo -e "${Y}==> 安装 sing-box...${N}"
+    if ! install_singbox; then
+      echo ""
+      echo -e "${R}sing-box 安装失败，请检查上方输出${N}"
+      pause_screen
+      return 1
+    fi
+  fi
+
+  echo -e "${Y}==> 生成参数...${N}"
+  if ! command -v openssl >/dev/null 2>&1; then
+    echo -e "${R}缺少 openssl${N}"
+    pause_screen
+    return 1
+  fi
+  UUID=$(cat /proc/sys/kernel/random/uuid 2>/dev/null)
+  if [ -z "$UUID" ] && command -v sing-box >/dev/null 2>&1; then
+    UUID=$(sing-box generate uuid 2>/dev/null)
+  fi
+  if [ -z "$UUID" ]; then
+    echo -e "${R}UUID 生成失败${N}"
+    pause_screen
+    return 1
+  fi
+  PASSWORD=$(openssl rand -base64 16 | tr -d '=+/' | cut -c1-22)
+
+  public_ipv4=${public_ipv4:-$(detect_primary_ipv4)}
+  public_ipv6=${public_ipv6:-$(detect_primary_ipv6)}
+
+  case "$install_mode" in
+    ipv6-in-ipv4-out)
+      access_ip="$public_ipv6"
+      LISTEN_ADDR="$public_ipv6"
+      [ -z "$access_ip" ] && { echo -e "${R}未检测到 IPv6${N}"; pause_screen; return 1; }
+      ;;
+    dualstack)
+      access_ip="${public_ipv4:-$public_ipv6}"
+      [ -z "$access_ip" ] && { echo -e "${R}未检测到 IPv4 / IPv6${N}"; pause_screen; return 1; }
+      ;;
+    *)
+      access_ip="$public_ipv4"
+      [ -z "$access_ip" ] && { echo -e "${R}未检测到 IPv4${N}"; pause_screen; return 1; }
+      ;;
+  esac
+
+  mode_label=$(describe_install_mode "$install_mode")
+
+  # 准备证书
+  if [ "$cert_source" = "self" ]; then
+    echo -e "${Y}==> 生成自签证书...${N}"
+    cert_paths=$(generate_self_signed_cert_for_tuic "$SNI") || { pause_screen; return 1; }
+    cert_path=$(echo "$cert_paths" | sed -n '1p')
+    key_path=$(echo "$cert_paths" | sed -n '2p')
+  fi
+
+  echo -e "${Y}==> 写入配置...${N}"
+  ensure_jq || { pause_screen; return 1; }
+
+  local tls_json
+  if [ "$cert_source" = "acme" ]; then
+    tls_json=$(jq -n --arg sni "$SNI" --arg email "$acme_email" '{
+      enabled: true,
+      server_name: $sni,
+      alpn: ["h3"],
+      acme: {domain: [$sni], email: $email}
+    }')
+  else
+    tls_json=$(jq -n --arg sni "$SNI" --arg crt "$cert_path" --arg key "$key_path" '{
+      enabled: true,
+      server_name: $sni,
+      alpn: ["h3"],
+      certificate_path: $crt,
+      key_path: $key
+    }')
+  fi
+
+  local user_obj
+  user_obj=$(jq -n --arg uuid "$UUID" --arg pw "$PASSWORD" '{uuid: $uuid, password: $pw}')
+
+  local inbound_json
+  inbound_json=$(jq -n \
+    --arg listen "$LISTEN_ADDR" \
+    --argjson port "$PORT" \
+    --argjson user "$user_obj" \
+    --argjson tls "$tls_json" \
+    --arg cc "$CC" '
+    {
+      type: "tuic",
+      tag: "tuic-in",
+      listen: $listen,
+      listen_port: $port,
+      users: [$user],
+      congestion_control: $cc,
+      auth_timeout: "3s",
+      zero_rtt_handshake: false,
+      heartbeat: "10s",
+      tls: $tls
+    }')
+
+  if ! config_add_inbound "$inbound_json"; then
+    echo -e "${R}写入 inbound 失败${N}"
+    pause_screen
+    return 1
+  fi
+
+  echo -e "${Y}==> 校验并启动...${N}"
+  if ! config_check_and_restart; then
+    echo ""
+    echo -e "${R}sing-box 校验或重启失败${N}"
+    pause_screen
+    return 1
+  fi
+
+  node_apply_firewall_for_mode "$PORT" udp "$install_mode"
+  print_firewall_hint "$PORT" udp "TUIC v5 节点入站"
+  if [ "$cert_source" = "acme" ]; then
+    print_firewall_hint 80 tcp "ACME 证书签发与续期，签发期间必须可外部访问"
+  fi
+
+  local insecure="0"
+  [ "$cert_source" = "self" ] && insecure="1"
+
+  link=$(build_tuic_link "$UUID" "$PASSWORD" "$access_ip" "$PORT" "$SNI" "$insecure" "$CC" "$TAG" 2>/dev/null || true)
+  if [ "$install_mode" = "dualstack" ] && [ -n "$public_ipv6" ] && [ "$public_ipv6" != "$access_ip" ]; then
+    ipv6_link=$(build_tuic_link "$UUID" "$PASSWORD" "$public_ipv6" "$PORT" "$SNI" "$insecure" "$CC" "${TAG}-ipv6" 2>/dev/null || true)
+  fi
+
+  ensure_nodes_dir
+  cat > "$(node_info_path tuic)" <<EOF
+Type=tuic
+Tag=$TAG
+Mode=$install_mode
+ListenAddr=$LISTEN_ADDR
+Port=$PORT
+SNI=$SNI
+CertSource=$cert_source
+ACMEEmail=$acme_email
+CertPath=${cert_path:-}
+KeyPath=${key_path:-}
+UUID=$UUID
+Password=$PASSWORD
+CongestionControl=$CC
+Insecure=$insecure
+IP=$access_ip
+Link=$link
+EOF
+
+  register_sb_command || true
+
+  echo ""
+  echo -e "  ${G}╔══════════════════════════════════════════════════════╗${N}"
+  echo -e "  ${G}║${N}  ${B}${W}${APP_NAME}${N}  ${G}TUIC v5 节点创建完成${N}                       ${G}║${N}"
+  echo -e "  ${G}╚══════════════════════════════════════════════════════╝${N}"
+  echo -e "  模式      : ${C}$mode_label${N}"
+  echo -e "  端口      : ${C}$PORT${N} ${D}(UDP)${N}"
+  echo -e "  入口 IP   : ${C}${access_ip:-未知}${N}"
+  echo -e "  SNI       : ${C}$SNI${N}"
+  echo -e "  证书      : ${C}${cert_source}${N}$([ "$insecure" = "1" ] && echo "  ${Y}(客户端需 insecure=1)${N}")"
+  echo -e "  UUID      : ${C}$UUID${N}"
+  echo -e "  Password  : ${C}$PASSWORD${N}"
+  echo -e "  拥塞控制  : ${C}$CC${N}"
+  echo -e "  出站策略  : ${C}仅 IPv4${N}"
+  echo ""
+  echo -e "  ${B}客户端链接：${N}"
+  echo -e "  ${G}${link:-未生成}${N}"
+  print_qrcode "${link:-}"
+  if [ -n "$ipv6_link" ]; then
+    echo ""
+    echo -e "  ${B}IPv6 客户端链接：${N}"
+    echo -e "  ${G}${ipv6_link}${N}"
+    print_qrcode "$ipv6_link"
+  fi
+  echo ""
+  echo -e "  信息已保存至 ${Y}$(node_info_path tuic)${N}"
+  echo -e "  输入 ${B}${COMMAND_NAME}${N} 进入管理菜单"
+  pause_screen
+}
+
 uninstall_anytls_node(){
   local confirm
   if ! node_installed anytls; then
@@ -6544,6 +6895,36 @@ uninstall_anytls_node(){
   remove_node_info anytls
   post_uninstall_service_step
   echo -e "${G}AnyTLS 节点已卸载${N}"
+  pause_screen
+}
+
+uninstall_tuic_node(){
+  local confirm
+  if ! node_installed tuic; then
+    echo -e "${Y}TUIC 节点未安装${N}"
+    pause_screen
+    return 0
+  fi
+  echo ""
+  read -p "  确认卸载 TUIC 节点？(y/N): " confirm
+  if [ "$confirm" != "y" ] && [ "$confirm" != "Y" ]; then
+    echo -e "  已取消"
+    return 0
+  fi
+
+  # 必须在 remove_node_info 之前撤防火墙规则，否则读不到 Mode/Port
+  local tuic_port tuic_mode
+  tuic_port=$(get_node_value tuic Port 2>/dev/null || true)
+  tuic_mode=$(get_node_value tuic Mode 2>/dev/null || echo ipv4)
+  if [ -n "$tuic_port" ]; then
+    node_revoke_firewall_for_mode "$tuic_port" udp "$tuic_mode"
+  fi
+
+  config_remove_inbound_by_tag "tuic-in" || true
+  remove_node_info tuic
+  rm -f "$CERTS_DIR/tuic.crt" "$CERTS_DIR/tuic.key" 2>/dev/null || true
+  post_uninstall_service_step
+  echo -e "${G}TUIC 节点已卸载${N}"
   pause_screen
 }
 
@@ -6687,6 +7068,219 @@ modify_anytls_params(){
 
   echo ""
   echo -e "${G}AnyTLS 节点参数已更新并重启服务${N}"
+  if [ -n "$new_link" ]; then
+    echo ""
+    echo -e "  ${B}新客户端链接：${N}"
+    echo -e "  ${G}$new_link${N}"
+    print_qrcode "$new_link"
+  fi
+  if [ -n "$ipv6_new_link" ]; then
+    echo ""
+    echo -e "  ${B}新 IPv6 客户端链接：${N}"
+    echo -e "  ${G}$ipv6_new_link${N}"
+    print_qrcode "$ipv6_new_link"
+  fi
+  pause_screen
+}
+
+modify_tuic_params(){
+  local new_port="" new_sni="" new_uuid="" new_pw="" new_cc=""
+  local cur_port cur_sni cur_uuid cur_pw cur_cc cur_cert_src cur_email cur_mode cur_insecure
+  local cur_cert_path cur_key_path
+  local backup_path="" confirm cc_choice regen_uuid regen_pw
+
+  if ! require_root; then return 1; fi
+  if ! require_singbox_installed; then return 1; fi
+  if ! node_installed tuic; then
+    echo ""
+    echo -e "${R}未发现 TUIC 节点信息${N}"
+    pause_screen
+    return 1
+  fi
+  if [ ! -f "$CONFIG_PATH" ]; then
+    echo ""
+    echo -e "${R}未找到配置文件：$CONFIG_PATH${N}"
+    pause_screen
+    return 1
+  fi
+
+  cur_port=$(get_node_value tuic Port 2>/dev/null || true)
+  cur_sni=$(get_node_value tuic SNI 2>/dev/null || true)
+  cur_uuid=$(get_node_value tuic UUID 2>/dev/null || true)
+  cur_pw=$(get_node_value tuic Password 2>/dev/null || true)
+  cur_cc=$(get_node_value tuic CongestionControl 2>/dev/null || echo bbr)
+  cur_cert_src=$(get_node_value tuic CertSource 2>/dev/null || echo self)
+  cur_email=$(get_node_value tuic ACMEEmail 2>/dev/null || true)
+  cur_mode=$(get_node_value tuic Mode 2>/dev/null || echo ipv4)
+  cur_insecure=$(get_node_value tuic Insecure 2>/dev/null || echo 0)
+  cur_cert_path=$(get_node_value tuic CertPath 2>/dev/null || true)
+  cur_key_path=$(get_node_value tuic KeyPath 2>/dev/null || true)
+
+  echo ""
+  echo -e "  ${B}${C}修改 TUIC v5 节点参数${N}  ${D}直接回车保留当前值${N}"
+  echo -e "  ${D}（证书来源 ${cur_cert_src} 不可在此修改，需要切换请卸载重装）${N}"
+  render_divider
+
+  # 端口
+  while true; do
+    read -p "  端口 (${cur_port:-当前未知}): " new_port
+    new_port="${new_port:-$cur_port}"
+    if validate_port "$new_port"; then
+      new_port=$((10#$new_port))
+      break
+    fi
+    echo -e "${R}端口必须是 1-65535 的数字${N}"
+  done
+
+  # SNI
+  while true; do
+    if [ "$cur_cert_src" = "acme" ]; then
+      read -p "  域名 (${cur_sni:-当前未知}, 改后会触发 ACME 重签): " new_sni
+    else
+      read -p "  SNI (${cur_sni:-当前未知}): " new_sni
+    fi
+    new_sni="${new_sni:-$cur_sni}"
+    new_sni=$(sanitize_sni "$new_sni")
+    if [ -n "$new_sni" ]; then break; fi
+    echo -e "${R}SNI 不能为空${N}"
+  done
+
+  # UUID
+  read -p "  UUID (回车保留当前 / 输入 new 重新生成): " regen_uuid
+  case "$regen_uuid" in
+    new|NEW)
+      new_uuid=$(cat /proc/sys/kernel/random/uuid 2>/dev/null)
+      if [ -z "$new_uuid" ] && command -v sing-box >/dev/null 2>&1; then
+        new_uuid=$(sing-box generate uuid 2>/dev/null)
+      fi
+      if [ -z "$new_uuid" ]; then
+        echo -e "${R}UUID 生成失败${N}"
+        pause_screen
+        return 1
+      fi
+      echo -e "  ${D}新 UUID：$new_uuid${N}"
+      ;;
+    *) new_uuid="$cur_uuid" ;;
+  esac
+
+  # Password
+  read -p "  Password (回车保留当前 / 输入 new 重新随机生成): " regen_pw
+  case "$regen_pw" in
+    new|NEW)
+      new_pw=$(openssl rand -base64 16 | tr -d '=+/' | cut -c1-22)
+      echo -e "  ${D}新 Password：$new_pw${N}"
+      ;;
+    *) new_pw="$cur_pw" ;;
+  esac
+
+  # 拥塞控制
+  echo -e "  拥塞控制算法 (当前: ${C}${cur_cc}${N})："
+  echo "    1) 保留当前（默认）"
+  echo "    2) bbr"
+  echo "    3) cubic"
+  read -p "  请选择 (1): " cc_choice
+  case "$cc_choice" in
+    2) new_cc="bbr" ;;
+    3) new_cc="cubic" ;;
+    *) new_cc="$cur_cc" ;;
+  esac
+
+  # 应用前确认
+  echo ""
+  echo -e "  即将应用："
+  echo -e "    端口         ${cur_port:-?} ${D}→${N} ${C}${new_port}${N}"
+  echo -e "    SNI          ${cur_sni:-?} ${D}→${N} ${C}${new_sni}${N}"
+  if [ "$new_uuid" != "$cur_uuid" ]; then
+    echo -e "    UUID         ${cur_uuid:-?} ${D}→${N} ${C}${new_uuid}${N}"
+  else
+    echo -e "    UUID         ${D}保留${N}"
+  fi
+  if [ "$new_pw" != "$cur_pw" ]; then
+    echo -e "    Password     ${cur_pw:-?} ${D}→${N} ${C}${new_pw}${N}"
+  else
+    echo -e "    Password     ${D}保留${N}"
+  fi
+  if [ "$new_cc" != "$cur_cc" ]; then
+    echo -e "    拥塞控制     ${cur_cc:-?} ${D}→${N} ${C}${new_cc}${N}"
+  else
+    echo -e "    拥塞控制     ${D}保留${N}"
+  fi
+  read -p "  确认？(y/N): " confirm
+  if [ "$confirm" != "y" ] && [ "$confirm" != "Y" ]; then
+    echo -e "  已取消"
+    return 0
+  fi
+
+  # 备份配置
+  backup_path="${CONFIG_PATH}.$(date +%Y%m%d-%H%M%S).bak"
+  cp "$CONFIG_PATH" "$backup_path" 2>/dev/null || true
+
+  ensure_jq || { pause_screen; return 1; }
+
+  # 自签证书：SNI 变了 → 重新自签
+  if [ "$cur_cert_src" = "self" ] && [ "$new_sni" != "$cur_sni" ]; then
+    echo -e "${Y}==> SNI 已修改，重新生成自签证书...${N}"
+    if ! generate_self_signed_cert_for_tuic "$new_sni" >/dev/null; then
+      echo -e "${R}自签证书生成失败${N}"
+      pause_screen
+      return 1
+    fi
+  fi
+
+  # jq 修改 inbound
+  local tmp jq_filter
+  tmp=$(mktemp)
+  jq_filter='(.inbounds[] | select(.tag == "tuic-in"))
+       |= (.listen_port = ($port | tonumber)
+           | .users[0].uuid = $uuid
+           | .users[0].password = $pw
+           | .congestion_control = $cc
+           | .tls.server_name = $sni
+           | (if .tls.acme then .tls.acme.domain = [$sni] else . end))'
+  if ! jq --arg port "$new_port" \
+          --arg sni "$new_sni" \
+          --arg uuid "$new_uuid" \
+          --arg pw "$new_pw" \
+          --arg cc "$new_cc" \
+          "$jq_filter" "$CONFIG_PATH" > "$tmp" 2>/dev/null; then
+    rm -f "$tmp"
+    echo -e "${R}配置写入失败（jq 过滤错误）${N}"
+    pause_screen
+    return 1
+  fi
+  mv "$tmp" "$CONFIG_PATH"
+
+  if ! config_check_and_restart; then
+    echo ""
+    echo -e "${R}sing-box 校验或重启失败，已保留备份：${backup_path}${N}"
+    pause_screen
+    return 1
+  fi
+
+  # 防火墙：撤旧放新
+  if [ -n "$cur_port" ] && [ "$cur_port" != "$new_port" ]; then
+    node_revoke_firewall_for_mode "$cur_port" udp "$cur_mode"
+    node_apply_firewall_for_mode "$new_port" udp "$cur_mode"
+    print_firewall_hint "$new_port" udp "TUIC 节点新端口"
+  fi
+
+  # 更新 .info
+  set_node_value tuic Port "$new_port"
+  set_node_value tuic SNI "$new_sni"
+  set_node_value tuic UUID "$new_uuid"
+  set_node_value tuic Password "$new_pw"
+  set_node_value tuic CongestionControl "$new_cc"
+
+  # 重生成 Link
+  local cur_ip cur_tag new_link ipv6_new_link
+  cur_ip=$(get_node_value tuic IP 2>/dev/null || true)
+  cur_tag=$(get_node_value tuic Tag 2>/dev/null || echo tuic)
+  new_link=$(build_tuic_link "$new_uuid" "$new_pw" "$cur_ip" "$new_port" "$new_sni" "$cur_insecure" "$new_cc" "${cur_tag:-tuic}" 2>/dev/null || true)
+  ipv6_new_link=$(build_dualstack_ipv6_link_for_node tuic 2>/dev/null || true)
+  [ -n "$new_link" ] && set_node_value tuic Link "$new_link"
+
+  echo ""
+  echo -e "${G}TUIC 节点参数已更新并重启服务${N}"
   if [ -n "$new_link" ]; then
     echo ""
     echo -e "  ${B}新客户端链接：${N}"
@@ -6929,6 +7523,7 @@ render_node_card_block(){
     reality) label="Reality    " ;;   # 11 可见列：7 + 4 sp
     hy2)     label="Hysteria2  " ;;   # 11 可见列：9 + 2 sp
     anytls)  label="AnyTLS     " ;;   # 11 可见列：6 + 5 sp
+    tuic)    label="TUIC v5    " ;;   # 11 可见列：7 + 4 sp
     *)       label=$(printf '%-11s' "$type") ;;
   esac
 
@@ -7072,6 +7667,8 @@ render_main_menu_card(){
   render_card_blank
   render_node_card_block anytls
   render_card_blank
+  render_node_card_block tuic
+  render_card_blank
   render_tcp_card_line
   render_initcwnd_card_line
   render_realm_card_line
@@ -7089,6 +7686,7 @@ show_node_install_menu(){
     else
       echo -e "  ${D}3) 创建 AnyTLS 节点  (需先创建 Reality)${N}"
     fi
+    render_menu_item 4 "创建 TUIC v5 节点$(node_installed tuic && echo "  ${D}(已安装，将覆盖)${N}")"
     render_menu_item 0 "返回上级"
     render_divider
     read -p "  请输入序号: " choice
@@ -7102,6 +7700,7 @@ show_node_install_menu(){
           notify_invalid_choice
         fi
         ;;
+      4) install_tuic_node; return ;;
       0) return ;;
       *) notify_invalid_choice ;;
     esac
@@ -7126,6 +7725,11 @@ show_node_uninstall_menu(){
     else
       echo -e "  ${D}3) AnyTLS 未安装${N}"
     fi
+    if node_installed tuic; then
+      render_menu_item 4 "卸载 TUIC v5 节点"
+    else
+      echo -e "  ${D}4) TUIC 未安装${N}"
+    fi
     render_menu_item 0 "返回上级"
     render_divider
     read -p "  请输入序号: " choice
@@ -7133,6 +7737,7 @@ show_node_uninstall_menu(){
       1) node_installed reality && uninstall_reality_node; return ;;
       2) node_installed hy2 && uninstall_hy2_node; return ;;
       3) node_installed anytls && uninstall_anytls_node; return ;;
+      4) node_installed tuic && uninstall_tuic_node; return ;;
       0) return ;;
       *) notify_invalid_choice ;;
     esac
@@ -7175,7 +7780,7 @@ upgrade_singbox_kernel(){
 show_node_manage_menu(){
   while true; do
     render_section_header "节点 / 内核管理"
-    render_menu_item 1 "创建节点 (Reality / Hysteria2 / AnyTLS)"
+    render_menu_item 1 "创建节点 (Reality / Hysteria2 / AnyTLS / TUIC)"
     render_menu_item 2 "卸载单个节点"
     render_menu_item 3 "升级 sing-box 内核"
     render_menu_item 0 "返回上级"
