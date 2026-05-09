@@ -1478,8 +1478,12 @@ ensure_jq(){
   fi
   echo -e "${Y}==> 安装 jq...${N}"
   if ! apt-get install -y jq 2>/dev/null; then
-    echo -e "${R}jq 安装失败，请手动执行：apt install jq${N}"
-    return 1
+    # 第一次跑的全新 VPS 可能 apt 缓存为空，先 update 再重试
+    DEBIAN_FRONTEND=noninteractive apt-get update -qq >/dev/null 2>&1 || true
+    if ! apt-get install -y jq 2>/dev/null; then
+      echo -e "${R}jq 安装失败，请手动执行：apt install jq${N}"
+      return 1
+    fi
   fi
   return 0
 }
@@ -2907,6 +2911,16 @@ ip4_init_firewall(){
       echo -e "  ${G}已自动恢复 tuic 主端口放行：${node_port}/udp${N}"
     fi
   fi
+  if node_installed ss2022; then
+    node_port=$(get_node_value ss2022 Port 2>/dev/null || true)
+    node_mode=$(get_node_value ss2022 Mode 2>/dev/null || echo ipv4)
+    if [ -n "$node_port" ] \
+       && { [ "$node_mode" = "ipv4" ] || [ "$node_mode" = "dualstack" ]; }; then
+      iptables -C INPUT -p tcp --dport "$node_port" -j ACCEPT 2>/dev/null \
+        || iptables -A INPUT -p tcp --dport "$node_port" -j ACCEPT 2>/dev/null || true
+      echo -e "  ${G}已自动恢复 ss2022 主端口放行：${node_port}/tcp${N}"
+    fi
+  fi
 
   # 应用后再次校验 sshd 监听依然存在（防止备份/检测误差）
   if ! verify_sshd_listening_on_port "$ssh_port"; then
@@ -3660,10 +3674,15 @@ install_basic_tools(){
   echo -e "${Y}==> 安装基础工具...${N}"
   echo -e "  ${C}$BASIC_TOOLS_PACKAGES${N}"
   if ! apt install -y $BASIC_TOOLS_PACKAGES; then
-    echo ""
-    echo -e "${R}基础工具安装失败，请检查上方输出${N}"
-    pause_screen
-    return 1
+    # 全新 VPS apt 缓存可能为空，先 update 再重试一次
+    echo -e "${Y}==> 安装失败，刷新 apt 索引后重试...${N}"
+    DEBIAN_FRONTEND=noninteractive apt-get update -qq >/dev/null 2>&1 || true
+    if ! apt install -y $BASIC_TOOLS_PACKAGES; then
+      echo ""
+      echo -e "${R}基础工具安装失败，请检查上方输出${N}"
+      pause_screen
+      return 1
+    fi
   fi
 
   echo ""
@@ -4040,8 +4059,11 @@ print_qrcode(){
   if ! command -v qrencode >/dev/null 2>&1; then
     echo -e "${Y}==> 未检测到 qrencode，正在安装...${N}"
     if ! apt-get install -y qrencode 2>/dev/null; then
-      echo -e "${R}qrencode 安装失败，请手动执行：apt install qrencode${N}"
-      return 1
+      DEBIAN_FRONTEND=noninteractive apt-get update -qq >/dev/null 2>&1 || true
+      if ! apt-get install -y qrencode 2>/dev/null; then
+        echo -e "${R}qrencode 安装失败，请手动执行：apt install qrencode${N}"
+        return 1
+      fi
     fi
   fi
 
@@ -4191,6 +4213,7 @@ EOF
 
 remove_tcp_tuning(){
   local confirm=""
+  local service_name route_line route_spec
 
   if ! require_root; then
     return 1
@@ -4205,6 +4228,7 @@ remove_tcp_tuning(){
 
   echo ""
   echo -e "${Y}==> 即将移除 ${C}$TCP_TUNING_PATH${N}${Y}，并恢复默认 qdisc / 拥塞算法${N}"
+  echo -e "${Y}    同时撤销配套的 initcwnd 持久化服务（若存在）${N}"
   read -p "  确认继续？(y/N): " confirm
   if [ "$confirm" != "y" ] && [ "$confirm" != "Y" ]; then
     echo -e "  已取消"
@@ -4217,6 +4241,30 @@ remove_tcp_tuning(){
   sysctl -w net.core.default_qdisc=pfifo_fast >/dev/null 2>&1 || true
   sysctl -w net.ipv4.tcp_congestion_control=cubic >/dev/null 2>&1 || true
   sysctl --system >/dev/null 2>&1 || true
+
+  # 配套撤销 initcwnd（apply_network_optimization 是把 TCP+initcwnd 当一组应用的，对称地撤）
+  service_name=$(basename "$INITCWND_SERVICE_PATH")
+  if [ -f "$INITCWND_SERVICE_PATH" ] || systemctl cat "$service_name" >/dev/null 2>&1; then
+    systemctl disable --now "$service_name" >/dev/null 2>&1 || true
+    rm -f "$INITCWND_SERVICE_PATH"
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    if command -v ip >/dev/null 2>&1; then
+      route_line=$(ip route show default 2>/dev/null | head -1)
+      if [ -n "$route_line" ]; then
+        route_spec=$(printf '%s\n' "$route_line" | awk '{
+          sep=""
+          for (i = 1; i <= NF; i++) {
+            if ($i == "initcwnd" || $i == "initrwnd") { i++; next }
+            printf "%s%s", sep, $i
+            sep=" "
+          }
+        }')
+        # shellcheck disable=SC2086
+        ip route replace $route_spec >/dev/null 2>&1 || true
+      fi
+    fi
+    echo -e "  ${D}initcwnd 持久化服务已移除${N}"
+  fi
 
   echo ""
   echo -e "${G}TCP 优化已移除（部分参数重启后完全复位）${N}"
