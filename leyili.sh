@@ -594,12 +594,23 @@ cancel_rollback_pid(){
 }
 
 register_sb_command(){
-  local source_path=""
+  local source_path="" src_real dst_real
 
   if [ -n "${BASH_SOURCE[0]:-}" ] && [ -f "${BASH_SOURCE[0]}" ]; then
     source_path="${BASH_SOURCE[0]}"
   elif [ -n "${0:-}" ] && [ -f "$0" ]; then
     source_path="$0"
+  fi
+
+  # 已经位于 SCRIPT_PATH（用户用 sb 命令再次进入菜单）：什么都不做
+  # 否则 cp same-file 必失败，会回落到 curl 重新下载，导致每次运行都偷偷自动更新
+  if [ -n "$source_path" ] && [ -f "$SCRIPT_PATH" ]; then
+    src_real=$(readlink -f "$source_path" 2>/dev/null || printf '%s' "$source_path")
+    dst_real=$(readlink -f "$SCRIPT_PATH" 2>/dev/null || printf '%s' "$SCRIPT_PATH")
+    if [ -n "$src_real" ] && [ "$src_real" = "$dst_real" ]; then
+      chmod +x "$SCRIPT_PATH" 2>/dev/null || true
+      return 0
+    fi
   fi
 
   if [ -n "$source_path" ]; then
@@ -609,7 +620,7 @@ register_sb_command(){
   fi
 
   if [ -n "$SELF_INSTALL_URL" ]; then
-    if curl -fsSL "$SELF_INSTALL_URL" -o "$SCRIPT_PATH" && chmod +x "$SCRIPT_PATH"; then
+    if curl -fsSL --max-time 15 "$SELF_INSTALL_URL" -o "$SCRIPT_PATH" && chmod +x "$SCRIPT_PATH"; then
       return 0
     fi
   fi
@@ -3895,8 +3906,8 @@ modify_reality_params(){
 
   local tmp_file
   tmp_file=$(mktemp)
-  # 兜底：函数返回 / 信号中断时清理临时文件（已存在的 rm -f 路径仍保留，trap 仅作保险）
-  trap 'rm -f "$tmp_file"' RETURN INT TERM
+  # 兜底：函数返回时清理临时文件（不挂 INT/TERM，避免污染全局信号 trap）
+  trap 'rm -f "$tmp_file"' RETURN
   if ! jq --arg port "$new_port" --arg sni "$new_sni" --arg uuid "$new_uuid" \
        --arg pri "${new_pri:-}" --arg sid "${new_short_id:-}" \
        "$jq_filter" "$CONFIG_PATH" > "$tmp_file"; then
@@ -5073,7 +5084,7 @@ update_self_script(){
   echo ""
   echo -e "${Y}==> 下载最新脚本...${N}"
   tmp_file=$(mktemp)
-  trap 'rm -f "$tmp_file"' RETURN INT TERM
+  trap 'rm -f "$tmp_file"' RETURN
   if ! curl -fsSL --max-time 15 "$SELF_INSTALL_URL" -o "$tmp_file"; then
     rm -f "$tmp_file"
     echo -e "${R}下载失败，请检查网络或 SELF_INSTALL_URL${N}"
@@ -5774,15 +5785,18 @@ generate_hy2_random_port(){
   printf '%s' "$p"
 }
 
-# AnyTLS 默认端口生成：避开本机已占端口与 Reality 节点已用端口
+# AnyTLS 默认端口生成：避开本机已占端口与已安装节点已用端口
 generate_anytls_random_port(){
-  local p attempts=0
-  local reality_port
-  reality_port=$(get_node_value reality Port 2>/dev/null || true)
+  local p attempts=0 t taken_ports=""
+  for t in reality hy2 tuic ss2022; do
+    if node_installed "$t"; then
+      taken_ports="$taken_ports $(get_node_value "$t" Port 2>/dev/null || true)"
+    fi
+  done
   while [ $attempts -lt 30 ]; do
     p=$(( (RANDOM << 15 | RANDOM) % 45535 + 20000 ))
     attempts=$((attempts + 1))
-    if [ -n "$reality_port" ] && [ "$p" -eq "$reality_port" ]; then
+    if printf '%s\n' $taken_ports | grep -qFx "$p"; then
       continue
     fi
     if ! check_port_in_use "$p"; then
@@ -5993,7 +6007,7 @@ install_hy2_node(){
     2)
       HOP_ENABLE=1
       HOP_MODE="auto"
-      read HOP_START HOP_END < <(port_hop_compute_range "$PORT")
+      read -r HOP_START HOP_END < <(port_hop_compute_range "$PORT")
       echo -e "  自动选择：${C}${HOP_START}-${HOP_END}${N} ${D}（共 $((HOP_END-HOP_START+1)) 个端口）${N}"
       echo -e "  ${Y}注意：会自动配置 iptables NAT 规则并占用整个范围${N}"
       read -p "  确认启用？(y/N): " confirm_hop
@@ -6428,7 +6442,7 @@ modify_hy2_params(){
     2)
       new_hop=1
       new_hop_mode="auto"
-      read new_hop_start new_hop_end < <(port_hop_compute_range "$new_port")
+      read -r new_hop_start new_hop_end < <(port_hop_compute_range "$new_port")
       echo -e "  自动选择：${C}${new_hop_start}-${new_hop_end}${N}"
       ;;
     3)
@@ -6473,7 +6487,7 @@ modify_hy2_params(){
       new_hop_end="$cur_hop_end"
       if [ "$cur_hop" = "1" ] && [ "$new_port" != "$cur_port" ]; then
         if [ "$cur_hop_mode" = "auto" ]; then
-          read new_hop_start new_hop_end < <(port_hop_compute_range "$new_port")
+          read -r new_hop_start new_hop_end < <(port_hop_compute_range "$new_port")
           echo -e "  ${D}主端口已变，自动范围重算为 ${new_hop_start}-${new_hop_end}${N}"
         else
           # 自定义模式下主端口变了，校验老范围是否仍然合法
@@ -6552,7 +6566,7 @@ modify_hy2_params(){
 
   local tmp_file
   tmp_file=$(mktemp)
-  trap 'rm -f "$tmp_file"' RETURN INT TERM
+  trap 'rm -f "$tmp_file"' RETURN
   if ! jq --arg port "$new_port" --arg sni "$new_sni" \
        --arg pw "${new_pw:-}" --arg opw "${new_obfs_pw:-}" \
        --arg bw_action "$bw_action" --arg up "$new_up" --arg down "$new_down" \
@@ -8932,13 +8946,13 @@ warp_install_wgcf(){
     return 1
   fi
   warp_log_info "下载 wgcf（${arch}）..."
-  tag=$(curl -fsSL "$WARP_WGCF_RELEASE_API" 2>/dev/null | jq -r '.tag_name' 2>/dev/null)
+  tag=$(curl -fsSL --max-time 10 "$WARP_WGCF_RELEASE_API" 2>/dev/null | jq -r '.tag_name' 2>/dev/null)
   if [ -z "$tag" ] || [ "$tag" = "null" ]; then
     warp_log_warn "GitHub API 取版本失败，回退固定版本 v2.2.19"
     tag="v2.2.19"
   fi
   url="https://github.com/ViRb3/wgcf/releases/download/${tag}/wgcf_${tag#v}_linux_${arch}"
-  if ! curl -fsSL "$url" -o "$WARP_WGCF_BIN"; then
+  if ! curl -fsSL --max-time 60 "$url" -o "$WARP_WGCF_BIN"; then
     warp_log_err "wgcf 下载失败：$url"
     return 1
   fi
