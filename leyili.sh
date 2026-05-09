@@ -635,10 +635,16 @@ render_divider(){
 }
 
 render_brand_banner(){
+  # 星空横幅：· ✦ · ─ · ✧ · ─ 重复 3 次 + · ✦ ·，共 53 可见列
+  local sky="" i
+  for ((i = 0; i < 3; i++)); do
+    sky+="${L}·${N} ${C}✦${N} ${L}·${N} ${L}─${N} ${L}·${N} ${C}✧${N} ${L}·${N} ${L}─${N} "
+  done
+  sky+="${L}·${N} ${C}✦${N} ${L}·${N}"
   echo ""
-  echo -e "  ${L}╔══════════════════════════════════════════════════════╗${N}"
-  echo -e "  ${L}║${N}  ${B}${W}${APP_NAME}${N}  ${D}Linux Menu${N}                                  ${L}║${N}"
-  echo -e "  ${L}╚══════════════════════════════════════════════════════╝${N}"
+  echo -e "  ${sky}"
+  echo -e "          ✨  ${B}${W}${APP_NAME}${N}  ${C}Linux Menu${N}  ✨"
+  echo -e "  ${sky}"
 }
 
 render_section_header(){
@@ -8272,8 +8278,8 @@ CARD_INNER_WIDTH=52
 # 计算字符串可见宽度（剥除 ANSI 颜色码）
 # 直接看 UTF-8 字节头：ASCII 与 2 字节字符按 1 列、3 字节 / 4 字节按 2 列。
 # 不依赖 wc -m 的 locale 行为，C / POSIX locale 下也能正确算 CJK 宽度。
-# 注意：● 与 box-drawing 字符 ─ ╭ ╮ ╰ ╯ │ 这些 "3 字节 UTF-8 但实际单倍宽"
-# 的字符会被高估 1，所以本框架不在被测内容里使用它们（边框由本框架自身绘制）。
+# 例外：U+2500-U+27BF 这一段（box drawing / 几何 / 杂项符号 / 装饰符）
+# 实际多为单倍宽，此处单独按 1 列计；其中 ✨ (U+2728) 是 emoji，仍按 2 列。
 _card_visible(){
   local s
   s=$(printf '%b' "$1" | sed $'s/\x1b\\[[0-9;]*[a-zA-Z]//g')
@@ -8282,11 +8288,25 @@ _card_visible(){
     {
       for (i = 1; i <= NF; i++) {
         b = $i + 0
-        if (b < 128) n += 1
-        else if (b < 192) continue
-        else if (b < 224) n += 1
-        else if (b < 240) n += 2
-        else            n += 2
+        if (b < 128) { n += 1; continue }
+        if (b < 192) continue
+        if (b < 224) { n += 1; continue }
+        if (b < 240) {
+          # 3 字节 UTF-8：默认 2 列；E2 94..9B / 9C 段中的非 emoji 字符按 1 列
+          if (b == 226) {
+            b2 = (i + 1 <= NF) ? $(i+1) + 0 : 0
+            b3 = (i + 2 <= NF) ? $(i+2) + 0 : 0
+            if (b2 >= 148 && b2 <= 155) { n += 1; continue }
+            if (b2 == 156) {
+              # ✨ U+2728 = E2 9C A8 是 emoji，按 2 列
+              if (b3 == 168) { n += 2; continue }
+              n += 1; continue
+            }
+          }
+          n += 2
+          continue
+        }
+        n += 2
       }
     }
     END { print n }
@@ -8314,17 +8334,17 @@ render_card_line(){
   echo -e "  ${L}│${N}${content}$(printf '%*s' "$pad" '')${L}│${N}"
 }
 
-# 卡片顶部：╭─ TITLE ─...─ RIGHT ─╮
+# 卡片顶部：╭─★ TITLE ─...─ RIGHT ★─╮
 render_card_top(){
   local title="$1" right="$2"
   local title_w right_w fill_w fill
   title_w=$(_card_visible "$title")
   right_w=$(_card_visible "$right")
-  # 内宽 = 1(─) + 1(空) + title + 1(空) + N + 1(空) + right + 1(空) + 1(─)
-  fill_w=$((CARD_INNER_WIDTH - 6 - title_w - right_w))
+  # 内宽 = 1(─) + 1(★) + 1(空) + title + 1(空) + N + 1(空) + right + 1(空) + 1(★) + 1(─)
+  fill_w=$((CARD_INNER_WIDTH - 8 - title_w - right_w))
   [ "$fill_w" -lt 1 ] && fill_w=1
   fill=$(_card_dash_fill "$fill_w")
-  echo -e "  ${L}╭─${N} ${title} ${L}${fill}${N} ${right} ${L}─╮${N}"
+  echo -e "  ${L}╭─${N}${C}★${N} ${title} ${L}${fill}${N} ${right} ${C}★${N}${L}─╮${N}"
 }
 
 # 卡片底部
@@ -8347,7 +8367,7 @@ render_node_card_block(){
   esac
 
   if ! node_installed "$type"; then
-    render_card_line "   ${C}${label}${N}${Y}未安装${N}"
+    render_card_line " ${C}✦${N} ${C}${label}${N}${D}◌${N} ${Y}未安装${N}"
     return
   fi
 
@@ -8373,8 +8393,8 @@ render_node_card_block(){
     extra="  ${R}[谨慎]${N}"
   fi
 
-  # 第一行：协议名 + 已安装 + :端口 + IP + 附加
-  render_card_line "   ${C}${label}${N}${G}已安装${N}  :${C}${port:-?}${N}${gap_str}${C}${ip:-?}${N}${extra}"
+  # 第一行：✦ + 协议名 + ● + :端口 + IP + 附加
+  render_card_line " ${C}✦${N} ${C}${label}${N}${G}●${N} :${C}${port:-?}${N}${gap_str}${C}${ip:-?}${N}${extra}"
   # 第二行：网络方向（缩进对齐到第一行的状态列）
   render_card_line "              ${D}${mode_label}${N}"
 
@@ -8384,7 +8404,7 @@ render_node_card_block(){
 render_tcp_card_line(){
   local label="TCP 调优   "  # 11 可见列
   if [ ! -f "$TCP_TUNING_PATH" ]; then
-    render_card_line "   ${C}${label}${N}${D}未启用${N}"
+    render_card_line " ${C}✧${N} ${C}${label}${N}${D}未启用${N}"
     return
   fi
   local profile_line region="" mem_tier="" region_label="" mem_label=""
@@ -8408,9 +8428,9 @@ render_tcp_card_line(){
   local cc
   cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "?")
   if [ -n "$region_label" ] && [ -n "$mem_label" ]; then
-    render_card_line "   ${C}${label}${N}${G}已启用${N} ${D}·${N} ${C}${region_label}/${mem_label}${N} ${D}·${N} ${D}cc=${cc}${N}"
+    render_card_line " ${C}✧${N} ${C}${label}${N}${C}${region_label}/${mem_label}${N} ${D}·${N} ${D}cc=${cc}${N}"
   else
-    render_card_line "   ${C}${label}${N}${G}已启用${N} ${D}·${N} ${D}cc=${cc}${N}"
+    render_card_line " ${C}✧${N} ${C}${label}${N}${D}cc=${cc}${N}"
   fi
 }
 
@@ -8418,7 +8438,7 @@ render_tcp_card_line(){
 render_quic_card_line(){
   local label="QUIC 调优  "  # 11 可见列
   if [ ! -f "$QUIC_TUNING_PATH" ]; then
-    render_card_line "   ${C}${label}${N}${D}未启用${N}"
+    render_card_line " ${C}✧${N} ${C}${label}${N}${D}未启用${N}"
     return
   fi
   local profile_line region="" mem_tier="" region_label="" mem_label=""
@@ -8445,9 +8465,9 @@ render_quic_card_line(){
     rmem_label="$((rmem_max / 1024 / 1024))M"
   fi
   if [ -n "$region_label" ] && [ -n "$mem_label" ]; then
-    render_card_line "   ${C}${label}${N}${G}已启用${N} ${D}·${N} ${C}${region_label}/${mem_label}${N} ${D}·${N} ${D}rmem=${rmem_label}${N}"
+    render_card_line " ${C}✧${N} ${C}${label}${N}${C}${region_label}/${mem_label}${N} ${D}·${N} ${D}rmem=${rmem_label}${N}"
   else
-    render_card_line "   ${C}${label}${N}${G}已启用${N} ${D}·${N} ${D}rmem=${rmem_label}${N}"
+    render_card_line " ${C}✧${N} ${C}${label}${N}${D}rmem=${rmem_label}${N}"
   fi
 }
 
@@ -8455,13 +8475,13 @@ render_quic_card_line(){
 render_initcwnd_card_line(){
   local label="initcwnd   "  # 11 可见列
   if ! command -v ip >/dev/null 2>&1; then
-    render_card_line "   ${C}${label}${N}${D}未知 (ip 命令缺失)${N}"
+    render_card_line " ${C}✧${N} ${C}${label}${N}${D}未知 (ip 命令缺失)${N}"
     return
   fi
   local route_line val persist
   route_line=$(ip route show default 2>/dev/null | head -n1)
   if [ -z "$route_line" ]; then
-    render_card_line "   ${C}${label}${N}${D}无默认路由${N}"
+    render_card_line " ${C}✧${N} ${C}${label}${N}${D}无默认路由${N}"
     return
   fi
   val=$(printf '%s\n' "$route_line" | awk '{
@@ -8470,7 +8490,7 @@ render_initcwnd_card_line(){
     }
   }')
   if [ -z "$val" ]; then
-    render_card_line "   ${C}${label}${N}${D}未设置${N}"
+    render_card_line " ${C}✧${N} ${C}${label}${N}${D}未设置${N}"
     return
   fi
   if [ -f "$INITCWND_SERVICE_PATH" ] \
@@ -8479,7 +8499,7 @@ render_initcwnd_card_line(){
   else
     persist="${Y}(未持久化)${N}"
   fi
-  render_card_line "   ${C}${label}${N}${C}${val}${N}  ${persist}"
+  render_card_line " ${C}✧${N} ${C}${label}${N}${C}${val}${N}  ${persist}"
 }
 
 # 主菜单卡片：标题栏 + 协议块 + 系统调优行
@@ -8489,16 +8509,18 @@ render_realm_card_line(){
     return  # 未安装时不显示这一行（保持卡片简洁）
   fi
   local ver status status_str count
-  ver=$(realm_get_version 2>/dev/null)
+  ver=$(realm_get_version 2>/dev/null | head -n1)
   [ -z "$ver" ] && ver="?"
-  status=$(systemctl is-active realm 2>/dev/null || echo "未知")
-  if [ "$status" = "active" ]; then
-    status_str="${G}运行中${N}"
-  else
-    status_str="${R}${status}${N}"
-  fi
-  count=$(realm_count_rules 2>/dev/null || echo 0)
-  render_card_line "   ${C}${label}${N}${G}已安装${N} ${D}·${N} ${C}v${ver}${N} ${D}·${N} ${status_str} ${D}·${N} ${C}${count}${N} ${D}条规则${N}"
+  status=$(systemctl is-active realm 2>/dev/null | head -n1)
+  [ -z "$status" ] && status="未知"
+  case "$status" in
+    active)              status_str="${G}运行中${N}" ;;
+    activating|reloading) status_str="${Y}${status}${N}" ;;
+    *)                   status_str="${R}${status}${N}" ;;
+  esac
+  count=$(realm_count_rules 2>/dev/null | head -n1)
+  [ -z "$count" ] && count=0
+  render_card_line " ${C}✧${N} ${C}${label}${N}${C}v${ver}${N} ${D}·${N} ${status_str} ${D}·${N} ${C}${count}${N} ${D}条规则${N}"
 }
 
 render_main_menu_card(){
@@ -9397,8 +9419,11 @@ require_realm_installed(){
 #   ...
 
 realm_count_rules(){
-  [ -f "$REALM_CONFIG_PATH" ] || { echo 0; return 0; }
-  grep -c '^\[\[endpoints\]\]' "$REALM_CONFIG_PATH" 2>/dev/null || echo 0
+  local n=0
+  if [ -f "$REALM_CONFIG_PATH" ]; then
+    n=$(grep -c '^\[\[endpoints\]\]' "$REALM_CONFIG_PATH" 2>/dev/null)
+  fi
+  printf '%s\n' "${n:-0}"
 }
 
 # 列出所有规则，输出: "INDEX|LISTEN|REMOTE"，从 1 开始
