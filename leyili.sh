@@ -1944,6 +1944,26 @@ build_tuic_link(){
     "$uuid" "$password" "$host" "$port" "${sni:-}" "$cc" "$insecure" "$tag"
 }
 
+build_ss2022_link(){
+  # build_ss2022_link <method> <password> <ip> <port> <tag>
+  # SIP002 标准：ss://<base64url(method:password)>@host:port#tag
+  local method="$1"
+  local password="$2"
+  local ip="$3"
+  local port="$4"
+  local tag="${5:-ss2022}"
+
+  if [ -z "$method" ] || [ -z "$password" ] || [ -z "$ip" ] || [ -z "$port" ]; then
+    return 1
+  fi
+
+  local host userinfo
+  host=$(url_encode_host "$ip")
+  userinfo=$(printf '%s:%s' "$method" "$password" | base64 -w0 2>/dev/null | tr '+/' '-_' | tr -d '=')
+  printf 'ss://%s@%s:%s#%s\n' \
+    "$userinfo" "$host" "$port" "$tag"
+}
+
 
 # 由节点 info 文件构造链接（dispatcher）
 build_link_for_node(){
@@ -1995,6 +2015,12 @@ build_link_for_node(){
       insecure=$(get_node_value "$type" Insecure 2>/dev/null || echo 0)
       cc=$(get_node_value "$type" CongestionControl 2>/dev/null || echo bbr)
       build_tuic_link "$uuid" "$password" "$ip" "$port" "$sni" "$insecure" "$cc" "$tag"
+      ;;
+    ss2022)
+      local method password
+      method=$(get_node_value "$type" Method 2>/dev/null || true)
+      password=$(get_node_value "$type" Password 2>/dev/null || true)
+      build_ss2022_link "$method" "$password" "$ip" "$port" "$tag"
       ;;
     *)
       return 1
@@ -3696,6 +3722,18 @@ render_node_detail(){
       echo -e "  端口      : ${C}${port:-未知}${N} ${D}(TCP)${N}"
       echo -e "  SNI       : ${C}${sni:-未知}${N}"
       ;;
+    ss2022)
+      local method_v pwd_v
+      method_v=$(get_node_value "$type" Method 2>/dev/null || true)
+      pwd_v=$(get_node_value "$type" Password 2>/dev/null || true)
+      echo -e "  类型      : ${C}Shadowsocks-2022${N}  Tag : ${C}${tag}${N}"
+      echo -e "  加密方式  : ${C}${method_v:-未知}${N}"
+      echo -e "  Password  : ${C}${pwd_v:-未知}${N}"
+      echo -e "  模式      : ${C}${mode_label}${N}"
+      echo -e "  IP        : ${C}${ip:-未知}${N}"
+      echo -e "  端口      : ${C}${port:-未知}${N} ${D}(TCP)${N}"
+      echo -e "  ${R}⚠ 谨慎：抗主动探测较弱，避免在高 GFW 风险链路单独使用${N}"
+      ;;
   esac
 }
 
@@ -3966,6 +4004,7 @@ modify_node_params(){
     hy2)     modify_hy2_params ;;
     anytls)  modify_anytls_params ;;
     tuic)    modify_tuic_params ;;
+    ss2022)  modify_ss2022_params ;;
     *)
       echo -e "${R}未知节点类型: $node_type${N}"
       pause_screen
@@ -7248,6 +7287,462 @@ uninstall_tuic_node(){
   pause_screen
 }
 
+# ─── Shadowsocks-2022 ─────────────────────────────────
+# 抗主动探测能力弱于 Reality / Hysteria2，菜单中标记为 [谨慎]
+
+generate_ss2022_random_port(){
+  local p attempts=0
+  while [ $attempts -lt 30 ]; do
+    p=$(( (RANDOM << 15 | RANDOM) % 45535 + 20000 ))
+    attempts=$((attempts + 1))
+    if ! check_port_in_use "$p"; then
+      printf '%s' "$p"
+      return 0
+    fi
+  done
+  printf '%s' "$p"
+}
+
+# SS-2022 密钥长度由加密方式决定：
+#   2022-blake3-aes-128-gcm        → 16 bytes
+#   2022-blake3-aes-256-gcm        → 32 bytes
+#   2022-blake3-chacha20-poly1305  → 32 bytes
+generate_ss2022_password(){
+  local method="${1:-2022-blake3-aes-128-gcm}"
+  local bytes=16
+  case "$method" in
+    *aes-128-gcm)                       bytes=16 ;;
+    *aes-256-gcm|*chacha20-poly1305)    bytes=32 ;;
+  esac
+  if ! command -v openssl >/dev/null 2>&1; then
+    return 1
+  fi
+  openssl rand -base64 "$bytes" | tr -d '\r\n'
+}
+
+install_ss2022_node(){
+  local port_input=""
+  local access_ip="" link="" ipv6_link=""
+  local public_ipv4="" public_ipv6=""
+  local install_mode="ipv4" mode_label=""
+  local PORT TAG LISTEN_CHOICE LISTEN_ADDR METHOD PASSWORD METHOD_CHOICE confirm
+  local default_port
+
+  if ! require_root; then return 1; fi
+
+  render_section_header "创建 Shadowsocks-2022 节点"
+  echo -e "  ${R}⚠ 谨慎：SS-2022 抗主动探测能力弱于 Reality / Hysteria2${N}"
+  echo -e "  ${R}  在被高强度 GFW 主动探测的链路上更容易被识别${N}"
+  echo -e "  ${D}  建议仅在低风险环境（落地中转 / 跨境企业线路）使用${N}"
+  echo -e "  ${Y}直接回车使用括号内默认值${N}"
+  echo ""
+
+  if node_installed ss2022; then
+    echo -e "${Y}检测到已存在 Shadowsocks-2022 节点，继续将覆盖原节点配置${N}"
+    read -p "  继续？(y/N): " confirm
+    if [ "$confirm" != "y" ] && [ "$confirm" != "Y" ]; then
+      echo -e "  已取消"
+      return 0
+    fi
+  fi
+
+  default_port=$(generate_ss2022_random_port)
+  while true; do
+    read -p "  端口 (${default_port}): " port_input
+    PORT="${port_input:-$default_port}"
+    if ! validate_port "$PORT"; then
+      echo -e "${R}端口必须是 1-65535 的数字${N}"
+      continue
+    fi
+    PORT=$((10#$PORT))
+    if check_port_in_use "$PORT"; then
+      echo -e "${R}端口 ${PORT} 已被其他服务占用${N}"
+      local force_port=""
+      read -p "  仍然使用此端口？(y/N): " force_port
+      if [ "$force_port" != "y" ] && [ "$force_port" != "Y" ]; then
+        continue
+      fi
+    fi
+    break
+  done
+
+  read -p "  节点名称 (ss2022): " TAG
+  TAG="${TAG:-ss2022}"
+
+  echo -e "  加密方式："
+  echo -e "    1) 2022-blake3-aes-128-gcm        ${D}(默认，AES-NI 性能最佳)${N}"
+  echo -e "    2) 2022-blake3-aes-256-gcm        ${D}(更高安全冗余，CPU 开销略增)${N}"
+  echo -e "    3) 2022-blake3-chacha20-poly1305  ${D}(无 AES 硬件加速时更快)${N}"
+  read -p "  请选择 (1): " METHOD_CHOICE
+  case "$METHOD_CHOICE" in
+    2) METHOD="2022-blake3-aes-256-gcm" ;;
+    3) METHOD="2022-blake3-chacha20-poly1305" ;;
+    *) METHOD="2022-blake3-aes-128-gcm" ;;
+  esac
+
+  echo -e "  监听模式："
+  echo "    1) 仅 IPv4 入站 + 仅 IPv4 出站 - 0.0.0.0（默认）"
+  echo "    2) 双栈入站 + 仅 IPv4 出站 - ::"
+  echo "    3) 仅 IPv6 入站 + 仅 IPv4 出站"
+  read -p "  请选择 (1): " LISTEN_CHOICE
+  case "$LISTEN_CHOICE" in
+    2) LISTEN_ADDR="::"; install_mode="dualstack" ;;
+    3) LISTEN_ADDR=""; install_mode="ipv6-in-ipv4-out" ;;
+    *) LISTEN_ADDR="0.0.0.0"; install_mode="ipv4" ;;
+  esac
+
+  if [ "$install_mode" = "ipv6-in-ipv4-out" ]; then
+    public_ipv6=$(detect_primary_ipv6)
+    if [ -z "$public_ipv6" ]; then
+      echo ""
+      echo -e "${R}未检测到可用的 IPv6 地址，无法使用“仅 IPv6 入站 + 仅 IPv4 出站”模式${N}"
+      pause_screen
+      return 1
+    fi
+  fi
+
+  if ! is_singbox_installed; then
+    echo ""
+    echo -e "${Y}==> 安装 sing-box...${N}"
+    if ! install_singbox; then
+      echo ""
+      echo -e "${R}sing-box 安装失败，请检查上方输出${N}"
+      pause_screen
+      return 1
+    fi
+  fi
+
+  echo -e "${Y}==> 生成 SS-2022 密钥...${N}"
+  PASSWORD=$(generate_ss2022_password "$METHOD")
+  if [ -z "$PASSWORD" ]; then
+    echo ""
+    echo -e "${R}密钥生成失败（缺少 openssl?）${N}"
+    pause_screen
+    return 1
+  fi
+
+  public_ipv4=${public_ipv4:-$(detect_primary_ipv4)}
+  public_ipv6=${public_ipv6:-$(detect_primary_ipv6)}
+
+  case "$install_mode" in
+    ipv6-in-ipv4-out)
+      access_ip="$public_ipv6"
+      LISTEN_ADDR="$public_ipv6"
+      if [ -z "$access_ip" ]; then
+        echo ""
+        echo -e "${R}未检测到可用的 IPv6 地址${N}"
+        pause_screen
+        return 1
+      fi
+      ;;
+    dualstack)
+      access_ip="${public_ipv4:-$public_ipv6}"
+      if [ -z "$access_ip" ]; then
+        echo ""
+        echo -e "${R}未检测到可用的 IPv4 / IPv6 地址${N}"
+        pause_screen
+        return 1
+      fi
+      ;;
+    *)
+      access_ip="$public_ipv4"
+      if [ -z "$access_ip" ]; then
+        echo ""
+        echo -e "${R}未检测到可用的 IPv4 地址，请检查网络环境${N}"
+        pause_screen
+        return 1
+      fi
+      ;;
+  esac
+
+  mode_label=$(describe_install_mode "$install_mode")
+
+  echo -e "${Y}==> 写入配置...${N}"
+  ensure_jq || { pause_screen; return 1; }
+
+  # network=tcp 屏蔽 UDP relay：减小攻击面，单一 TCP 防火墙规则
+  local inbound_json
+  inbound_json=$(jq -n \
+    --arg listen "$LISTEN_ADDR" \
+    --argjson port "$PORT" \
+    --arg method "$METHOD" \
+    --arg password "$PASSWORD" '{
+      type: "shadowsocks",
+      tag: "ss2022-in",
+      listen: $listen,
+      listen_port: $port,
+      network: "tcp",
+      method: $method,
+      password: $password
+    }')
+
+  if ! config_add_inbound "$inbound_json"; then
+    echo -e "${R}写入 inbound 失败${N}"
+    pause_screen
+    return 1
+  fi
+
+  echo -e "${Y}==> 校验并启动...${N}"
+  if ! config_check_and_restart; then
+    echo ""
+    echo -e "${R}sing-box 校验或重启失败${N}"
+    pause_screen
+    return 1
+  fi
+
+  node_apply_firewall_for_mode "$PORT" tcp "$install_mode"
+  print_firewall_hint "$PORT" tcp "Shadowsocks-2022 节点入站"
+
+  link=$(build_ss2022_link "$METHOD" "$PASSWORD" "$access_ip" "$PORT" "$TAG" 2>/dev/null || true)
+  if [ "$install_mode" = "dualstack" ] && [ -n "$public_ipv6" ] && [ "$public_ipv6" != "$access_ip" ]; then
+    ipv6_link=$(build_ss2022_link "$METHOD" "$PASSWORD" "$public_ipv6" "$PORT" "${TAG}-ipv6" 2>/dev/null || true)
+  fi
+
+  ensure_nodes_dir
+  cat > "$(node_info_path ss2022)" <<EOF
+Type=ss2022
+Tag=$TAG
+Mode=$install_mode
+ListenAddr=$LISTEN_ADDR
+Port=$PORT
+Method=$METHOD
+Password=$PASSWORD
+IP=$access_ip
+Link=$link
+EOF
+
+  register_sb_command || true
+
+  echo ""
+  echo -e "  ${G}╔══════════════════════════════════════════════════════╗${N}"
+  echo -e "  ${G}║${N}  ${B}${W}${APP_NAME}${N}  ${G}Shadowsocks-2022 节点创建完成${N}              ${G}║${N}"
+  echo -e "  ${G}╚══════════════════════════════════════════════════════╝${N}"
+  echo -e "  模式      : ${C}$mode_label${N}"
+  echo -e "  加密方式  : ${C}$METHOD${N}"
+  echo -e "  Password  : ${C}$PASSWORD${N}"
+  echo -e "  入口 IP   : ${C}${access_ip:-未知}${N}"
+  echo -e "  端口      : ${C}$PORT${N} ${D}(TCP)${N}"
+  if [ -n "$link" ]; then
+    echo ""
+    echo -e "  ${B}客户端链接：${N}"
+    echo -e "  ${G}$link${N}"
+    print_qrcode "$link"
+  fi
+  if [ -n "$ipv6_link" ]; then
+    echo ""
+    echo -e "  ${B}IPv6 客户端链接：${N}"
+    echo -e "  ${G}$ipv6_link${N}"
+    print_qrcode "$ipv6_link"
+  fi
+  echo ""
+  echo -e "  ${R}⚠ SS-2022 抗主动探测较弱，建议结合 CDN / 中转或仅在低风险环境使用${N}"
+  echo -e "  ${D}  默认仅启用 TCP；如需 UDP relay 请手动编辑 /etc/sing-box/config.json${N}"
+  echo -e "  信息已保存至 ${Y}$(node_info_path ss2022)${N}"
+  echo -e "  输入 ${B}${COMMAND_NAME}${N} 进入管理菜单"
+  pause_screen
+}
+
+uninstall_ss2022_node(){
+  local confirm
+  if ! node_installed ss2022; then
+    echo -e "${Y}Shadowsocks-2022 节点未安装${N}"
+    pause_screen
+    return 0
+  fi
+  echo ""
+  read -p "  确认卸载 Shadowsocks-2022 节点？(y/N): " confirm
+  if [ "$confirm" != "y" ] && [ "$confirm" != "Y" ]; then
+    echo -e "  已取消"
+    return 0
+  fi
+
+  # 必须在 remove_node_info 之前撤防火墙规则，否则读不到 Mode/Port
+  local ss_port ss_mode
+  ss_port=$(get_node_value ss2022 Port 2>/dev/null || true)
+  ss_mode=$(get_node_value ss2022 Mode 2>/dev/null || echo ipv4)
+  if [ -n "$ss_port" ]; then
+    node_revoke_firewall_for_mode "$ss_port" tcp "$ss_mode"
+  fi
+
+  config_remove_inbound_by_tag "ss2022-in" || true
+  remove_node_info ss2022
+  post_uninstall_service_step
+  echo -e "${G}Shadowsocks-2022 节点已卸载${N}"
+  pause_screen
+}
+
+modify_ss2022_params(){
+  local new_port="" new_method="" new_tag=""
+  local cur_port cur_method cur_tag cur_password regen_choice
+  local backup_path="" confirm new_password=""
+
+  if ! require_root; then return 1; fi
+  if ! require_singbox_installed; then return 1; fi
+  if ! node_installed ss2022; then
+    echo ""
+    echo -e "${R}未发现 Shadowsocks-2022 节点信息${N}"
+    pause_screen
+    return 1
+  fi
+  if [ ! -f "$CONFIG_PATH" ]; then
+    echo ""
+    echo -e "${R}未找到配置文件：$CONFIG_PATH${N}"
+    pause_screen
+    return 1
+  fi
+
+  cur_port=$(get_node_value ss2022 Port 2>/dev/null || true)
+  cur_method=$(get_node_value ss2022 Method 2>/dev/null || echo 2022-blake3-aes-128-gcm)
+  cur_tag=$(get_node_value ss2022 Tag 2>/dev/null || echo ss2022)
+  cur_password=$(get_node_value ss2022 Password 2>/dev/null || true)
+
+  render_section_header "修改 Shadowsocks-2022 节点"
+  echo -e "  ${Y}留空回车则保留当前值${N}"
+  echo ""
+
+  while true; do
+    read -p "  端口 (${cur_port}): " new_port
+    new_port="${new_port:-$cur_port}"
+    if ! validate_port "$new_port"; then
+      echo -e "${R}端口必须是 1-65535 的数字${N}"
+      continue
+    fi
+    new_port=$((10#$new_port))
+    if [ "$new_port" != "$cur_port" ] && check_port_in_use "$new_port"; then
+      echo -e "${R}端口 ${new_port} 已被其他服务占用${N}"
+      local force_port=""
+      read -p "  仍然使用此端口？(y/N): " force_port
+      if [ "$force_port" != "y" ] && [ "$force_port" != "Y" ]; then
+        continue
+      fi
+    fi
+    break
+  done
+
+  echo -e "  加密方式 (当前: ${C}${cur_method}${N})："
+  echo -e "    0) 保持不变（默认）"
+  echo -e "    1) 2022-blake3-aes-128-gcm"
+  echo -e "    2) 2022-blake3-aes-256-gcm"
+  echo -e "    3) 2022-blake3-chacha20-poly1305"
+  read -p "  请选择 (0): " METHOD_CHOICE
+  case "$METHOD_CHOICE" in
+    1) new_method="2022-blake3-aes-128-gcm" ;;
+    2) new_method="2022-blake3-aes-256-gcm" ;;
+    3) new_method="2022-blake3-chacha20-poly1305" ;;
+    *) new_method="$cur_method" ;;
+  esac
+
+  read -p "  节点名称 (${cur_tag}): " new_tag
+  new_tag="${new_tag:-$cur_tag}"
+
+  # 改加密方式必须重新生成密钥（密钥长度可能变）
+  if [ "$new_method" != "$cur_method" ]; then
+    echo -e "  ${Y}加密方式已变更，将自动重新生成密钥${N}"
+    regen_choice="y"
+  else
+    read -p "  重新生成密钥？(y/N): " regen_choice
+  fi
+
+  if [ "$regen_choice" = "y" ] || [ "$regen_choice" = "Y" ]; then
+    new_password=$(generate_ss2022_password "$new_method")
+    if [ -z "$new_password" ]; then
+      echo -e "${R}密钥生成失败${N}"
+      pause_screen
+      return 1
+    fi
+  else
+    new_password="$cur_password"
+  fi
+
+  echo ""
+  echo -e "  即将写入："
+  echo -e "    端口      : ${C}${new_port}${N}"
+  echo -e "    加密方式  : ${C}${new_method}${N}"
+  echo -e "    Tag       : ${C}${new_tag}${N}"
+  if [ "$new_password" != "$cur_password" ]; then
+    echo -e "    Password  : ${C}${new_password}${N} ${Y}(已更新)${N}"
+  else
+    echo -e "    Password  : ${D}保持不变${N}"
+  fi
+  read -p "  确认应用？(y/N): " confirm
+  if [ "$confirm" != "y" ] && [ "$confirm" != "Y" ]; then
+    echo -e "  已取消"
+    return 0
+  fi
+
+  backup_path="${CONFIG_PATH}.bak.$(date +%Y%m%d-%H%M%S)"
+  cp "$CONFIG_PATH" "$backup_path" 2>/dev/null || true
+
+  local cur_listen cur_mode
+  cur_listen=$(get_node_value ss2022 ListenAddr 2>/dev/null || echo "0.0.0.0")
+  cur_mode=$(get_node_value ss2022 Mode 2>/dev/null || echo ipv4)
+
+  local inbound_json
+  inbound_json=$(jq -n \
+    --arg listen "$cur_listen" \
+    --argjson port "$new_port" \
+    --arg method "$new_method" \
+    --arg password "$new_password" '{
+      type: "shadowsocks",
+      tag: "ss2022-in",
+      listen: $listen,
+      listen_port: $port,
+      network: "tcp",
+      method: $method,
+      password: $password
+    }')
+
+  if ! config_add_inbound "$inbound_json"; then
+    echo -e "${R}写入 inbound 失败，已保留备份: $backup_path${N}"
+    pause_screen
+    return 1
+  fi
+
+  if ! config_check_and_restart; then
+    echo -e "${R}sing-box 校验或重启失败，正在回滚...${N}"
+    cp "$backup_path" "$CONFIG_PATH" 2>/dev/null || true
+    systemctl restart sing-box >/dev/null 2>&1 || true
+    pause_screen
+    return 1
+  fi
+
+  # 端口变化时同步防火墙
+  if [ "$new_port" != "$cur_port" ]; then
+    node_revoke_firewall_for_mode "$cur_port" tcp "$cur_mode"
+    node_apply_firewall_for_mode "$new_port" tcp "$cur_mode"
+    print_firewall_hint "$new_port" tcp "Shadowsocks-2022 节点入站"
+  fi
+
+  set_node_value ss2022 Port "$new_port"
+  set_node_value ss2022 Method "$new_method"
+  set_node_value ss2022 Tag "$new_tag"
+  set_node_value ss2022 Password "$new_password"
+
+  local cur_ip new_link ipv6_new_link
+  cur_ip=$(get_node_value ss2022 IP 2>/dev/null || true)
+  new_link=$(build_ss2022_link "$new_method" "$new_password" "$cur_ip" "$new_port" "$new_tag" 2>/dev/null || true)
+  ipv6_new_link=$(build_dualstack_ipv6_link_for_node ss2022 2>/dev/null || true)
+  [ -n "$new_link" ] && set_node_value ss2022 Link "$new_link"
+
+  echo ""
+  echo -e "  ${G}修改完成${N}"
+  if [ -n "$new_link" ]; then
+    echo ""
+    echo -e "  ${B}新客户端链接：${N}"
+    echo -e "  ${G}${new_link}${N}"
+    print_qrcode "$new_link"
+  fi
+  if [ -n "$ipv6_new_link" ]; then
+    echo ""
+    echo -e "  ${B}新 IPv6 客户端链接：${N}"
+    echo -e "  ${G}${ipv6_new_link}${N}"
+    print_qrcode "$ipv6_new_link"
+  fi
+  echo ""
+  echo -e "  备份: ${Y}${backup_path}${N}"
+  pause_screen
+}
+
 modify_anytls_params(){
   local new_port="" new_sni="" new_pw=""
   local cur_port cur_sni cur_pw backup_path="" confirm
@@ -7698,6 +8193,9 @@ uninstall_script_completely(){
         anytls)
           [ -n "$port" ] && deny_port_in_firewall "$port" tcp
           ;;
+        ss2022)
+          [ -n "$port" ] && deny_port_in_firewall "$port" tcp
+          ;;
         hy2)
           [ -n "$port" ] && deny_port_in_firewall "$port" udp
           cert_src=$(get_node_value "$node" CertSource 2>/dev/null || true)
@@ -7844,6 +8342,7 @@ render_node_card_block(){
     hy2)     label="Hysteria2  " ;;   # 11 可见列：9 + 2 sp
     anytls)  label="AnyTLS     " ;;   # 11 可见列：6 + 5 sp
     tuic)    label="TUIC v5    " ;;   # 11 可见列：7 + 4 sp
+    ss2022)  label="SS-2022    " ;;   # 11 可见列：7 + 4 sp
     *)       label=$(printf '%-11s' "$type") ;;
   esac
 
@@ -7864,12 +8363,14 @@ render_node_card_block(){
   [ "$gap" -lt 1 ] && gap=1
   gap_str=$(printf '%*s' "$gap" '')
 
-  # 附加信息：HY2 端口跳跃
+  # 附加信息：HY2 端口跳跃 / SS-2022 谨慎标记
   local extra=""
   if [ "$type" = "hy2" ]; then
     local hop_v
     hop_v=$(get_node_value "$type" PortHop 2>/dev/null || echo 0)
     [ "$hop_v" = "1" ] && extra="  ${C}+hop${N}"
+  elif [ "$type" = "ss2022" ]; then
+    extra="  ${R}[谨慎]${N}"
   fi
 
   # 第一行：协议名 + 已安装 + :端口 + IP + 附加
@@ -8025,6 +8526,10 @@ render_main_menu_card(){
   render_node_card_block anytls
   render_card_blank
   render_node_card_block tuic
+  if node_installed ss2022; then
+    render_card_blank
+    render_node_card_block ss2022
+  fi
   render_card_blank
   render_tcp_card_line
   render_quic_card_line
@@ -8045,6 +8550,7 @@ show_node_install_menu(){
       echo -e "  ${D}3) 创建 AnyTLS 节点  (需先创建 Reality)${N}"
     fi
     render_menu_item 4 "创建 TUIC v5 节点$(node_installed tuic && echo "  ${D}(已安装，将覆盖)${N}")"
+    render_menu_item 5 "创建 Shadowsocks-2022 节点  ${R}[谨慎]${N}$(node_installed ss2022 && echo "  ${D}(已安装，将覆盖)${N}")"
     render_menu_item 0 "返回上级"
     render_divider
     read -p "  请输入序号: " choice
@@ -8059,6 +8565,7 @@ show_node_install_menu(){
         fi
         ;;
       4) install_tuic_node; return ;;
+      5) install_ss2022_node; return ;;
       0) return ;;
       *) notify_invalid_choice ;;
     esac
@@ -8088,6 +8595,11 @@ show_node_uninstall_menu(){
     else
       echo -e "  ${D}4) TUIC 未安装${N}"
     fi
+    if node_installed ss2022; then
+      render_menu_item 5 "卸载 Shadowsocks-2022 节点"
+    else
+      echo -e "  ${D}5) Shadowsocks-2022 未安装${N}"
+    fi
     render_menu_item 0 "返回上级"
     render_divider
     read -p "  请输入序号: " choice
@@ -8096,6 +8608,7 @@ show_node_uninstall_menu(){
       2) node_installed hy2 && uninstall_hy2_node; return ;;
       3) node_installed anytls && uninstall_anytls_node; return ;;
       4) node_installed tuic && uninstall_tuic_node; return ;;
+      5) node_installed ss2022 && uninstall_ss2022_node; return ;;
       0) return ;;
       *) notify_invalid_choice ;;
     esac
@@ -8343,7 +8856,7 @@ EOF
 show_node_manage_menu(){
   while true; do
     render_section_header "节点管理"
-    render_menu_item 1 "创建节点 (Reality / Hysteria2 / AnyTLS / TUIC)"
+    render_menu_item 1 "创建节点 (Reality / Hysteria2 / AnyTLS / TUIC / SS-2022)"
     render_menu_item 2 "卸载单个节点"
     render_menu_item 3 "Reality 域名检测工具"
     render_menu_item 4 "WARP 谷歌解锁分流"
