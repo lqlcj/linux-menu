@@ -18,8 +18,6 @@ QUIC_TUNING_PATH="/etc/sysctl.d/99-quic-optimized.conf"
 INITCWND_SERVICE_PATH="/etc/systemd/system/initcwnd.service"
 INITCWND_VALUE="24"
 SWAPFILE_PATH="/swapfile"
-SWAP_SIZE="2G"
-SWAP_SIZE_MB="2048"
 SWAP_SYSCTL_PATH="/etc/sysctl.d/99-swap-tuning.conf"
 SWAPPINESS_VALUE="10"
 
@@ -2181,7 +2179,7 @@ show_system_menu(){
     render_menu_item 4 "安装基础工具"
     render_menu_item 5 "网络优化"
     render_menu_item 6 "查看网络优化状态"
-    render_menu_item 7 "添加 SWAP (2G)"
+    render_menu_item 7 "添加 SWAP"
     render_menu_item 0 "返回上级"
     render_divider
     read -p "  请输入序号: " choice
@@ -2206,7 +2204,7 @@ show_system_menu(){
         show_network_optimization_status
         ;;
       7)
-        configure_swap
+        show_swap_picker
         ;;
       0)
         return
@@ -4962,6 +4960,8 @@ show_network_optimization_status(){
 }
 
 configure_swap(){
+  local swap_size_mb="${1:-2048}"
+  local size_label="${2:-${swap_size_mb} MB}"
   local swap_active="false"
 
   if ! require_root; then return 1; fi
@@ -4977,15 +4977,18 @@ configure_swap(){
 
   if [ "$swap_active" = "true" ]; then
     echo -e "${Y}==> 检测到 ${SWAPFILE_PATH} 已启用，跳过创建${N}"
+    echo -e "${D}    如需更换大小，请先在 shell 执行：swapoff ${SWAPFILE_PATH} && rm -f ${SWAPFILE_PATH}${N}"
   else
     if [ -f "$SWAPFILE_PATH" ]; then
-      echo -e "${Y}==> 检测到已有 ${SWAPFILE_PATH}，继续复用${N}"
+      echo -e "${Y}==> 检测到已有 ${SWAPFILE_PATH}，继续复用（不重建）${N}"
+      echo -e "${D}    如需更换大小，请先 rm -f ${SWAPFILE_PATH} 后重新运行此项${N}"
     else
-      echo -e "${Y}==> 创建 ${SWAP_SIZE} SWAP 文件...${N}"
-      if ! fallocate -l "$SWAP_SIZE" "$SWAPFILE_PATH"; then
-        echo -e "${Y}==> fallocate 失败，改用 dd 创建...${N}"
-        dd if=/dev/zero of="$SWAPFILE_PATH" bs=1M count="$SWAP_SIZE_MB" status=progress || {
+      echo -e "${Y}==> 创建 ${size_label} SWAP 文件...${N}"
+      if ! fallocate -l "${swap_size_mb}M" "$SWAPFILE_PATH"; then
+        echo -e "${Y}==> fallocate 失败（可能文件系统不支持，如 tmpfs/zfs），改用 dd 创建...${N}"
+        dd if=/dev/zero of="$SWAPFILE_PATH" bs=1M count="$swap_size_mb" status=progress || {
           echo -e "${R}SWAP 文件创建失败${N}"
+          rm -f "$SWAPFILE_PATH"
           pause_screen
           return 1
         }
@@ -5024,6 +5027,83 @@ EOF
   echo ""
   swapon --show
   pause_screen
+}
+
+# SWAP 档位选择器：根据用户内存档位推荐 SWAP 大小
+show_swap_picker(){
+  local detected_mem_kb detected_mem_mb detected_mem_label
+  local suggested=2 swap_size_mb=0 size_label="" choice
+  local existing_size_mb=""
+
+  if ! require_root; then return 1; fi
+
+  detected_mem_kb=$(awk '/MemTotal/ {print $2}' /proc/meminfo 2>/dev/null)
+  if [ -n "$detected_mem_kb" ] && [ "$detected_mem_kb" -gt 0 ]; then
+    detected_mem_mb=$((detected_mem_kb / 1024))
+    if   [ "$detected_mem_mb" -lt 768 ];  then suggested=1; detected_mem_label="${detected_mem_mb} MB ${D}(≤ 512 MB 档)${N}"
+    elif [ "$detected_mem_mb" -lt 1500 ]; then suggested=2; detected_mem_label="${detected_mem_mb} MB ${D}(1 GB 档)${N}"
+    else                                       suggested=3; detected_mem_label="${detected_mem_mb} MB ${D}(≥ 2 GB 档)${N}"
+    fi
+  else
+    detected_mem_label="未知"
+  fi
+
+  render_section_header "添加 SWAP"
+  echo -e "  ${B}当前检测到内存${N} : ${C}${detected_mem_label}${N}"
+  echo ""
+  free -h
+  echo ""
+
+  if [ -f "$SWAPFILE_PATH" ]; then
+    existing_size_mb=$(stat -c%s "$SWAPFILE_PATH" 2>/dev/null)
+    if [ -n "$existing_size_mb" ] && [ "$existing_size_mb" -gt 0 ] 2>/dev/null; then
+      existing_size_mb=$((existing_size_mb / 1024 / 1024))
+      echo -e "  ${Y}⚠ 检测到已存在 ${SWAPFILE_PATH}（约 ${existing_size_mb} MB），后续步骤会复用、不重建${N}"
+      echo -e "  ${D}  如需更换大小：先 ${C}swapoff ${SWAPFILE_PATH} && rm -f ${SWAPFILE_PATH}${D}，再回此菜单${N}"
+      echo ""
+    fi
+  fi
+
+  echo -e "  ${B}选择内存档位（脚本按档位推荐 SWAP 大小）：${N}"
+  render_menu_item 1 "≤ 512 MB    ${D}→ SWAP 1 GB    (小机器跑 apt/编译必需)${N}"
+  render_menu_item 2 "1 GB        ${D}→ SWAP 2 GB    (主流入门套餐推荐)${N}"
+  render_menu_item 3 "≥ 2 GB      ${D}→ SWAP 2 GB    (跑代理/转发足够)${N}"
+  render_menu_item 4 "自定义大小（MB）"
+  render_menu_item 0 "返回"
+  render_divider
+  read -p "  请选择 (默认 ${suggested}): " choice
+  choice="${choice:-$suggested}"
+
+  case "$choice" in
+    1) swap_size_mb=1024; size_label="1 GB" ;;
+    2) swap_size_mb=2048; size_label="2 GB" ;;
+    3) swap_size_mb=2048; size_label="2 GB" ;;
+    4)
+      while true; do
+        read -p "  自定义大小（MB，512-8192）: " swap_size_mb
+        case "$swap_size_mb" in
+          ''|*[!0-9]*)
+            echo -e "${R}必须为正整数${N}"
+            continue
+            ;;
+        esac
+        if [ "$swap_size_mb" -lt 512 ] || [ "$swap_size_mb" -gt 8192 ]; then
+          echo -e "${R}范围必须在 512-8192 MB 之间${N}"
+          continue
+        fi
+        if [ "$swap_size_mb" -ge 1024 ] && [ $((swap_size_mb % 1024)) -eq 0 ]; then
+          size_label="$((swap_size_mb / 1024)) GB"
+        else
+          size_label="${swap_size_mb} MB"
+        fi
+        break
+      done
+      ;;
+    0) return 0 ;;
+    *) notify_invalid_choice; return 0 ;;
+  esac
+
+  configure_swap "$swap_size_mb" "$size_label"
 }
 
 remove_swap(){
