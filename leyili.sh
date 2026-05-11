@@ -1498,7 +1498,8 @@ config_ensure_skeleton(){
       {"type": "udp", "tag": "cloudflare", "server": "1.1.1.1", "detour": "direct-out"},
       {"type": "udp", "tag": "google", "server": "8.8.8.8", "detour": "direct-out"}
     ],
-    "strategy": "ipv4_only"
+    "strategy": "prefer_ipv4",
+    "cache_capacity": 4096
   },
   "inbounds": [],
   "outbounds": [{
@@ -1535,7 +1536,8 @@ EOF
                         {"type":"udp","tag":"google","server":"8.8.8.8","detour":"direct-out"}
                       ]
                       else .dns.servers end)
-    | .dns.strategy = (.dns.strategy // "ipv4_only")
+    | .dns.strategy = (if ((.dns.strategy // "ipv4_only") == "ipv4_only") then "prefer_ipv4" else .dns.strategy end)
+    | .dns.cache_capacity = (.dns.cache_capacity // 4096)
     | .inbounds = ((.inbounds // []) | map(select(.tag == "reality-in" or .tag == "hy2-in" or .tag == "anytls-in" or .tag == "tuic-in")))
     | .outbounds = (if ((.outbounds // []) | length) == 0
                     then [{"type":"direct","tag":"direct-out","domain_resolver":"cloudflare"}]
