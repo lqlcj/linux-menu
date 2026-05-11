@@ -1493,25 +1493,12 @@ config_ensure_skeleton(){
     cat > "$CONFIG_PATH" <<'EOF'
 {
   "log": {"disabled": false, "level": "warn", "timestamp": true},
-  "dns": {
-    "servers": [
-      {"type": "udp", "tag": "cloudflare", "server": "1.1.1.1", "detour": "direct-out"},
-      {"type": "udp", "tag": "google", "server": "8.8.8.8", "detour": "direct-out"}
-    ],
-    "strategy": "prefer_ipv4",
-    "cache_capacity": 4096
-  },
   "inbounds": [],
   "outbounds": [{
     "type": "direct",
-    "tag": "direct-out",
-    "domain_resolver": "cloudflare"
+    "tag": "direct-out"
   }],
   "route": {
-    "default_domain_resolver": "cloudflare",
-    "rules": [
-      {"port": 53, "action": "hijack-dns"}
-    ],
     "final": "direct-out"
   }
 }
@@ -1521,37 +1508,26 @@ EOF
 
   local tmp
   tmp=$(mktemp)
-  # 透明升级：
-  # 1) 若没 outbounds 或为空，建一条 tagged direct-out
-  # 2) 若 direct outbound 没 tag，加上 tag=direct-out
-  # 3) 确保 route 块存在，final 默认 direct-out
-  # 4) DNS 兜底：servers 列表为空时塞两条公共 V4 上游（Cloudflare + Google）
-  # 5) 路由兜底：保证有 hijack-dns:53 规则，避免客户端 DNS 走原路泄漏
+  # 透明升级（不再托管 DNS，交给系统 resolv.conf）：
+  # 1) 清理老脚本残留的 dns 块、hijack-dns 规则、domain_resolver 字段
+  # 2) 若没 outbounds 或为空，建一条 tagged direct-out
+  # 3) 若 direct outbound 没 tag，加上 tag=direct-out
+  # 4) 确保 route 块存在，final 默认 direct-out
   if jq '
       .log = (.log // {"disabled": false, "level": "warn", "timestamp": true})
-    | .dns = (.dns // {})
-    | .dns.servers = (if ((.dns.servers // []) | length) == 0
-                      then [
-                        {"type":"udp","tag":"cloudflare","server":"1.1.1.1","detour":"direct-out"},
-                        {"type":"udp","tag":"google","server":"8.8.8.8","detour":"direct-out"}
-                      ]
-                      else .dns.servers end)
-    | .dns.strategy = (if ((.dns.strategy // "ipv4_only") == "ipv4_only") then "prefer_ipv4" else .dns.strategy end)
-    | .dns.cache_capacity = (.dns.cache_capacity // 4096)
+    | del(.dns)
     | .inbounds = ((.inbounds // []) | map(select(.tag == "reality-in" or .tag == "hy2-in" or .tag == "anytls-in" or .tag == "tuic-in")))
     | .outbounds = (if ((.outbounds // []) | length) == 0
-                    then [{"type":"direct","tag":"direct-out","domain_resolver":"cloudflare"}]
+                    then [{"type":"direct","tag":"direct-out"}]
                     else (.outbounds | map(
                         if .type == "direct" and (.tag // "") == ""
                         then .tag = "direct-out"
-                        else . end))
+                        else . end)
+                      | map(del(.domain_resolver)))
                     end)
     | .route = (.route // {})
-    | .route.default_domain_resolver = (.route.default_domain_resolver // "cloudflare")
-    | .route.rules = (
-        ((.route.rules // []) | map(select(.action != "hijack-dns" and (.port // null) != 53)))
-        + [{"port": 53, "action": "hijack-dns"}]
-      )
+    | del(.route.default_domain_resolver)
+    | .route.rules = ((.route.rules // []) | map(select(.action != "hijack-dns" and (.port // null) != 53)))
     | .route.final = (.route.final // "direct-out")
   ' "$CONFIG_PATH" > "$tmp" 2>/dev/null; then
     mv "$tmp" "$CONFIG_PATH"
