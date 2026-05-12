@@ -4084,18 +4084,24 @@ apply_tcp_tuning(){
   esac
 
   case "${region}_${mem_tier}" in
+    hk_512m)     buffer_max=4194304   ;;
     hk_1g)       buffer_max=8388608   ;;
     hk_2g)       buffer_max=16777216  ;;
     hk_4g)       buffer_max=16777216  ;;
     hk_8g)       buffer_max=33554432  ;;
+    jp_512m)     buffer_max=6291456   ;;
     jp_1g)       buffer_max=12582912  ;;
     jp_2g)       buffer_max=16777216  ;;
     jp_4g)       buffer_max=25165824  ;;
     jp_8g)       buffer_max=33554432  ;;
+    # us-west_512m: CloudCone LA 实测 185ms RTT，按 200Mbps × 1.5 ≈ 8M；
+    # 512MB 总内存严格防 OOM，比 1GB 档（16M）小一档，单连接占用减半
+    us-west_512m) buffer_max=8388608  ;;
     us-west_1g)  buffer_max=16777216  ;;
     us-west_2g)  buffer_max=33554432  ;;
     us-west_4g)  buffer_max=50331648  ;;
     us-west_8g)  buffer_max=67108864  ;;
+    eu_512m)     buffer_max=8388608   ;;
     eu_1g)       buffer_max=16777216  ;;
     eu_2g)       buffer_max=33554432  ;;
     eu_4g)       buffer_max=50331648  ;;
@@ -4107,6 +4113,7 @@ apply_tcp_tuning(){
   esac
 
   case "$mem_tier" in
+    512m) mem_label="512MB" ;;
     1g)  mem_label="1GB"  ;;
     2g)  mem_label="2GB"  ;;
     4g)  mem_label="4GB"  ;;
@@ -4275,18 +4282,22 @@ apply_quic_tuning(){
   esac
 
   case "${region}_${mem_tier}" in
+    hk_512m)     buffer_max=8388608   ;;
     hk_1g)       buffer_max=16777216  ;;
     hk_2g)       buffer_max=33554432  ;;
     hk_4g)       buffer_max=33554432  ;;
     hk_8g)       buffer_max=67108864  ;;
+    jp_512m)     buffer_max=12582912  ;;
     jp_1g)       buffer_max=16777216  ;;
     jp_2g)       buffer_max=33554432  ;;
     jp_4g)       buffer_max=67108864  ;;
     jp_8g)       buffer_max=67108864  ;;
+    us-west_512m) buffer_max=16777216 ;;
     us-west_1g)  buffer_max=25165824  ;;
     us-west_2g)  buffer_max=67108864  ;;
     us-west_4g)  buffer_max=100663296 ;;
     us-west_8g)  buffer_max=134217728 ;;
+    eu_512m)     buffer_max=16777216  ;;
     eu_1g)       buffer_max=33554432  ;;
     eu_2g)       buffer_max=67108864  ;;
     eu_4g)       buffer_max=134217728 ;;
@@ -4298,6 +4309,7 @@ apply_quic_tuning(){
   esac
 
   case "$mem_tier" in
+    512m) mem_label="512MB" ;;
     1g)  mem_label="1GB"  ;;
     2g)  mem_label="2GB"  ;;
     4g)  mem_label="4GB"  ;;
@@ -4395,6 +4407,7 @@ apply_quic_optimization(){
   esac
 
   case "$mem_tier" in
+    512m) mem_label="512MB" ;;
     1g)  mem_label="1GB"  ;;
     2g)  mem_label="2GB"  ;;
     4g)  mem_label="4GB"  ;;
@@ -4575,18 +4588,22 @@ remove_initcwnd_optimization(){
 _buffer_label_for(){
   local r="$1" m="$2"
   case "${r}_${m}" in
+    hk_512m)     echo "4M"  ;;
     hk_1g)       echo "16M" ;;
     hk_2g)       echo "32M" ;;
     hk_4g)       echo "32M" ;;
     hk_8g)       echo "64M" ;;
+    jp_512m)     echo "6M"  ;;
     jp_1g)       echo "16M" ;;
     jp_2g)       echo "32M" ;;
     jp_4g)       echo "64M" ;;
     jp_8g)       echo "64M" ;;
+    us-west_512m) echo "8M" ;;
     us-west_1g)  echo "24M" ;;
     us-west_2g)  echo "64M" ;;
     us-west_4g)  echo "96M" ;;
     us-west_8g)  echo "128M" ;;
+    eu_512m)     echo "8M"  ;;
     eu_1g)       echo "32M" ;;
     eu_2g)       echo "64M" ;;
     eu_4g)       echo "128M" ;;
@@ -4616,6 +4633,7 @@ apply_network_optimization(){
   esac
 
   case "$mem_tier" in
+    512m) mem_label="512MB" ;;
     1g)  mem_label="1GB"  ;;
     2g)  mem_label="2GB"  ;;
     4g)  mem_label="4GB"  ;;
@@ -4715,19 +4733,21 @@ show_tcp_optimization_picker(){
         echo ""
       fi
 
-      render_menu_item 1 "1 GB     ${D}缓冲上限 $(_buffer_label_for "$region" 1g)${N}"
-      render_menu_item 2 "2 GB     ${D}缓冲上限 $(_buffer_label_for "$region" 2g)${N}"
-      render_menu_item 3 "4 GB     ${D}缓冲上限 $(_buffer_label_for "$region" 4g)${N}"
-      render_menu_item 4 "8 GB+    ${D}缓冲上限 $(_buffer_label_for "$region" 8g)${N}"
+      render_menu_item 1 "512 MB   ${D}缓冲上限 $(_buffer_label_for "$region" 512m)${N}"
+      render_menu_item 2 "1 GB     ${D}缓冲上限 $(_buffer_label_for "$region" 1g)${N}"
+      render_menu_item 3 "2 GB     ${D}缓冲上限 $(_buffer_label_for "$region" 2g)${N}"
+      render_menu_item 4 "4 GB     ${D}缓冲上限 $(_buffer_label_for "$region" 4g)${N}"
+      render_menu_item 5 "8 GB+    ${D}缓冲上限 $(_buffer_label_for "$region" 8g)${N}"
       render_menu_item 0 "返回选择地区"
       render_divider
       read -p "  请选择内存档位: " mem_choice
 
       case "$mem_choice" in
-        1) mem_tier="1g" ;;
-        2) mem_tier="2g" ;;
-        3) mem_tier="4g" ;;
-        4) mem_tier="8g" ;;
+        1) mem_tier="512m" ;;
+        2) mem_tier="1g" ;;
+        3) mem_tier="2g" ;;
+        4) mem_tier="4g" ;;
+        5) mem_tier="8g" ;;
         0) break ;;
         *) notify_invalid_choice; continue ;;
       esac
@@ -4773,19 +4793,21 @@ show_quic_optimization_picker(){
         echo ""
       fi
 
-      render_menu_item 1 "1 GB     ${D}缓冲上限 $(_buffer_label_for "$region" 1g)${N}"
-      render_menu_item 2 "2 GB     ${D}缓冲上限 $(_buffer_label_for "$region" 2g)${N}"
-      render_menu_item 3 "4 GB     ${D}缓冲上限 $(_buffer_label_for "$region" 4g)${N}"
-      render_menu_item 4 "8 GB+    ${D}缓冲上限 $(_buffer_label_for "$region" 8g)${N}"
+      render_menu_item 1 "512 MB   ${D}缓冲上限 $(_buffer_label_for "$region" 512m)${N}"
+      render_menu_item 2 "1 GB     ${D}缓冲上限 $(_buffer_label_for "$region" 1g)${N}"
+      render_menu_item 3 "2 GB     ${D}缓冲上限 $(_buffer_label_for "$region" 2g)${N}"
+      render_menu_item 4 "4 GB     ${D}缓冲上限 $(_buffer_label_for "$region" 4g)${N}"
+      render_menu_item 5 "8 GB+    ${D}缓冲上限 $(_buffer_label_for "$region" 8g)${N}"
       render_menu_item 0 "返回选择地区"
       render_divider
       read -p "  请选择内存档位: " mem_choice
 
       case "$mem_choice" in
-        1) mem_tier="1g" ;;
-        2) mem_tier="2g" ;;
-        3) mem_tier="4g" ;;
-        4) mem_tier="8g" ;;
+        1) mem_tier="512m" ;;
+        2) mem_tier="1g" ;;
+        3) mem_tier="2g" ;;
+        4) mem_tier="4g" ;;
+        5) mem_tier="8g" ;;
         0) break ;;
         *) notify_invalid_choice; continue ;;
       esac
@@ -4869,6 +4891,7 @@ show_network_optimization_status(){
         eu)      region_label="欧洲" ;;
       esac
       case "$mem_tier" in
+        512m) mem_label="512MB" ;;
         1g) mem_label="1GB"  ;;
         2g) mem_label="2GB"  ;;
         4g) mem_label="4GB"  ;;
@@ -4913,6 +4936,7 @@ show_network_optimization_status(){
         eu)      region_label="欧洲" ;;
       esac
       case "$mem_tier" in
+        512m) mem_label="512MB" ;;
         1g) mem_label="1GB"  ;;
         2g) mem_label="2GB"  ;;
         4g) mem_label="4GB"  ;;
@@ -8548,6 +8572,7 @@ render_tcp_card_line(){
       eu)      region_label="欧洲" ;;
     esac
     case "$mem_tier" in
+      512m) mem_label="512M" ;;
       1g) mem_label="1G"  ;;
       2g) mem_label="2G"  ;;
       4g) mem_label="4G"  ;;
@@ -8582,6 +8607,7 @@ render_quic_card_line(){
       eu)      region_label="欧洲" ;;
     esac
     case "$mem_tier" in
+      512m) mem_label="512M" ;;
       1g) mem_label="1G"  ;;
       2g) mem_label="2G"  ;;
       4g) mem_label="4G"  ;;
