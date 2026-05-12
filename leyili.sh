@@ -4088,13 +4088,13 @@ apply_tcp_tuning(){
     hk_2g)       buffer_max=16777216  ;;
     hk_4g)       buffer_max=16777216  ;;
     hk_8g)       buffer_max=33554432  ;;
-    jp_1g)       buffer_max=8388608   ;;
+    jp_1g)       buffer_max=12582912  ;;
     jp_2g)       buffer_max=16777216  ;;
-    jp_4g)       buffer_max=16777216  ;;
+    jp_4g)       buffer_max=25165824  ;;
     jp_8g)       buffer_max=33554432  ;;
     us-west_1g)  buffer_max=16777216  ;;
-    us-west_2g)  buffer_max=25165824  ;;
-    us-west_4g)  buffer_max=33554432  ;;
+    us-west_2g)  buffer_max=33554432  ;;
+    us-west_4g)  buffer_max=50331648  ;;
     us-west_8g)  buffer_max=67108864  ;;
     eu_1g)       buffer_max=16777216  ;;
     eu_2g)       buffer_max=33554432  ;;
