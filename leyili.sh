@@ -4059,22 +4059,22 @@ apply_tcp_tuning(){
   case "$region" in
     hk)
       region_label="香港"
-      notsent_lowat=131072
+      notsent_lowat=16384
       fin_timeout=5
       ;;
     jp)
       region_label="日本"
-      notsent_lowat=131072
+      notsent_lowat=16384
       fin_timeout=5
       ;;
     us-west)
       region_label="美西"
-      notsent_lowat=131072
+      notsent_lowat=16384
       fin_timeout=10
       ;;
     eu)
       region_label="欧洲"
-      notsent_lowat=131072
+      notsent_lowat=16384
       fin_timeout=10
       ;;
     *)
@@ -4084,22 +4084,22 @@ apply_tcp_tuning(){
   esac
 
   case "${region}_${mem_tier}" in
-    hk_1g)       buffer_max=16777216  ;;
-    hk_2g)       buffer_max=33554432  ;;
-    hk_4g)       buffer_max=33554432  ;;
-    hk_8g)       buffer_max=67108864  ;;
-    jp_1g)       buffer_max=16777216  ;;
-    jp_2g)       buffer_max=33554432  ;;
-    jp_4g)       buffer_max=67108864  ;;
-    jp_8g)       buffer_max=67108864  ;;
-    us-west_1g)  buffer_max=25165824  ;;
-    us-west_2g)  buffer_max=67108864  ;;
-    us-west_4g)  buffer_max=100663296 ;;
-    us-west_8g)  buffer_max=134217728 ;;
-    eu_1g)       buffer_max=33554432  ;;
-    eu_2g)       buffer_max=67108864  ;;
-    eu_4g)       buffer_max=134217728 ;;
-    eu_8g)       buffer_max=134217728 ;;
+    hk_1g)       buffer_max=8388608   ;;
+    hk_2g)       buffer_max=16777216  ;;
+    hk_4g)       buffer_max=16777216  ;;
+    hk_8g)       buffer_max=33554432  ;;
+    jp_1g)       buffer_max=8388608   ;;
+    jp_2g)       buffer_max=16777216  ;;
+    jp_4g)       buffer_max=16777216  ;;
+    jp_8g)       buffer_max=33554432  ;;
+    us-west_1g)  buffer_max=16777216  ;;
+    us-west_2g)  buffer_max=25165824  ;;
+    us-west_4g)  buffer_max=33554432  ;;
+    us-west_8g)  buffer_max=67108864  ;;
+    eu_1g)       buffer_max=16777216  ;;
+    eu_2g)       buffer_max=33554432  ;;
+    eu_4g)       buffer_max=50331648  ;;
+    eu_8g)       buffer_max=67108864  ;;
     *)
       echo -e "${R}未知组合: ${region}/${mem_tier}${N}"
       return 1
@@ -4120,24 +4120,29 @@ apply_tcp_tuning(){
   cat > "$TCP_TUNING_PATH" <<EOF
 # leyili-profile: region=${region} mem_tier=${mem_tier}
 # 由 leyili.sh 一键网络优化生成 (${region_label} / ${mem_label})
+# 偏好：交互流（网页 / 社交 / 流媒体），非吞吐党
 
 # --- 拥塞控制 + 调度 ---
 net.core.default_qdisc = fq
 net.ipv4.tcp_congestion_control = bbr
-# TFO 客户端+服务端 (RFC 7413)；国内运营商可能干扰 TFO cookie，
-# 内核 blackhole 机制会自动退化为普通 TCP，开了不一定有用但不会有害
-net.ipv4.tcp_fastopen = 3
+# TFO = 1 仅客户端方向；服务端在国内出口常被运营商干扰 cookie，
+# 首包失败比首包提前 1RTT 更常见，因此服务端关闭
+net.ipv4.tcp_fastopen = 1
 
 # --- 缓冲区 (按地区 BDP 与内存档计算) ---
+# default 提到 512K：小连接也能直接进入有效拥塞窗口，不用等慢启动 grow
 net.core.rmem_max = ${buffer_max}
 net.core.wmem_max = ${buffer_max}
-net.core.rmem_default = 262144
-net.core.wmem_default = 262144
-net.ipv4.tcp_rmem = 16384 262144 ${buffer_max}
-net.ipv4.tcp_wmem = 16384 262144 ${buffer_max}
+net.core.rmem_default = 524288
+net.core.wmem_default = 524288
+net.ipv4.tcp_rmem = 16384 524288 ${buffer_max}
+net.ipv4.tcp_wmem = 16384 524288 ${buffer_max}
+# 路径不稳时偏 receiver 应用层 buffer，跨境丢包场景更跟手
+net.ipv4.tcp_adv_win_scale = 2
 
 # --- 长连接 / 慢启动 / MTU ---
-# 防 TCP-in-TCP 隧道 bufferbloat (Cloudflare web server 通用值 + NaiveProxy 推荐)
+# 16K：NaiveProxy 实测值，TCP-in-TLS 隧道防 HoL 阻塞 / 顿挫感的关键
+# (Cloudflare 早期推荐 128K 是面向 web server 吞吐场景，不适用代理转发)
 net.ipv4.tcp_notsent_lowat = ${notsent_lowat}
 net.ipv4.tcp_slow_start_after_idle = 0
 net.ipv4.tcp_window_scaling = 1
@@ -4150,14 +4155,17 @@ net.ipv4.ip_no_pmtu_disc = 0
 net.ipv4.tcp_tw_reuse = 1
 net.ipv4.tcp_fin_timeout = ${fin_timeout}
 net.ipv4.tcp_max_tw_buckets = 65536
-net.core.somaxconn = 8192
+net.core.somaxconn = 4096
 net.core.netdev_max_backlog = 16384
-net.ipv4.tcp_max_syn_backlog = 8192
+net.ipv4.tcp_max_syn_backlog = 4096
 net.ipv4.tcp_syncookies = 1
+# 防止异常 orphan 吃内存（小机器场景）
+net.ipv4.tcp_max_orphans = 16384
 
 # --- 保活 (防中间设备踢空闲连接) ---
-net.ipv4.tcp_keepalive_time = 600
-net.ipv4.tcp_keepalive_intvl = 15
+# 国内运营商 NAT 表常 5min 踢，缩短到 2min；切后台回来"第一下卡"主要由此引起
+net.ipv4.tcp_keepalive_time = 120
+net.ipv4.tcp_keepalive_intvl = 10
 net.ipv4.tcp_keepalive_probes = 5
 
 # --- 代理服务器专用 ---
@@ -4167,8 +4175,9 @@ net.ipv4.tcp_no_metrics_save = 1
 net.ipv4.tcp_ecn = 2
 # TIME-WAIT 状态下抑制迷路 RST/重复 FIN 干扰 (RFC 1337)
 net.ipv4.tcp_rfc1337 = 1
-# 异常连接重试上限 (Alibaba Cloud 推荐 5-10，10≈280s 给翻墙耐心容忍家庭网络抖动)
-net.ipv4.tcp_retries2 = 10
+# 异常连接重试 8≈100s：交互流场景下烂连接早点放弃让应用层重连
+# (默认 15≈924s 太久；之前 10≈280s 对刷网页/社交仍偏长)
+net.ipv4.tcp_retries2 = 8
 # SYN+ACK 重试 (Cloudflare/Red Hat 主流推荐 3≈45s，比默认 5≈63s 更稳健)
 net.ipv4.tcp_synack_retries = 3
 # 孤儿连接重试 (HAProxy/Nginx 生产标配；默认 8 在高并发下消耗内存，3≈25s 释放)

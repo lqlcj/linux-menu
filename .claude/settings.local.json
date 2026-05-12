@@ -69,7 +69,8 @@
       "Bash(awk NR>=8870 && NR<=8890 {printf \"%d: %s\\\\n\", NR, $0} *)",
       "Bash(awk NR>=7080 && NR<=7200 {printf \"%4d: %s\\\\n\", NR, $0} *)",
       "Bash(sed 's/<[^>]*>//g')",
-      "Bash(command -v jq)"
+      "Bash(command -v jq)",
+      "Bash(VPS_HOST=45.89.232.6 VPS_PORT=2222 VPS_USER=lcj VPS_PWD='Lcj13146688.' python *)"
     ]
   }
 }
