@@ -1533,9 +1533,9 @@ xray_config_check_and_restart(){
     echo -e "${R}xray 二进制不存在：$XRAY_BIN_PATH${N}"
     return 1
   fi
-  if ! "$XRAY_BIN_PATH" test -c "$XRAY_CONFIG_PATH" >/dev/null 2>&1; then
+  if ! "$XRAY_BIN_PATH" run -test -c "$XRAY_CONFIG_PATH" >/dev/null 2>&1; then
     echo -e "${R}Xray 配置校验失败，下面是详细错误：${N}"
-    "$XRAY_BIN_PATH" test -c "$XRAY_CONFIG_PATH" 2>&1 | sed 's/^/    /' || true
+    "$XRAY_BIN_PATH" run -test -c "$XRAY_CONFIG_PATH" 2>&1 | sed 's/^/    /' || true
     return 1
   fi
   if ! systemctl restart "$XRAY_SERVICE_NAME" 2>/dev/null; then
@@ -1559,7 +1559,7 @@ post_uninstall_xray_step(){
     systemctl disable "$XRAY_SERVICE_NAME" >/dev/null 2>&1 || true
     return 0
   fi
-  "$XRAY_BIN_PATH" test -c "$XRAY_CONFIG_PATH" >/dev/null 2>&1 \
+  "$XRAY_BIN_PATH" run -test -c "$XRAY_CONFIG_PATH" >/dev/null 2>&1 \
     && systemctl restart "$XRAY_SERVICE_NAME" >/dev/null 2>&1 || true
 }
 
