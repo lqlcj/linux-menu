@@ -68,6 +68,7 @@ G="\033[32m" Y="\033[33m" C="\033[36m" R="\033[31m" B="\033[1m" N="\033[0m"
 L="\033[94m" W="\033[97m" D="\033[2m"
 
 # ─── 通用辅助 ────────────────────────────────────────
+# ═══ source: 00-utils-head.sh ═══
 detect_distro(){
   if [ ! -r /etc/os-release ]; then
     printf '%s' "unknown"
@@ -147,6 +148,7 @@ cleanup_old_backups(){
   done
 }
 
+# ═══ source: 01-firewall-common.sh ═══
 check_port_in_use(){
   local port="$1"
 
@@ -602,6 +604,7 @@ cancel_rollback_pid(){
   kill "$pid" 2>/dev/null || true
 }
 
+# ═══ source: 02-utils-ui.sh ═══
 register_sb_command(){
   local source_path="" src_real dst_real
 
@@ -706,6 +709,7 @@ sanitize_sni(){
   printf '%s' "$1" | tr -d '\r\n' | tr -d '"'
 }
 
+# ═══ source: 03-system-admin-low.sh ═══
 require_root(){
   if [ "$(id -u)" -eq 0 ]; then
     return 0
@@ -1123,6 +1127,7 @@ ensure_password_auth_enabled(){
 # 判断 IPv4 是否属于私有 / CGNAT / 链路本地 / loopback / 0.0.0.0
 # NAT 型 VPS（阿里云国际轻量、腾讯云轻量、AWS Lightsail、各种 NAT 套餐）网卡绑的是
 # 内网 IP，公网 IP 在云厂商 NAT 网关上做映射；本地探测会拿到内网段，需要回退到外部接口。
+# ═══ source: 04-utils-ip.sh ═══
 is_private_ipv4(){
   case "$1" in
     10.*|127.*|192.168.*|0.0.0.0|169.254.*) return 0 ;;
@@ -1242,6 +1247,7 @@ describe_install_mode(){
   esac
 }
 
+# ═══ source: 10-singbox-core.sh ═══
 is_singbox_installed(){
   command -v sing-box >/dev/null 2>&1
 }
@@ -1347,6 +1353,7 @@ upgrade_singbox(){
 # 隔离原则：独立 systemd 服务 / 独立配置 / 独立二进制路径，不污染 sing-box
 # ═══════════════════════════════════════════════════════════════════════
 
+# ═══ source: 11-xray-core.sh ═══
 xray_detect_arch(){
   case "$(uname -m)" in
     x86_64|amd64)    printf '64' ;;
@@ -1563,6 +1570,7 @@ post_uninstall_xray_step(){
     && systemctl restart "$XRAY_SERVICE_NAME" >/dev/null 2>&1 || true
 }
 
+# ═══ source: 12-singbox-config-storage.sh ═══
 require_singbox_installed(){
   if is_singbox_installed; then
     return 0
@@ -2070,6 +2078,7 @@ load_proxy_context(){
 }
 
 # ─── 链接构造（按协议） ───────────────────────────────
+# ═══ source: 20-link-builders.sh ═══
 url_encode_host(){
   # 给 IPv6 地址套 [] ，IPv4 / 域名原样返回
   local ip="$1"
@@ -2339,6 +2348,7 @@ build_dualstack_ipv6_link(){
   build_reality_link "$uuid" "$ipv6" "$port" "$sni" "$public_key" "$short_id" "${tag}-ipv6"
 }
 
+# ═══ source: 21-menus-top.sh ═══
 show_status_menu(){
   if ! require_singbox_installed; then
     return
@@ -2510,6 +2520,7 @@ show_admin_menu(){
   done
 }
 
+# ═══ source: 22-firewall-ipv6.sh ═══
 show_ipv6_firewall_menu(){
   local ssh_port
 
@@ -2871,6 +2882,7 @@ ip6_emergency_disable(){
 }
 
 # ─── IPv4 防火墙菜单 ─────────────────────────────────
+# ═══ source: 23-firewall-ipv4.sh ═══
 show_ipv4_firewall_menu(){
   local ssh_port conflicts have_1panel=0 hp_choice
 
@@ -3353,6 +3365,7 @@ ip4_emergency_disable(){
   pause_screen
 }
 
+# ═══ source: 24-system-admin-high.sh ═══
 create_regular_user(){
   local username=""
   local home_dir=""
@@ -3803,6 +3816,7 @@ remove_passwordless_sudo(){
   pause_screen
 }
 
+# ═══ source: 25-system-basic.sh ═══
 update_system_packages(){
   if ! require_root; then return 1; fi
   echo ""
@@ -4034,6 +4048,7 @@ EOF
   pause_screen
 }
 
+# ═══ source: 30-node-render.sh ═══
 render_node_detail(){
   local type="$1"
   local node_type tag mode mode_label ip port sni
@@ -4441,6 +4456,7 @@ print_qrcode(){
   qrencode -t ANSIUTF8 "$link"
 }
 
+# ═══ source: 40-network-tuning.sh ═══
 apply_tcp_tuning(){
   local region="${1:-us-west}"
   local mem_tier="${2:-2g}"
@@ -5564,6 +5580,7 @@ remove_swap(){
 }
 
 # ─── 脚本自更新 / 配置管理 ────────────────────────────
+# ═══ source: 41-update-self.sh ═══
 get_latest_singbox_version(){
   local ver=""
   ver=$(curl -fsSL --max-time 5 "https://api.github.com/repos/SagerNet/sing-box/releases/latest" 2>/dev/null \
@@ -5809,6 +5826,7 @@ cleanup_config_backups(){
 }
 
 # ─── 首次安装入口 ─────────────────────────────────────
+# ═══ source: 50-node-reality.sh ═══
 install_reality_node(){
   local port_input="" sni_input=""
   local keypair="" private_key="" public_key=""
@@ -6127,6 +6145,7 @@ uninstall_reality_node(){
 do_install(){ install_reality_node; }
 
 # ─── 端口跳跃公共逻辑 ─────────────────────────────────
+# ═══ source: 51-port-hop.sh ═══
 PORT_HOP_NAT_CHAIN="LEYILI_HOP_NAT"
 PORT_HOP_RANGE_SIZE=999
 
@@ -6303,6 +6322,7 @@ port_hop_listen_addrs_for_mode(){
 }
 
 # ─── Hysteria2 节点 ────────────────────────────────────
+# ═══ source: 52-node-hy2.sh ═══
 generate_hy2_random_port(){
   local p attempts=0
   while [ $attempts -lt 30 ]; do
@@ -7229,6 +7249,7 @@ modify_hy2_params(){
 #   * 必须先安装 Reality 节点；卸载 Reality 时会有联动警告
 #   * sing-box 1.12+ 才支持 type: "anytls"
 #   * 不写 padding_scheme，使用 anytls-go 内置默认填充规则
+# ═══ source: 53-nodes-anytls-tuic.sh ═══
 install_anytls_node(){
   local port_input="" sni_input=""
   local access_ip="" link="" ipv6_link=""
@@ -7841,6 +7862,7 @@ uninstall_tuic_node(){
 # ─── Shadowsocks-2022 ─────────────────────────────────
 # 抗主动探测能力弱于 Reality / Hysteria2，菜单中标记为 [谨慎]
 
+# ═══ source: 54-node-ss2022.sh ═══
 generate_ss2022_random_port(){
   local p attempts=0
   while [ $attempts -lt 30 ]; do
@@ -8130,6 +8152,7 @@ uninstall_ss2022_node(){
 # 与 sing-box 节点完全独立：单独跑 xray-leyili.service，互不影响
 # ═══════════════════════════════════════════════════════════════════════
 
+# ═══ source: 55-node-xhr.sh ═══
 install_xhr_node(){
   local port_input="" sni_input="" tag_input=""
   local x25519_out="" vlessenc_out=""
@@ -8451,6 +8474,7 @@ uninstall_xhr_node(){
   pause_screen
 }
 
+# ═══ source: 56-modify-params.sh ═══
 modify_ss2022_params(){
   local new_port="" new_method="" new_tag=""
   local cur_port cur_method cur_tag cur_password regen_choice
@@ -9034,6 +9058,7 @@ sync_anytls_to_reality_keys(){
 # 不动：SSH 端口/sshd 配置、用户账户、sudoers、自动更新策略、
 #        IPv6 防火墙菜单规则、1Panel、apt 基础工具、
 #        TCP 网络优化、QUIC 协议优化、initcwnd 持久化服务、本脚本创建的 SWAP。
+# ═══ source: 60-uninstall-script.sh ═══
 uninstall_script_completely(){
   if ! require_root; then return 1; fi
 
@@ -9168,6 +9193,7 @@ uninstall_script_completely(){
 
 # ─── 管理菜单卡片 ─────────────────────────────────────
 # 卡片内宽（不含两侧 │ 边框）；外宽 = CARD_INNER_WIDTH + 2，与品牌横幅 56 同宽
+# ═══ source: 70-render-ui.sh ═══
 CARD_INNER_WIDTH=52
 
 # 计算字符串可见宽度（剥除 ANSI 颜色码）
@@ -9465,6 +9491,7 @@ render_main_menu_card(){
   render_card_bottom
 }
 
+# ═══ source: 80-menu-node.sh ═══
 show_node_install_menu(){
   while true; do
     render_section_header "创建节点"
@@ -9870,6 +9897,7 @@ show_node_manage_menu(){
 # 边界   : 只对通过 sing-box 入站节点转发的流量生效，不影响 VPS 本机直连
 # ═══════════════════════════════════════════════════════════════════════
 
+# ═══ source: 90-warp.sh ═══
 warp_log_ok()   { echo -e "  ${G}✓${N} $*" >&2; }
 warp_log_info() { echo -e "  ${C}●${N} $*" >&2; }
 warp_log_warn() { echo -e "  ${Y}⚠${N} $*" >&2; }
@@ -10320,6 +10348,7 @@ show_warp_menu(){
 # ═══════════════════════════════════════════════════════════════════════
 
 # ─── 底层探测 ─────────────────────────────────────────
+# ═══ source: 91-realm.sh ═══
 realm_is_installed(){
   [ -x "$REALM_BIN_PATH" ] && [ -f "$REALM_SERVICE_PATH" ]
 }
@@ -11064,6 +11093,7 @@ show_realm_menu(){
 }
 
 # ─── 服务器状态面板 ───────────────────────────────────
+# ═══ source: 92-status.sh ═══
 status_format_bytes(){
   local b="${1:-0}"
   case "$b" in ''|*[!0-9]*) b=0 ;; esac
@@ -11272,6 +11302,7 @@ show_server_status(){
   pause_screen
 }
 
+# ═══ source: 99-menu-main.sh ═══
 show_menu(){
   local main_action_label=""
 
