@@ -195,7 +195,7 @@ modify_anytls_params(){
 
   echo ""
   echo -e "  ${B}${C}修改 AnyTLS 节点参数${N}  ${D}直接回车保留当前值${N}"
-  echo -e "  ${D}（密钥对与 ShortID 由 Reality 节点统一管理，本菜单不修改）${N}"
+  echo -e "  ${D}（如需轮换密钥对 / ShortID，请卸载后重新安装节点）${N}"
   render_divider
 
   while true; do
@@ -206,13 +206,6 @@ modify_anytls_params(){
       continue
     fi
     new_port=$((10#$new_port))
-    # 与 reality 端口冲突检查
-    local reality_port
-    reality_port=$(get_node_value reality Port 2>/dev/null || true)
-    if [ -n "$reality_port" ] && [ "$new_port" -eq "$reality_port" ]; then
-      echo -e "${R}端口与 Reality 节点冲突（Reality 当前 ${reality_port}）${N}"
-      continue
-    fi
     break
   done
 
@@ -536,42 +529,6 @@ modify_tuic_params(){
     print_qrcode "$ipv6_new_link"
   fi
   pause_screen
-}
-
-# 当 Reality 节点重新生成密钥对+ShortID 后，同步更新已存在的 AnyTLS 节点
-# 用法：sync_anytls_to_reality_keys <new_private_key> <new_public_key> <new_short_id>
-sync_anytls_to_reality_keys(){
-  local new_pri="$1" new_pub="$2" new_sid="$3"
-  if ! node_installed anytls; then return 0; fi
-  [ -n "$new_pri" ] && [ -n "$new_pub" ] && [ -n "$new_sid" ] || return 1
-  ensure_jq || return 1
-  [ -f "$CONFIG_PATH" ] || return 1
-
-  local tmp jq_filter
-  tmp=$(mktemp)
-  jq_filter='(.inbounds[] | select(.tag == "anytls-in"))
-       |= (.tls.reality.private_key = $pri
-           | .tls.reality.short_id = [$sid])'
-  if ! jq --arg pri "$new_pri" --arg sid "$new_sid" \
-          "$jq_filter" "$CONFIG_PATH" > "$tmp" 2>/dev/null; then
-    rm -f "$tmp"
-    return 1
-  fi
-  mv "$tmp" "$CONFIG_PATH"
-
-  set_node_value anytls PublicKey "$new_pub"
-  set_node_value anytls ShortID "$new_sid"
-
-  # 重生成 Link（密钥变了，旧 Link 失效）
-  local pw ip port sni tag new_link
-  pw=$(get_node_value anytls Password 2>/dev/null || true)
-  ip=$(get_node_value anytls IP 2>/dev/null || true)
-  port=$(get_node_value anytls Port 2>/dev/null || true)
-  sni=$(get_node_value anytls SNI 2>/dev/null || true)
-  tag=$(get_node_value anytls Tag 2>/dev/null || echo anytls)
-  new_link=$(build_anytls_link "$pw" "$ip" "$port" "$sni" "$new_pub" "$new_sid" "$tag" 2>/dev/null || true)
-  [ -n "$new_link" ] && set_node_value anytls Link "$new_link"
-  return 0
 }
 
 # ─── 完整卸载脚本 ─────────────────────────────────────

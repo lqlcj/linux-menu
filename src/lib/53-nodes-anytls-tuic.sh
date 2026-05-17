@@ -4,22 +4,14 @@ install_anytls_node(){
   local public_ipv4="" public_ipv6=""
   local install_mode="ipv4" mode_label=""
   local PORT SNI TAG LISTEN_CHOICE LISTEN_ADDR PASSWORD confirm
-  local default_port reality_sni private_key public_key short_id
+  local default_port default_sni keypair private_key public_key short_id
 
   if ! require_root; then return 1; fi
 
   render_section_header "创建 AnyTLS 节点"
-  echo -e "  ${Y}AnyTLS + Reality（复用 Reality 密钥对，独立端口）${N}"
+  echo -e "  ${Y}AnyTLS + Reality（独立 Reality 密钥对，与其他节点互不影响）${N}"
   echo -e "  ${Y}直接回车使用括号内默认值${N}"
   echo ""
-
-  # ── 前置依赖：必须已有 Reality 节点
-  if ! node_installed reality; then
-    echo -e "${R}AnyTLS 节点必须复用 Reality 的密钥对${N}"
-    echo -e "${Y}请先在「创建节点」菜单创建 Reality 节点，再回来创建 AnyTLS${N}"
-    pause_screen
-    return 1
-  fi
 
   # ── sing-box 必须已安装且 >= 1.12
   if ! is_singbox_installed; then
@@ -78,11 +70,12 @@ install_anytls_node(){
     break
   done
 
-  # ── SNI（默认沿用 Reality 的 SNI，保持指纹一致）
-  reality_sni=$(get_node_value reality SNI 2>/dev/null || true)
+  # ── SNI（默认 tesla.com；若已装 Reality，沿用其 SNI 提升伪装一致性）
+  default_sni=$(get_node_value reality SNI 2>/dev/null || true)
+  default_sni="${default_sni:-www.tesla.com}"
   while true; do
-    read -p "  域名 (${reality_sni:-www.ucla.edu}): " sni_input
-    sni_input="${sni_input:-${reality_sni:-www.ucla.edu}}"
+    read -p "  域名 (${default_sni}): " sni_input
+    sni_input="${sni_input:-$default_sni}"
     SNI=$(sanitize_sni "$sni_input")
     if [ -n "$SNI" ]; then
       break
@@ -114,17 +107,22 @@ install_anytls_node(){
     fi
   fi
 
-  echo -e "${Y}==> 复用 Reality 密钥对...${N}"
-  private_key=$(get_node_value reality PrivateKey 2>/dev/null || true)
-  public_key=$(get_node_value reality PublicKey 2>/dev/null || true)
-  short_id=$(get_node_value reality ShortID 2>/dev/null || true)
-  if [ -z "$private_key" ] || [ -z "$public_key" ] || [ -z "$short_id" ]; then
+  echo -e "${Y}==> 生成 Reality 密钥对 / ShortID...${N}"
+  if ! keypair=$(sing-box generate reality-keypair); then
     echo ""
-    echo -e "${R}Reality 节点信息不完整（缺少 PrivateKey / PublicKey / ShortID）${N}"
-    echo -e "${Y}请在「修改 Reality 参数」中重新生成密钥对后再试${N}"
+    echo -e "${R}密钥对生成失败${N}"
     pause_screen
     return 1
   fi
+  private_key=$(echo "$keypair" | grep PrivateKey | awk '{print $2}')
+  public_key=$(echo "$keypair" | grep PublicKey | awk '{print $2}')
+  if [ -z "$private_key" ] || [ -z "$public_key" ]; then
+    echo ""
+    echo -e "${R}密钥对解析失败${N}"
+    pause_screen
+    return 1
+  fi
+  short_id=$(openssl rand -hex 4)
 
   echo -e "${Y}==> 生成 AnyTLS 用户密码...${N}"
   PASSWORD=$(cat /proc/sys/kernel/random/uuid)
@@ -225,6 +223,7 @@ Port=$PORT
 SNI=$SNI
 Password=$PASSWORD
 PublicKey=$public_key
+PrivateKey=$private_key
 ShortID=$short_id
 IP=$access_ip
 Link=$link
@@ -238,7 +237,7 @@ EOF
   echo -e "  ${G}╚══════════════════════════════════════════════════════╝${N}"
   echo -e "  模式      : ${C}$mode_label${N}"
   echo -e "  Password  : ${C}$PASSWORD${N}"
-  echo -e "  PublicKey : ${C}$public_key${N} ${D}(共享自 Reality)${N}"
+  echo -e "  PublicKey : ${C}$public_key${N}"
   echo -e "  IP        : ${C}$access_ip${N}"
   echo -e "  端口      : ${C}$PORT${N} ${D}(TCP)${N}"
   echo -e "  SNI       : ${C}$SNI${N}"
