@@ -292,23 +292,6 @@ modify_reality_params(){
     set_node_value reality PublicKey "$new_pub"
     set_node_value reality PrivateKey "$new_pri"
     set_node_value reality ShortID "$new_short_id"
-
-    # 联动：AnyTLS 节点也复用同一对密钥，必须同步否则客户端会静默连不上
-    if node_installed anytls; then
-      echo ""
-      echo -e "${Y}==> 同步更新 AnyTLS 节点的密钥对...${N}"
-      if sync_anytls_to_reality_keys "$new_pri" "$new_pub" "$new_short_id"; then
-        if sing-box check -c "$CONFIG_PATH" >/dev/null 2>&1 \
-           && systemctl restart sing-box >/dev/null 2>&1; then
-          echo -e "  ${G}AnyTLS 节点密钥已同步${N}"
-          echo -e "  ${Y}请用「查看客户端链接」获取新的 AnyTLS 分享链接${N}"
-        else
-          echo -e "  ${R}AnyTLS 同步后配置校验或重启失败，请手动排查 sing-box 日志${N}"
-        fi
-      else
-        echo -e "  ${R}AnyTLS 同步失败（jq 改写错误），请手动排查${N}"
-      fi
-    fi
   fi
 
   local cur_ip cur_tag final_pub final_sid new_link ipv6_new_link

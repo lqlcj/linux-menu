@@ -41,8 +41,8 @@ install_reality_node(){
   done
 
   while true; do
-    read -p "  域名 (www.ucla.edu): " sni_input
-    sni_input="${sni_input:-www.ucla.edu}"
+    read -p "  域名 (www.tesla.com): " sni_input
+    sni_input="${sni_input:-www.tesla.com}"
     SNI=$(sanitize_sni "$sni_input")
     if [ -n "$SNI" ]; then
       break
@@ -273,21 +273,6 @@ uninstall_reality_node(){
     echo -e "${Y}Reality 节点未安装${N}"
     pause_screen
     return 0
-  fi
-
-  # AnyTLS 复用 Reality 的密钥对/ShortID，卸载 Reality 后 AnyTLS 客户端会静默连不上
-  if node_installed anytls; then
-    echo ""
-    echo -e "  ${Y}⚠ 检测到 AnyTLS 节点正在复用 Reality 的密钥对${N}"
-    echo -e "  ${Y}  卸载 Reality 后，AnyTLS 节点的 private_key 将失效，客户端会静默连不上${N}"
-    echo -e "  ${D}  建议：先在「卸载单个节点」里卸载 AnyTLS，再回来卸载 Reality${N}"
-    echo ""
-    local force_uninstall=""
-    read -p "  仍然继续卸载 Reality？(y/N): " force_uninstall
-    if [ "$force_uninstall" != "y" ] && [ "$force_uninstall" != "Y" ]; then
-      echo -e "  已取消"
-      return 0
-    fi
   fi
 
   echo ""

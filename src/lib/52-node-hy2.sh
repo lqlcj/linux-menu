@@ -917,10 +917,10 @@ modify_hy2_params(){
   pause_screen
 }
 
-# ─── AnyTLS + Reality 节点（共享 Reality 密钥对） ────────
+# ─── AnyTLS + Reality 节点（独立 Reality 密钥对） ────────
 # 设计：
-#   * private_key / public_key / short_id 全部复用 reality.info；
-#     anytls.info 只缓存 PublicKey/ShortID 用于生成 Link，不存 PrivateKey
-#   * 必须先安装 Reality 节点；卸载 Reality 时会有联动警告
+#   * 独立生成 private_key / public_key / short_id，与 reality 节点互不依赖
+#   * 可与 reality 节点共存（端口独立）；也可单独安装，无前置依赖
+#   * 默认 SNI 若检测到 reality 已装则沿用其 SNI（仅 UI 默认值，不影响协议）
 #   * sing-box 1.12+ 才支持 type: "anytls"
 #   * 不写 padding_scheme，使用 anytls-go 内置默认填充规则

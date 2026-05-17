@@ -43,8 +43,8 @@ install_xhr_node(){
   done
 
   while true; do
-    read -p "  Reality SNI 域名 (www.ucla.edu): " sni_input
-    sni_input="${sni_input:-www.ucla.edu}"
+    read -p "  Reality SNI 域名 (www.tesla.com): " sni_input
+    sni_input="${sni_input:-www.tesla.com}"
     SNI=$(sanitize_sni "$sni_input")
     if [ -n "$SNI" ]; then
       break
