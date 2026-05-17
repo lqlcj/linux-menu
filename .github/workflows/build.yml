@@ -1,0 +1,40 @@
+name: Build
+
+# 当 src/ 下的源文件或 build.sh 本身有改动并 push 到 main 时触发自动构建。
+# 注意：bot 提交 leyili.sh 时不会再触发本工作流，因为 paths 过滤了 leyili.sh。
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'src/**'
+      - 'build.sh'
+  workflow_dispatch:  # 手动触发兜底（Actions 页面有按钮）
+
+permissions:
+  contents: write     # 允许 bot push 回 main
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Run build.sh
+        run: bash ./build.sh
+
+      - name: Commit leyili.sh if changed
+        run: |
+          if git diff --quiet -- leyili.sh; then
+            echo "leyili.sh 已是最新，无需提交"
+            exit 0
+          fi
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add leyili.sh
+          git commit -m "chore: auto-build leyili.sh [skip ci]"
+          git push

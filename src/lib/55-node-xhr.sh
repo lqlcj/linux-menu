@@ -96,7 +96,8 @@ install_xhr_node(){
   echo -e "${Y}==> 生成 UUID / ShortID / Reality 密钥对 / ENC 密钥对...${N}"
   UUID=$(cat /proc/sys/kernel/random/uuid)
   SHORT_ID=$(openssl rand -hex 4)
-  PATH_TOKEN="${UUID}-xh"
+  # 用 CDN / API 风格的固定路径，避免 UUID 形态的明显特征
+  PATH_TOKEN="/api/v2/query"
 
   # Reality 公私钥（参考 argosbx.sh:208-214；xray x25519 输出格式：
   #   "PrivateKey: ..." 和 "Password: ..."，Password 即客户端用的 PublicKey）
@@ -188,7 +189,7 @@ install_xhr_node(){
       port: $port,
       protocol: "vless",
       settings: {
-        clients: [{id: $uuid, flow: "xtls-rprx-vision"}],
+        clients: [{id: $uuid}],
         decryption: $dec
       },
       streamSettings: {
