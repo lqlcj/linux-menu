@@ -2207,8 +2207,8 @@ build_ss2022_link(){
 
 build_xhr_link(){
   # build_xhr_link <uuid> <ip> <port> <sni> <public_key> <short_id> <enc_key> <path> <tag>
-  # vless-xhttp-reality-enc 链接（参考 argosbx.sh:1225 + xtls 官方 ENC + xhttp 规范）：
-  # vless://<uuid>@<host>:<port>?encryption=<enkey>&flow=xtls-rprx-vision&security=reality
+  # vless-xhttp-reality-enc 链接（xhttp 走 HTTP 不复用 TCP 流，无需 xtls-rprx-vision）：
+  # vless://<uuid>@<host>:<port>?encryption=<enkey>&security=reality
   #         &sni=<sni>&fp=chrome&pbk=<pbk>&sid=<sid>&type=xhttp&path=<path>&mode=auto#<tag>
   local uuid="$1"
   local ip="$2"
@@ -2225,10 +2225,12 @@ build_xhr_link(){
     return 1
   fi
 
-  local host
+  local host encoded_path
   host=$(url_encode_host "$ip")
-  printf 'vless://%s@%s:%s?encryption=%s&flow=xtls-rprx-vision&security=reality&sni=%s&fp=chrome&pbk=%s&sid=%s&type=xhttp&path=%s&mode=auto#%s\n' \
-    "$uuid" "$host" "$port" "$enc_key" "$sni" "$public_key" "$short_id" "$path" "$tag"
+  # 将 path 中的 / 编码为 %2F，避免部分客户端解析查询串时被截断
+  encoded_path=$(printf '%s' "$path" | sed 's|/|%2F|g')
+  printf 'vless://%s@%s:%s?encryption=%s&security=reality&sni=%s&fp=chrome&pbk=%s&sid=%s&type=xhttp&path=%s&mode=auto#%s\n' \
+    "$uuid" "$host" "$port" "$enc_key" "$sni" "$public_key" "$short_id" "$encoded_path" "$tag"
 }
 
 
@@ -8251,7 +8253,8 @@ install_xhr_node(){
   echo -e "${Y}==> 生成 UUID / ShortID / Reality 密钥对 / ENC 密钥对...${N}"
   UUID=$(cat /proc/sys/kernel/random/uuid)
   SHORT_ID=$(openssl rand -hex 4)
-  PATH_TOKEN="${UUID}-xh"
+  # 用 CDN / API 风格的固定路径，避免 UUID 形态的明显特征
+  PATH_TOKEN="/api/v2/query"
 
   # Reality 公私钥（参考 argosbx.sh:208-214；xray x25519 输出格式：
   #   "PrivateKey: ..." 和 "Password: ..."，Password 即客户端用的 PublicKey）
@@ -8343,7 +8346,7 @@ install_xhr_node(){
       port: $port,
       protocol: "vless",
       settings: {
-        clients: [{id: $uuid, flow: "xtls-rprx-vision"}],
+        clients: [{id: $uuid}],
         decryption: $dec
       },
       streamSettings: {
