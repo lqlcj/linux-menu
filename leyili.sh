@@ -4345,23 +4345,6 @@ modify_reality_params(){
     set_node_value reality PublicKey "$new_pub"
     set_node_value reality PrivateKey "$new_pri"
     set_node_value reality ShortID "$new_short_id"
-
-    # 联动：AnyTLS 节点也复用同一对密钥，必须同步否则客户端会静默连不上
-    if node_installed anytls; then
-      echo ""
-      echo -e "${Y}==> 同步更新 AnyTLS 节点的密钥对...${N}"
-      if sync_anytls_to_reality_keys "$new_pri" "$new_pub" "$new_short_id"; then
-        if sing-box check -c "$CONFIG_PATH" >/dev/null 2>&1 \
-           && systemctl restart sing-box >/dev/null 2>&1; then
-          echo -e "  ${G}AnyTLS 节点密钥已同步${N}"
-          echo -e "  ${Y}请用「查看客户端链接」获取新的 AnyTLS 分享链接${N}"
-        else
-          echo -e "  ${R}AnyTLS 同步后配置校验或重启失败，请手动排查 sing-box 日志${N}"
-        fi
-      else
-        echo -e "  ${R}AnyTLS 同步失败（jq 改写错误），请手动排查${N}"
-      fi
-    fi
   fi
 
   local cur_ip cur_tag final_pub final_sid new_link ipv6_new_link
@@ -5872,8 +5855,8 @@ install_reality_node(){
   done
 
   while true; do
-    read -p "  域名 (www.ucla.edu): " sni_input
-    sni_input="${sni_input:-www.ucla.edu}"
+    read -p "  域名 (www.tesla.com): " sni_input
+    sni_input="${sni_input:-www.tesla.com}"
     SNI=$(sanitize_sni "$sni_input")
     if [ -n "$SNI" ]; then
       break
@@ -6104,21 +6087,6 @@ uninstall_reality_node(){
     echo -e "${Y}Reality 节点未安装${N}"
     pause_screen
     return 0
-  fi
-
-  # AnyTLS 复用 Reality 的密钥对/ShortID，卸载 Reality 后 AnyTLS 客户端会静默连不上
-  if node_installed anytls; then
-    echo ""
-    echo -e "  ${Y}⚠ 检测到 AnyTLS 节点正在复用 Reality 的密钥对${N}"
-    echo -e "  ${Y}  卸载 Reality 后，AnyTLS 节点的 private_key 将失效，客户端会静默连不上${N}"
-    echo -e "  ${D}  建议：先在「卸载单个节点」里卸载 AnyTLS，再回来卸载 Reality${N}"
-    echo ""
-    local force_uninstall=""
-    read -p "  仍然继续卸载 Reality？(y/N): " force_uninstall
-    if [ "$force_uninstall" != "y" ] && [ "$force_uninstall" != "Y" ]; then
-      echo -e "  已取消"
-      return 0
-    fi
   fi
 
   echo ""
@@ -7244,11 +7212,11 @@ modify_hy2_params(){
   pause_screen
 }
 
-# ─── AnyTLS + Reality 节点（共享 Reality 密钥对） ────────
+# ─── AnyTLS + Reality 节点（独立 Reality 密钥对） ────────
 # 设计：
-#   * private_key / public_key / short_id 全部复用 reality.info；
-#     anytls.info 只缓存 PublicKey/ShortID 用于生成 Link，不存 PrivateKey
-#   * 必须先安装 Reality 节点；卸载 Reality 时会有联动警告
+#   * 独立生成 private_key / public_key / short_id，与 reality 节点互不依赖
+#   * 可与 reality 节点共存（端口独立）；也可单独安装，无前置依赖
+#   * 默认 SNI 若检测到 reality 已装则沿用其 SNI（仅 UI 默认值，不影响协议）
 #   * sing-box 1.12+ 才支持 type: "anytls"
 #   * 不写 padding_scheme，使用 anytls-go 内置默认填充规则
 # ═══ source: 53-nodes-anytls-tuic.sh ═══
@@ -7258,22 +7226,14 @@ install_anytls_node(){
   local public_ipv4="" public_ipv6=""
   local install_mode="ipv4" mode_label=""
   local PORT SNI TAG LISTEN_CHOICE LISTEN_ADDR PASSWORD confirm
-  local default_port reality_sni private_key public_key short_id
+  local default_port default_sni keypair private_key public_key short_id
 
   if ! require_root; then return 1; fi
 
   render_section_header "创建 AnyTLS 节点"
-  echo -e "  ${Y}AnyTLS + Reality（复用 Reality 密钥对，独立端口）${N}"
+  echo -e "  ${Y}AnyTLS + Reality（独立 Reality 密钥对，与其他节点互不影响）${N}"
   echo -e "  ${Y}直接回车使用括号内默认值${N}"
   echo ""
-
-  # ── 前置依赖：必须已有 Reality 节点
-  if ! node_installed reality; then
-    echo -e "${R}AnyTLS 节点必须复用 Reality 的密钥对${N}"
-    echo -e "${Y}请先在「创建节点」菜单创建 Reality 节点，再回来创建 AnyTLS${N}"
-    pause_screen
-    return 1
-  fi
 
   # ── sing-box 必须已安装且 >= 1.12
   if ! is_singbox_installed; then
@@ -7332,11 +7292,12 @@ install_anytls_node(){
     break
   done
 
-  # ── SNI（默认沿用 Reality 的 SNI，保持指纹一致）
-  reality_sni=$(get_node_value reality SNI 2>/dev/null || true)
+  # ── SNI（默认 tesla.com；若已装 Reality，沿用其 SNI 提升伪装一致性）
+  default_sni=$(get_node_value reality SNI 2>/dev/null || true)
+  default_sni="${default_sni:-www.tesla.com}"
   while true; do
-    read -p "  域名 (${reality_sni:-www.ucla.edu}): " sni_input
-    sni_input="${sni_input:-${reality_sni:-www.ucla.edu}}"
+    read -p "  域名 (${default_sni}): " sni_input
+    sni_input="${sni_input:-$default_sni}"
     SNI=$(sanitize_sni "$sni_input")
     if [ -n "$SNI" ]; then
       break
@@ -7368,17 +7329,22 @@ install_anytls_node(){
     fi
   fi
 
-  echo -e "${Y}==> 复用 Reality 密钥对...${N}"
-  private_key=$(get_node_value reality PrivateKey 2>/dev/null || true)
-  public_key=$(get_node_value reality PublicKey 2>/dev/null || true)
-  short_id=$(get_node_value reality ShortID 2>/dev/null || true)
-  if [ -z "$private_key" ] || [ -z "$public_key" ] || [ -z "$short_id" ]; then
+  echo -e "${Y}==> 生成 Reality 密钥对 / ShortID...${N}"
+  if ! keypair=$(sing-box generate reality-keypair); then
     echo ""
-    echo -e "${R}Reality 节点信息不完整（缺少 PrivateKey / PublicKey / ShortID）${N}"
-    echo -e "${Y}请在「修改 Reality 参数」中重新生成密钥对后再试${N}"
+    echo -e "${R}密钥对生成失败${N}"
     pause_screen
     return 1
   fi
+  private_key=$(echo "$keypair" | grep PrivateKey | awk '{print $2}')
+  public_key=$(echo "$keypair" | grep PublicKey | awk '{print $2}')
+  if [ -z "$private_key" ] || [ -z "$public_key" ]; then
+    echo ""
+    echo -e "${R}密钥对解析失败${N}"
+    pause_screen
+    return 1
+  fi
+  short_id=$(openssl rand -hex 4)
 
   echo -e "${Y}==> 生成 AnyTLS 用户密码...${N}"
   PASSWORD=$(cat /proc/sys/kernel/random/uuid)
@@ -7479,6 +7445,7 @@ Port=$PORT
 SNI=$SNI
 Password=$PASSWORD
 PublicKey=$public_key
+PrivateKey=$private_key
 ShortID=$short_id
 IP=$access_ip
 Link=$link
@@ -7492,7 +7459,7 @@ EOF
   echo -e "  ${G}╚══════════════════════════════════════════════════════╝${N}"
   echo -e "  模式      : ${C}$mode_label${N}"
   echo -e "  Password  : ${C}$PASSWORD${N}"
-  echo -e "  PublicKey : ${C}$public_key${N} ${D}(共享自 Reality)${N}"
+  echo -e "  PublicKey : ${C}$public_key${N}"
   echo -e "  IP        : ${C}$access_ip${N}"
   echo -e "  端口      : ${C}$PORT${N} ${D}(TCP)${N}"
   echo -e "  SNI       : ${C}$SNI${N}"
@@ -8200,8 +8167,8 @@ install_xhr_node(){
   done
 
   while true; do
-    read -p "  Reality SNI 域名 (www.ucla.edu): " sni_input
-    sni_input="${sni_input:-www.ucla.edu}"
+    read -p "  Reality SNI 域名 (www.tesla.com): " sni_input
+    sni_input="${sni_input:-www.tesla.com}"
     SNI=$(sanitize_sni "$sni_input")
     if [ -n "$SNI" ]; then
       break
@@ -8675,7 +8642,7 @@ modify_anytls_params(){
 
   echo ""
   echo -e "  ${B}${C}修改 AnyTLS 节点参数${N}  ${D}直接回车保留当前值${N}"
-  echo -e "  ${D}（密钥对与 ShortID 由 Reality 节点统一管理，本菜单不修改）${N}"
+  echo -e "  ${D}（如需轮换密钥对 / ShortID，请卸载后重新安装节点）${N}"
   render_divider
 
   while true; do
@@ -8686,13 +8653,6 @@ modify_anytls_params(){
       continue
     fi
     new_port=$((10#$new_port))
-    # 与 reality 端口冲突检查
-    local reality_port
-    reality_port=$(get_node_value reality Port 2>/dev/null || true)
-    if [ -n "$reality_port" ] && [ "$new_port" -eq "$reality_port" ]; then
-      echo -e "${R}端口与 Reality 节点冲突（Reality 当前 ${reality_port}）${N}"
-      continue
-    fi
     break
   done
 
@@ -9016,42 +8976,6 @@ modify_tuic_params(){
     print_qrcode "$ipv6_new_link"
   fi
   pause_screen
-}
-
-# 当 Reality 节点重新生成密钥对+ShortID 后，同步更新已存在的 AnyTLS 节点
-# 用法：sync_anytls_to_reality_keys <new_private_key> <new_public_key> <new_short_id>
-sync_anytls_to_reality_keys(){
-  local new_pri="$1" new_pub="$2" new_sid="$3"
-  if ! node_installed anytls; then return 0; fi
-  [ -n "$new_pri" ] && [ -n "$new_pub" ] && [ -n "$new_sid" ] || return 1
-  ensure_jq || return 1
-  [ -f "$CONFIG_PATH" ] || return 1
-
-  local tmp jq_filter
-  tmp=$(mktemp)
-  jq_filter='(.inbounds[] | select(.tag == "anytls-in"))
-       |= (.tls.reality.private_key = $pri
-           | .tls.reality.short_id = [$sid])'
-  if ! jq --arg pri "$new_pri" --arg sid "$new_sid" \
-          "$jq_filter" "$CONFIG_PATH" > "$tmp" 2>/dev/null; then
-    rm -f "$tmp"
-    return 1
-  fi
-  mv "$tmp" "$CONFIG_PATH"
-
-  set_node_value anytls PublicKey "$new_pub"
-  set_node_value anytls ShortID "$new_sid"
-
-  # 重生成 Link（密钥变了，旧 Link 失效）
-  local pw ip port sni tag new_link
-  pw=$(get_node_value anytls Password 2>/dev/null || true)
-  ip=$(get_node_value anytls IP 2>/dev/null || true)
-  port=$(get_node_value anytls Port 2>/dev/null || true)
-  sni=$(get_node_value anytls SNI 2>/dev/null || true)
-  tag=$(get_node_value anytls Tag 2>/dev/null || echo anytls)
-  new_link=$(build_anytls_link "$pw" "$ip" "$port" "$sni" "$new_pub" "$new_sid" "$tag" 2>/dev/null || true)
-  [ -n "$new_link" ] && set_node_value anytls Link "$new_link"
-  return 0
 }
 
 # ─── 完整卸载脚本 ─────────────────────────────────────
