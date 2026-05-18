@@ -7,7 +7,7 @@ uninstall_script_completely(){
   echo -e "    ${L}·${N} 所有 sing-box 节点（Reality / Hysteria2 / AnyTLS）及其防火墙端口"
   echo -e "    ${L}·${N} sing-box 服务、软件包与 ${C}/etc/sing-box${N} 整个目录"
   if is_xray_installed || [ -d "$XRAY_DIR" ] || [ -f "$XRAY_SERVICE_PATH" ]; then
-    echo -e "    ${L}·${N} Xray 内核（vless-xhttp-reality-enc）服务、二进制与 ${C}${XRAY_DIR}${N} 目录"
+    echo -e "    ${L}·${N} Xray 内核（vless-xhttp-reality）服务、二进制与 ${C}${XRAY_DIR}${N} 目录"
   fi
   if realm_is_installed; then
     echo -e "    ${L}·${N} Realm 中转服务、所有转发规则与 ${C}${REALM_CONFIG_DIR}${N} 目录"
@@ -97,7 +97,7 @@ uninstall_script_completely(){
   rm -f "$SAGERNET_SOURCES" "$SAGERNET_KEYRING"
   DEBIAN_FRONTEND=noninteractive apt-get update -qq >/dev/null 2>&1 || true
 
-  # 2.5 Xray 内核（vless-xhttp-reality-enc 节点用，独立于 sing-box）
+  # 2.5 Xray 内核（vless-xhttp-reality 节点用，独立于 sing-box）
   if is_xray_installed || [ -f "$XRAY_SERVICE_PATH" ]; then
     echo -e "${Y}==> 停止并禁用 ${XRAY_SERVICE_NAME} 服务...${N}"
     systemctl stop "$XRAY_SERVICE_NAME" >/dev/null 2>&1 || true

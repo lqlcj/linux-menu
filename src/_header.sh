@@ -21,7 +21,7 @@ SWAPFILE_PATH="/swapfile"
 SWAP_SYSCTL_PATH="/etc/sysctl.d/99-swap-tuning.conf"
 SWAPPINESS_VALUE="10"
 
-# ─── Xray 附加内核（用于 vless-xhttp-reality-enc）────
+# ─── Xray 附加内核（用于 vless-xhttp-reality）────
 # 与 sing-box 完全独立：独立 systemd 服务 + 独立配置目录，互不污染
 XRAY_DIR="/etc/leyili/xray"
 XRAY_CONFIG_PATH="${XRAY_DIR}/config.json"

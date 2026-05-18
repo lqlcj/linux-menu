@@ -88,7 +88,7 @@ render_node_card_block(){
     anytls)  label="AnyTLS     " ;;   # 11 可见列：6 + 5 sp
     tuic)    label="TUIC v5    " ;;   # 11 可见列：7 + 4 sp
     ss2022)  label="SS-2022    " ;;   # 11 可见列：7 + 4 sp
-    xhr)     label="XHR-ENC    " ;;   # 11 可见列：7 + 4 sp（vless-xhttp-reality-enc）
+    xhr)     label="VLESS-XHR  " ;;   # 11 可见列：9 + 2 sp（vless-xhttp-reality）
     *)       label=$(printf '%-11s' "$type") ;;
   esac
 

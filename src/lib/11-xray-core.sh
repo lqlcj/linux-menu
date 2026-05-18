@@ -97,7 +97,7 @@ xray_install_systemd_unit(){
   fi
   cat > "$XRAY_SERVICE_PATH" <<EOF
 [Unit]
-Description=${XRAY_SERVICE_NAME} (Xray-core for vless-xhttp-reality-enc)
+Description=${XRAY_SERVICE_NAME} (Xray-core for vless-xhttp-reality)
 After=network.target nss-lookup.target
 
 [Service]
