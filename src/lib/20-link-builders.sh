@@ -125,9 +125,10 @@ build_ss2022_link(){
 }
 
 build_xhr_link(){
-  # build_xhr_link <uuid> <ip> <port> <sni> <public_key> <short_id> <enc_key> <path> <tag>
-  # vless-xhttp-reality-enc 链接（xhttp 走 HTTP 不复用 TCP 流，无需 xtls-rprx-vision）：
-  # vless://<uuid>@<host>:<port>?encryption=<enkey>&security=reality
+  # build_xhr_link <uuid> <ip> <port> <sni> <public_key> <short_id> <path> <tag>
+  # vless-xhttp-reality 链接（xhttp 走 HTTP 不复用 TCP 流，无需 xtls-rprx-vision；
+  # Reality 已承担 TLS 加密，VLESS 层固定 encryption=none）：
+  # vless://<uuid>@<host>:<port>?encryption=none&security=reality
   #         &sni=<sni>&fp=chrome&pbk=<pbk>&sid=<sid>&type=xhttp&path=<path>&mode=auto#<tag>
   local uuid="$1"
   local ip="$2"
@@ -135,12 +136,11 @@ build_xhr_link(){
   local sni="$4"
   local public_key="$5"
   local short_id="$6"
-  local enc_key="$7"
-  local path="$8"
-  local tag="${9:-xhr}"
+  local path="$7"
+  local tag="${8:-xhr}"
 
   if [ -z "$uuid" ] || [ -z "$ip" ] || [ -z "$port" ] || [ -z "$sni" ] \
-     || [ -z "$public_key" ] || [ -z "$short_id" ] || [ -z "$enc_key" ] || [ -z "$path" ]; then
+     || [ -z "$public_key" ] || [ -z "$short_id" ] || [ -z "$path" ]; then
     return 1
   fi
 
@@ -148,8 +148,8 @@ build_xhr_link(){
   host=$(url_encode_host "$ip")
   # 将 path 中的 / 编码为 %2F，避免部分客户端解析查询串时被截断
   encoded_path=$(printf '%s' "$path" | sed 's|/|%2F|g')
-  printf 'vless://%s@%s:%s?encryption=%s&security=reality&sni=%s&fp=chrome&pbk=%s&sid=%s&type=xhttp&path=%s&mode=auto#%s\n' \
-    "$uuid" "$host" "$port" "$enc_key" "$sni" "$public_key" "$short_id" "$encoded_path" "$tag"
+  printf 'vless://%s@%s:%s?encryption=none&security=reality&sni=%s&fp=chrome&pbk=%s&sid=%s&type=xhttp&path=%s&mode=auto#%s\n' \
+    "$uuid" "$host" "$port" "$sni" "$public_key" "$short_id" "$encoded_path" "$tag"
 }
 
 
@@ -211,13 +211,12 @@ build_link_for_node(){
       build_ss2022_link "$method" "$password" "$ip" "$port" "$tag"
       ;;
     xhr)
-      local uuid pubk sid enkey path
+      local uuid pubk sid path
       uuid=$(get_node_value "$type" UUID 2>/dev/null || true)
       pubk=$(get_node_value "$type" PublicKey 2>/dev/null || true)
       sid=$(get_node_value "$type" ShortID 2>/dev/null || true)
-      enkey=$(get_node_value "$type" EncKey 2>/dev/null || true)
       path=$(get_node_value "$type" Path 2>/dev/null || true)
-      build_xhr_link "$uuid" "$ip" "$port" "$sni" "$pubk" "$sid" "$enkey" "$path" "$tag"
+      build_xhr_link "$uuid" "$ip" "$port" "$sni" "$pubk" "$sid" "$path" "$tag"
       ;;
     *)
       return 1

@@ -21,7 +21,7 @@ SWAPFILE_PATH="/swapfile"
 SWAP_SYSCTL_PATH="/etc/sysctl.d/99-swap-tuning.conf"
 SWAPPINESS_VALUE="10"
 
-# ─── Xray 附加内核（用于 vless-xhttp-reality-enc）────
+# ─── Xray 附加内核（用于 vless-xhttp-reality）────
 # 与 sing-box 完全独立：独立 systemd 服务 + 独立配置目录，互不污染
 XRAY_DIR="/etc/leyili/xray"
 XRAY_CONFIG_PATH="${XRAY_DIR}/config.json"
@@ -1346,10 +1346,10 @@ upgrade_singbox(){
 }
 
 # ═══════════════════════════════════════════════════════════════════════
-# Xray 附加内核管理（vless-xhttp-reality-enc 专用）
+# Xray 附加内核管理（vless-xhttp-reality 专用）
 # ─────────────────────────────────────────────────────────────────────
-# 为何要用 Xray：sing-box 不支持 VLESS Post-Quantum Encryption (ENC) 和
-# xhttp 网络层，这两个都是 Xray 25.x 才有的新特性
+# 为何要用 Xray：sing-box 服务端尚不支持 xhttp 传输层，这是 Xray 25.x 才有
+# 的新特性
 # 隔离原则：独立 systemd 服务 / 独立配置 / 独立二进制路径，不污染 sing-box
 # ═══════════════════════════════════════════════════════════════════════
 
@@ -1453,7 +1453,7 @@ xray_install_systemd_unit(){
   fi
   cat > "$XRAY_SERVICE_PATH" <<EOF
 [Unit]
-Description=${XRAY_SERVICE_NAME} (Xray-core for vless-xhttp-reality-enc)
+Description=${XRAY_SERVICE_NAME} (Xray-core for vless-xhttp-reality)
 After=network.target nss-lookup.target
 
 [Service]
@@ -2206,9 +2206,10 @@ build_ss2022_link(){
 }
 
 build_xhr_link(){
-  # build_xhr_link <uuid> <ip> <port> <sni> <public_key> <short_id> <enc_key> <path> <tag>
-  # vless-xhttp-reality-enc 链接（xhttp 走 HTTP 不复用 TCP 流，无需 xtls-rprx-vision）：
-  # vless://<uuid>@<host>:<port>?encryption=<enkey>&security=reality
+  # build_xhr_link <uuid> <ip> <port> <sni> <public_key> <short_id> <path> <tag>
+  # vless-xhttp-reality 链接（xhttp 走 HTTP 不复用 TCP 流，无需 xtls-rprx-vision；
+  # Reality 已承担 TLS 加密，VLESS 层固定 encryption=none）：
+  # vless://<uuid>@<host>:<port>?encryption=none&security=reality
   #         &sni=<sni>&fp=chrome&pbk=<pbk>&sid=<sid>&type=xhttp&path=<path>&mode=auto#<tag>
   local uuid="$1"
   local ip="$2"
@@ -2216,12 +2217,11 @@ build_xhr_link(){
   local sni="$4"
   local public_key="$5"
   local short_id="$6"
-  local enc_key="$7"
-  local path="$8"
-  local tag="${9:-xhr}"
+  local path="$7"
+  local tag="${8:-xhr}"
 
   if [ -z "$uuid" ] || [ -z "$ip" ] || [ -z "$port" ] || [ -z "$sni" ] \
-     || [ -z "$public_key" ] || [ -z "$short_id" ] || [ -z "$enc_key" ] || [ -z "$path" ]; then
+     || [ -z "$public_key" ] || [ -z "$short_id" ] || [ -z "$path" ]; then
     return 1
   fi
 
@@ -2229,8 +2229,8 @@ build_xhr_link(){
   host=$(url_encode_host "$ip")
   # 将 path 中的 / 编码为 %2F，避免部分客户端解析查询串时被截断
   encoded_path=$(printf '%s' "$path" | sed 's|/|%2F|g')
-  printf 'vless://%s@%s:%s?encryption=%s&security=reality&sni=%s&fp=chrome&pbk=%s&sid=%s&type=xhttp&path=%s&mode=auto#%s\n' \
-    "$uuid" "$host" "$port" "$enc_key" "$sni" "$public_key" "$short_id" "$encoded_path" "$tag"
+  printf 'vless://%s@%s:%s?encryption=none&security=reality&sni=%s&fp=chrome&pbk=%s&sid=%s&type=xhttp&path=%s&mode=auto#%s\n' \
+    "$uuid" "$host" "$port" "$sni" "$public_key" "$short_id" "$encoded_path" "$tag"
 }
 
 
@@ -2292,13 +2292,12 @@ build_link_for_node(){
       build_ss2022_link "$method" "$password" "$ip" "$port" "$tag"
       ;;
     xhr)
-      local uuid pubk sid enkey path
+      local uuid pubk sid path
       uuid=$(get_node_value "$type" UUID 2>/dev/null || true)
       pubk=$(get_node_value "$type" PublicKey 2>/dev/null || true)
       sid=$(get_node_value "$type" ShortID 2>/dev/null || true)
-      enkey=$(get_node_value "$type" EncKey 2>/dev/null || true)
       path=$(get_node_value "$type" Path 2>/dev/null || true)
-      build_xhr_link "$uuid" "$ip" "$port" "$sni" "$pubk" "$sid" "$enkey" "$path" "$tag"
+      build_xhr_link "$uuid" "$ip" "$port" "$sni" "$pubk" "$sid" "$path" "$tag"
       ;;
     *)
       return 1
@@ -4132,23 +4131,15 @@ render_node_detail(){
       echo -e "  ${R}⚠ 谨慎：抗主动探测较弱，避免在高 GFW 风险链路单独使用${N}"
       ;;
     xhr)
-      local uuid_v pubk_v sid_v enkey_v path_v enkey_disp
+      local uuid_v pubk_v sid_v path_v
       uuid_v=$(get_node_value "$type" UUID 2>/dev/null || true)
       pubk_v=$(get_node_value "$type" PublicKey 2>/dev/null || true)
       sid_v=$(get_node_value "$type" ShortID 2>/dev/null || true)
-      enkey_v=$(get_node_value "$type" EncKey 2>/dev/null || true)
       path_v=$(get_node_value "$type" Path 2>/dev/null || true)
-      # ENC 密钥很长，截断显示
-      if [ -n "$enkey_v" ] && [ "${#enkey_v}" -gt 60 ]; then
-        enkey_disp="${enkey_v:0:30}...${enkey_v: -20}"
-      else
-        enkey_disp="$enkey_v"
-      fi
-      echo -e "  类型      : ${C}Vless-xhttp-reality-enc${N}  Tag : ${C}${tag}${N}"
+      echo -e "  类型      : ${C}Vless-xhttp-reality${N}  Tag : ${C}${tag}${N}"
       echo -e "  UUID      : ${C}${uuid_v:-未知}${N}"
       echo -e "  PublicKey : ${C}${pubk_v:-未知}${N}"
       echo -e "  ShortID   : ${C}${sid_v:-未知}${N}"
-      echo -e "  EncKey    : ${C}${enkey_disp:-未知}${N} ${D}(Post-Quantum)${N}"
       echo -e "  模式      : ${C}${mode_label}${N}"
       echo -e "  IP        : ${C}${ip:-未知}${N}"
       echo -e "  端口      : ${C}${port:-未知}${N} ${D}(TCP)${N}"
@@ -4345,23 +4336,6 @@ modify_reality_params(){
     set_node_value reality PublicKey "$new_pub"
     set_node_value reality PrivateKey "$new_pri"
     set_node_value reality ShortID "$new_short_id"
-
-    # 联动：AnyTLS 节点也复用同一对密钥，必须同步否则客户端会静默连不上
-    if node_installed anytls; then
-      echo ""
-      echo -e "${Y}==> 同步更新 AnyTLS 节点的密钥对...${N}"
-      if sync_anytls_to_reality_keys "$new_pri" "$new_pub" "$new_short_id"; then
-        if sing-box check -c "$CONFIG_PATH" >/dev/null 2>&1 \
-           && systemctl restart sing-box >/dev/null 2>&1; then
-          echo -e "  ${G}AnyTLS 节点密钥已同步${N}"
-          echo -e "  ${Y}请用「查看客户端链接」获取新的 AnyTLS 分享链接${N}"
-        else
-          echo -e "  ${R}AnyTLS 同步后配置校验或重启失败，请手动排查 sing-box 日志${N}"
-        fi
-      else
-        echo -e "  ${R}AnyTLS 同步失败（jq 改写错误），请手动排查${N}"
-      fi
-    fi
   fi
 
   local cur_ip cur_tag final_pub final_sid new_link ipv6_new_link
@@ -5872,8 +5846,8 @@ install_reality_node(){
   done
 
   while true; do
-    read -p "  域名 (www.ucla.edu): " sni_input
-    sni_input="${sni_input:-www.ucla.edu}"
+    read -p "  域名 (www.tesla.com): " sni_input
+    sni_input="${sni_input:-www.tesla.com}"
     SNI=$(sanitize_sni "$sni_input")
     if [ -n "$SNI" ]; then
       break
@@ -6104,21 +6078,6 @@ uninstall_reality_node(){
     echo -e "${Y}Reality 节点未安装${N}"
     pause_screen
     return 0
-  fi
-
-  # AnyTLS 复用 Reality 的密钥对/ShortID，卸载 Reality 后 AnyTLS 客户端会静默连不上
-  if node_installed anytls; then
-    echo ""
-    echo -e "  ${Y}⚠ 检测到 AnyTLS 节点正在复用 Reality 的密钥对${N}"
-    echo -e "  ${Y}  卸载 Reality 后，AnyTLS 节点的 private_key 将失效，客户端会静默连不上${N}"
-    echo -e "  ${D}  建议：先在「卸载单个节点」里卸载 AnyTLS，再回来卸载 Reality${N}"
-    echo ""
-    local force_uninstall=""
-    read -p "  仍然继续卸载 Reality？(y/N): " force_uninstall
-    if [ "$force_uninstall" != "y" ] && [ "$force_uninstall" != "Y" ]; then
-      echo -e "  已取消"
-      return 0
-    fi
   fi
 
   echo ""
@@ -7244,11 +7203,11 @@ modify_hy2_params(){
   pause_screen
 }
 
-# ─── AnyTLS + Reality 节点（共享 Reality 密钥对） ────────
+# ─── AnyTLS + Reality 节点（独立 Reality 密钥对） ────────
 # 设计：
-#   * private_key / public_key / short_id 全部复用 reality.info；
-#     anytls.info 只缓存 PublicKey/ShortID 用于生成 Link，不存 PrivateKey
-#   * 必须先安装 Reality 节点；卸载 Reality 时会有联动警告
+#   * 独立生成 private_key / public_key / short_id，与 reality 节点互不依赖
+#   * 可与 reality 节点共存（端口独立）；也可单独安装，无前置依赖
+#   * 默认 SNI 若检测到 reality 已装则沿用其 SNI（仅 UI 默认值，不影响协议）
 #   * sing-box 1.12+ 才支持 type: "anytls"
 #   * 不写 padding_scheme，使用 anytls-go 内置默认填充规则
 # ═══ source: 53-nodes-anytls-tuic.sh ═══
@@ -7258,22 +7217,14 @@ install_anytls_node(){
   local public_ipv4="" public_ipv6=""
   local install_mode="ipv4" mode_label=""
   local PORT SNI TAG LISTEN_CHOICE LISTEN_ADDR PASSWORD confirm
-  local default_port reality_sni private_key public_key short_id
+  local default_port default_sni keypair private_key public_key short_id
 
   if ! require_root; then return 1; fi
 
   render_section_header "创建 AnyTLS 节点"
-  echo -e "  ${Y}AnyTLS + Reality（复用 Reality 密钥对，独立端口）${N}"
+  echo -e "  ${Y}AnyTLS + Reality（独立 Reality 密钥对，与其他节点互不影响）${N}"
   echo -e "  ${Y}直接回车使用括号内默认值${N}"
   echo ""
-
-  # ── 前置依赖：必须已有 Reality 节点
-  if ! node_installed reality; then
-    echo -e "${R}AnyTLS 节点必须复用 Reality 的密钥对${N}"
-    echo -e "${Y}请先在「创建节点」菜单创建 Reality 节点，再回来创建 AnyTLS${N}"
-    pause_screen
-    return 1
-  fi
 
   # ── sing-box 必须已安装且 >= 1.12
   if ! is_singbox_installed; then
@@ -7332,11 +7283,12 @@ install_anytls_node(){
     break
   done
 
-  # ── SNI（默认沿用 Reality 的 SNI，保持指纹一致）
-  reality_sni=$(get_node_value reality SNI 2>/dev/null || true)
+  # ── SNI（默认 tesla.com；若已装 Reality，沿用其 SNI 提升伪装一致性）
+  default_sni=$(get_node_value reality SNI 2>/dev/null || true)
+  default_sni="${default_sni:-www.tesla.com}"
   while true; do
-    read -p "  域名 (${reality_sni:-www.ucla.edu}): " sni_input
-    sni_input="${sni_input:-${reality_sni:-www.ucla.edu}}"
+    read -p "  域名 (${default_sni}): " sni_input
+    sni_input="${sni_input:-$default_sni}"
     SNI=$(sanitize_sni "$sni_input")
     if [ -n "$SNI" ]; then
       break
@@ -7368,17 +7320,22 @@ install_anytls_node(){
     fi
   fi
 
-  echo -e "${Y}==> 复用 Reality 密钥对...${N}"
-  private_key=$(get_node_value reality PrivateKey 2>/dev/null || true)
-  public_key=$(get_node_value reality PublicKey 2>/dev/null || true)
-  short_id=$(get_node_value reality ShortID 2>/dev/null || true)
-  if [ -z "$private_key" ] || [ -z "$public_key" ] || [ -z "$short_id" ]; then
+  echo -e "${Y}==> 生成 Reality 密钥对 / ShortID...${N}"
+  if ! keypair=$(sing-box generate reality-keypair); then
     echo ""
-    echo -e "${R}Reality 节点信息不完整（缺少 PrivateKey / PublicKey / ShortID）${N}"
-    echo -e "${Y}请在「修改 Reality 参数」中重新生成密钥对后再试${N}"
+    echo -e "${R}密钥对生成失败${N}"
     pause_screen
     return 1
   fi
+  private_key=$(echo "$keypair" | grep PrivateKey | awk '{print $2}')
+  public_key=$(echo "$keypair" | grep PublicKey | awk '{print $2}')
+  if [ -z "$private_key" ] || [ -z "$public_key" ]; then
+    echo ""
+    echo -e "${R}密钥对解析失败${N}"
+    pause_screen
+    return 1
+  fi
+  short_id=$(openssl rand -hex 4)
 
   echo -e "${Y}==> 生成 AnyTLS 用户密码...${N}"
   PASSWORD=$(cat /proc/sys/kernel/random/uuid)
@@ -7479,6 +7436,7 @@ Port=$PORT
 SNI=$SNI
 Password=$PASSWORD
 PublicKey=$public_key
+PrivateKey=$private_key
 ShortID=$short_id
 IP=$access_ip
 Link=$link
@@ -7492,7 +7450,7 @@ EOF
   echo -e "  ${G}╚══════════════════════════════════════════════════════╝${N}"
   echo -e "  模式      : ${C}$mode_label${N}"
   echo -e "  Password  : ${C}$PASSWORD${N}"
-  echo -e "  PublicKey : ${C}$public_key${N} ${D}(共享自 Reality)${N}"
+  echo -e "  PublicKey : ${C}$public_key${N}"
   echo -e "  IP        : ${C}$access_ip${N}"
   echo -e "  端口      : ${C}$PORT${N} ${D}(TCP)${N}"
   echo -e "  SNI       : ${C}$SNI${N}"
@@ -8147,7 +8105,7 @@ uninstall_ss2022_node(){
 }
 
 # ═══════════════════════════════════════════════════════════════════════
-# Vless-xhttp-reality-enc 节点（Xray 内核）
+# Vless-xhttp-reality 节点（Xray 内核）
 # ─────────────────────────────────────────────────────────────────────
 # 借鉴 yonggekkk/argosbx 项目（用户已 fork 并测试通过），核心参考
 # argosbx.sh:201-281（xray inbound 模板）+ 1225（节点链接格式）
@@ -8157,8 +8115,8 @@ uninstall_ss2022_node(){
 # ═══ source: 55-node-xhr.sh ═══
 install_xhr_node(){
   local port_input="" sni_input="" tag_input=""
-  local x25519_out="" vlessenc_out=""
-  local private_key="" public_key="" dec_key="" enc_key=""
+  local x25519_out=""
+  local private_key="" public_key=""
   local access_ip="" link="" ipv6_link=""
   local public_ipv4="" public_ipv6=""
   local install_mode="ipv4" mode_label=""
@@ -8166,13 +8124,13 @@ install_xhr_node(){
 
   if ! require_root; then return 1; fi
 
-  render_section_header "创建 Vless-xhttp-reality-enc 节点"
+  render_section_header "创建 Vless-xhttp-reality 节点"
   echo -e "  ${Y}直接回车使用括号内默认值${N}"
-  echo -e "  ${D}（基于 Xray 25.x，需 v2rayN 6.x / NekoBox-starifly 等支持 ENC + xhttp 的客户端）${N}"
+  echo -e "  ${D}（基于 Xray 25.x，需 v2rayN / NekoBox / Happ 等支持 xhttp 的客户端）${N}"
   echo ""
 
   if node_installed xhr; then
-    echo -e "${Y}检测到已存在 Vless-xhttp-reality-enc 节点，继续将覆盖原节点配置${N}"
+    echo -e "${Y}检测到已存在 Vless-xhttp-reality 节点，继续将覆盖原节点配置${N}"
     read -p "  继续？(y/N): " confirm
     if [ "$confirm" != "y" ] && [ "$confirm" != "Y" ]; then
       echo -e "  已取消"
@@ -8200,8 +8158,8 @@ install_xhr_node(){
   done
 
   while true; do
-    read -p "  Reality SNI 域名 (www.ucla.edu): " sni_input
-    sni_input="${sni_input:-www.ucla.edu}"
+    read -p "  Reality SNI 域名 (www.tesla.com): " sni_input
+    sni_input="${sni_input:-www.tesla.com}"
     SNI=$(sanitize_sni "$sni_input")
     if [ -n "$SNI" ]; then
       break
@@ -8236,7 +8194,7 @@ install_xhr_node(){
   # 装 Xray 内核（不影响 sing-box）
   if ! is_xray_installed; then
     echo ""
-    echo -e "${Y}==> 安装 Xray 内核（用于 xhttp + ENC）...${N}"
+    echo -e "${Y}==> 安装 Xray 内核（用于 xhttp）...${N}"
     if ! install_xray; then
       echo ""
       echo -e "${R}Xray 安装失败，请检查上方输出${N}"
@@ -8250,7 +8208,7 @@ install_xhr_node(){
   xray_install_systemd_unit
   xray_config_ensure_skeleton || { pause_screen; return 1; }
 
-  echo -e "${Y}==> 生成 UUID / ShortID / Reality 密钥对 / ENC 密钥对...${N}"
+  echo -e "${Y}==> 生成 UUID / ShortID / Reality 密钥对...${N}"
   UUID=$(cat /proc/sys/kernel/random/uuid)
   SHORT_ID=$(openssl rand -hex 4)
   # 用 CDN / API 风格的固定路径，避免 UUID 形态的明显特征
@@ -8269,26 +8227,6 @@ install_xhr_node(){
   if [ -z "$private_key" ] || [ -z "$public_key" ]; then
     echo -e "${R}Reality 密钥对解析失败，原始输出：${N}"
     printf '%s\n' "$x25519_out" | sed 's/^/    /'
-    pause_screen
-    return 1
-  fi
-
-  # ENC 密钥对（参考 argosbx.sh:222-224）
-  # xray vlessenc 输出包含 server / client 两块 JSON，每块都有
-  # "decryption": "..." 和 "encryption": "..."，但 server 的 decryption 才是
-  # 服务器要的，client 的 encryption 才是客户端要的（取第 2 个匹配）
-  if ! vlessenc_out=$("$XRAY_BIN_PATH" vlessenc 2>&1); then
-    echo -e "${R}xray vlessenc 执行失败 — 你的 Xray 版本可能太旧不支持 ENC：${N}"
-    printf '%s\n' "$vlessenc_out" | sed 's/^/    /'
-    echo -e "${Y}请通过菜单「更新管理」升级 Xray 内核到 25.x 以上${N}"
-    pause_screen
-    return 1
-  fi
-  dec_key=$(printf '%s\n' "$vlessenc_out" | grep '"decryption":' | sed -n '2p' | cut -d' ' -f2- | tr -d '",')
-  enc_key=$(printf '%s\n' "$vlessenc_out" | grep '"encryption":' | sed -n '2p' | cut -d' ' -f2- | tr -d '",')
-  if [ -z "$dec_key" ] || [ -z "$enc_key" ]; then
-    echo -e "${R}ENC 密钥对解析失败，原始输出：${N}"
-    printf '%s\n' "$vlessenc_out" | sed 's/^/    /'
     pause_screen
     return 1
   fi
@@ -8336,7 +8274,6 @@ install_xhr_node(){
     --arg listen "$LISTEN_ADDR" \
     --argjson port "$PORT" \
     --arg uuid "$UUID" \
-    --arg dec "$dec_key" \
     --arg sni "$SNI" \
     --arg priv "$private_key" \
     --arg sid "$SHORT_ID" \
@@ -8347,7 +8284,7 @@ install_xhr_node(){
       protocol: "vless",
       settings: {
         clients: [{id: $uuid}],
-        decryption: $dec
+        decryption: "none"
       },
       streamSettings: {
         network: "xhttp",
@@ -8387,11 +8324,11 @@ install_xhr_node(){
   fi
 
   node_apply_firewall_for_mode "$PORT" tcp "$install_mode"
-  print_firewall_hint "$PORT" tcp "Vless-xhttp-reality-enc 节点入站"
+  print_firewall_hint "$PORT" tcp "Vless-xhttp-reality 节点入站"
 
-  link=$(build_xhr_link "$UUID" "$access_ip" "$PORT" "$SNI" "$public_key" "$SHORT_ID" "$enc_key" "$PATH_TOKEN" "$TAG" 2>/dev/null || true)
+  link=$(build_xhr_link "$UUID" "$access_ip" "$PORT" "$SNI" "$public_key" "$SHORT_ID" "$PATH_TOKEN" "$TAG" 2>/dev/null || true)
   if [ "$install_mode" = "dualstack" ] && [ -n "$public_ipv6" ] && [ "$public_ipv6" != "$access_ip" ]; then
-    ipv6_link=$(build_xhr_link "$UUID" "$public_ipv6" "$PORT" "$SNI" "$public_key" "$SHORT_ID" "$enc_key" "$PATH_TOKEN" "${TAG}-ipv6" 2>/dev/null || true)
+    ipv6_link=$(build_xhr_link "$UUID" "$public_ipv6" "$PORT" "$SNI" "$public_key" "$SHORT_ID" "$PATH_TOKEN" "${TAG}-ipv6" 2>/dev/null || true)
   fi
 
   ensure_nodes_dir
@@ -8406,8 +8343,6 @@ UUID=$UUID
 PublicKey=$public_key
 PrivateKey=$private_key
 ShortID=$SHORT_ID
-EncKey=$enc_key
-DecKey=$dec_key
 Path=$PATH_TOKEN
 IP=$access_ip
 Link=$link
@@ -8417,7 +8352,7 @@ EOF
 
   echo ""
   echo -e "  ${G}╔══════════════════════════════════════════════════════╗${N}"
-  echo -e "  ${G}║${N}  ${B}${W}${APP_NAME}${N}  ${G}Vless-xhttp-reality-enc 节点创建完成${N}        ${G}║${N}"
+  echo -e "  ${G}║${N}  ${B}${W}${APP_NAME}${N}  ${G}Vless-xhttp-reality 节点创建完成${N}            ${G}║${N}"
   echo -e "  ${G}╚══════════════════════════════════════════════════════╝${N}"
   echo -e "  模式      : ${C}$mode_label${N}"
   echo -e "  UUID      : ${C}$UUID${N}"
@@ -8428,7 +8363,7 @@ EOF
   echo -e "  端口      : ${C}$PORT${N}  ${D}(TCP)${N}"
   echo -e "  SNI       : ${C}$SNI${N}"
   echo -e "  网络层    : ${C}xhttp${N}  ${D}path=${PATH_TOKEN}${N}"
-  echo -e "  加密      : ${C}ENC (Post-Quantum)${N}"
+  echo -e "  加密      : ${C}none${N}  ${D}(VLESS 标准，Reality 已承担 TLS 加密)${N}"
   echo ""
   echo -e "  ${B}客户端链接：${N}"
   echo -e "  ${G}${link:-未生成}${N}"
@@ -8440,8 +8375,8 @@ EOF
     print_qrcode "$ipv6_link"
   fi
   echo ""
-  echo -e "  ${Y}注意：此协议需要支持 ENC + xhttp + Reality 的客户端${N}"
-  echo -e "  ${D}  · v2rayN 6.x+ / NekoBox-starifly fork (Android) / Happ (iOS)${N}"
+  echo -e "  ${Y}注意：此协议需要支持 xhttp + Reality 的客户端${N}"
+  echo -e "  ${D}  · v2rayN / NekoBox / Happ (iOS) / sing-box GUI 等${N}"
   echo -e "  信息已保存至 ${Y}$(node_info_path xhr)${N}"
   echo -e "  输入 ${B}${COMMAND_NAME}${N} 进入管理菜单"
   pause_screen
@@ -8450,13 +8385,13 @@ EOF
 uninstall_xhr_node(){
   local confirm
   if ! node_installed xhr; then
-    echo -e "${Y}Vless-xhttp-reality-enc 节点未安装${N}"
+    echo -e "${Y}Vless-xhttp-reality 节点未安装${N}"
     pause_screen
     return 0
   fi
 
   echo ""
-  read -p "  确认卸载 Vless-xhttp-reality-enc 节点？(y/N): " confirm
+  read -p "  确认卸载 Vless-xhttp-reality 节点？(y/N): " confirm
   if [ "$confirm" != "y" ] && [ "$confirm" != "Y" ]; then
     echo -e "  已取消"
     return 0
@@ -8473,7 +8408,7 @@ uninstall_xhr_node(){
   xray_config_remove_inbound_by_tag "$XRAY_INBOUND_TAG" || true
   remove_node_info xhr
   post_uninstall_xray_step
-  echo -e "${G}Vless-xhttp-reality-enc 节点已卸载${N}"
+  echo -e "${G}Vless-xhttp-reality 节点已卸载${N}"
   pause_screen
 }
 
@@ -8675,7 +8610,7 @@ modify_anytls_params(){
 
   echo ""
   echo -e "  ${B}${C}修改 AnyTLS 节点参数${N}  ${D}直接回车保留当前值${N}"
-  echo -e "  ${D}（密钥对与 ShortID 由 Reality 节点统一管理，本菜单不修改）${N}"
+  echo -e "  ${D}（如需轮换密钥对 / ShortID，请卸载后重新安装节点）${N}"
   render_divider
 
   while true; do
@@ -8686,13 +8621,6 @@ modify_anytls_params(){
       continue
     fi
     new_port=$((10#$new_port))
-    # 与 reality 端口冲突检查
-    local reality_port
-    reality_port=$(get_node_value reality Port 2>/dev/null || true)
-    if [ -n "$reality_port" ] && [ "$new_port" -eq "$reality_port" ]; then
-      echo -e "${R}端口与 Reality 节点冲突（Reality 当前 ${reality_port}）${N}"
-      continue
-    fi
     break
   done
 
@@ -9018,42 +8946,6 @@ modify_tuic_params(){
   pause_screen
 }
 
-# 当 Reality 节点重新生成密钥对+ShortID 后，同步更新已存在的 AnyTLS 节点
-# 用法：sync_anytls_to_reality_keys <new_private_key> <new_public_key> <new_short_id>
-sync_anytls_to_reality_keys(){
-  local new_pri="$1" new_pub="$2" new_sid="$3"
-  if ! node_installed anytls; then return 0; fi
-  [ -n "$new_pri" ] && [ -n "$new_pub" ] && [ -n "$new_sid" ] || return 1
-  ensure_jq || return 1
-  [ -f "$CONFIG_PATH" ] || return 1
-
-  local tmp jq_filter
-  tmp=$(mktemp)
-  jq_filter='(.inbounds[] | select(.tag == "anytls-in"))
-       |= (.tls.reality.private_key = $pri
-           | .tls.reality.short_id = [$sid])'
-  if ! jq --arg pri "$new_pri" --arg sid "$new_sid" \
-          "$jq_filter" "$CONFIG_PATH" > "$tmp" 2>/dev/null; then
-    rm -f "$tmp"
-    return 1
-  fi
-  mv "$tmp" "$CONFIG_PATH"
-
-  set_node_value anytls PublicKey "$new_pub"
-  set_node_value anytls ShortID "$new_sid"
-
-  # 重生成 Link（密钥变了，旧 Link 失效）
-  local pw ip port sni tag new_link
-  pw=$(get_node_value anytls Password 2>/dev/null || true)
-  ip=$(get_node_value anytls IP 2>/dev/null || true)
-  port=$(get_node_value anytls Port 2>/dev/null || true)
-  sni=$(get_node_value anytls SNI 2>/dev/null || true)
-  tag=$(get_node_value anytls Tag 2>/dev/null || echo anytls)
-  new_link=$(build_anytls_link "$pw" "$ip" "$port" "$sni" "$new_pub" "$new_sid" "$tag" 2>/dev/null || true)
-  [ -n "$new_link" ] && set_node_value anytls Link "$new_link"
-  return 0
-}
-
 # ─── 完整卸载脚本 ─────────────────────────────────────
 # 清理范围：节点 inbound、节点防火墙端口、sing-box 服务与软件包、
 #          /etc/sing-box（含 nodes/、certs/、备份）、
@@ -9071,7 +8963,7 @@ uninstall_script_completely(){
   echo -e "    ${L}·${N} 所有 sing-box 节点（Reality / Hysteria2 / AnyTLS）及其防火墙端口"
   echo -e "    ${L}·${N} sing-box 服务、软件包与 ${C}/etc/sing-box${N} 整个目录"
   if is_xray_installed || [ -d "$XRAY_DIR" ] || [ -f "$XRAY_SERVICE_PATH" ]; then
-    echo -e "    ${L}·${N} Xray 内核（vless-xhttp-reality-enc）服务、二进制与 ${C}${XRAY_DIR}${N} 目录"
+    echo -e "    ${L}·${N} Xray 内核（vless-xhttp-reality）服务、二进制与 ${C}${XRAY_DIR}${N} 目录"
   fi
   if realm_is_installed; then
     echo -e "    ${L}·${N} Realm 中转服务、所有转发规则与 ${C}${REALM_CONFIG_DIR}${N} 目录"
@@ -9161,7 +9053,7 @@ uninstall_script_completely(){
   rm -f "$SAGERNET_SOURCES" "$SAGERNET_KEYRING"
   DEBIAN_FRONTEND=noninteractive apt-get update -qq >/dev/null 2>&1 || true
 
-  # 2.5 Xray 内核（vless-xhttp-reality-enc 节点用，独立于 sing-box）
+  # 2.5 Xray 内核（vless-xhttp-reality 节点用，独立于 sing-box）
   if is_xray_installed || [ -f "$XRAY_SERVICE_PATH" ]; then
     echo -e "${Y}==> 停止并禁用 ${XRAY_SERVICE_NAME} 服务...${N}"
     systemctl stop "$XRAY_SERVICE_NAME" >/dev/null 2>&1 || true
@@ -9287,7 +9179,7 @@ render_node_card_block(){
     anytls)  label="AnyTLS     " ;;   # 11 可见列：6 + 5 sp
     tuic)    label="TUIC v5    " ;;   # 11 可见列：7 + 4 sp
     ss2022)  label="SS-2022    " ;;   # 11 可见列：7 + 4 sp
-    xhr)     label="XHR-ENC    " ;;   # 11 可见列：7 + 4 sp（vless-xhttp-reality-enc）
+    xhr)     label="VLESS-XHR  " ;;   # 11 可见列：9 + 2 sp（vless-xhttp-reality）
     *)       label=$(printf '%-11s' "$type") ;;
   esac
 
@@ -9507,7 +9399,7 @@ show_node_install_menu(){
     fi
     render_menu_item 4 "创建 TUIC v5 节点$(node_installed tuic && echo "  ${D}(已安装，将覆盖)${N}")"
     render_menu_item 5 "创建 Shadowsocks-2022 节点  ${R}[谨慎]${N}$(node_installed ss2022 && echo "  ${D}(已安装，将覆盖)${N}")"
-    render_menu_item 6 "创建 Vless-xhttp-reality-enc 节点  ${C}[Xray + ENC]${N}$(node_installed xhr && echo "  ${D}(已安装，将覆盖)${N}")"
+    render_menu_item 6 "创建 Vless-xhttp-reality 节点  ${C}[Xray]${N}$(node_installed xhr && echo "  ${D}(已安装，将覆盖)${N}")"
     render_menu_item 0 "返回上级"
     render_divider
     read -p "  请输入序号: " choice
@@ -9559,9 +9451,9 @@ show_node_uninstall_menu(){
       echo -e "  ${D}5) Shadowsocks-2022 未安装${N}"
     fi
     if node_installed xhr; then
-      render_menu_item 6 "卸载 Vless-xhttp-reality-enc 节点"
+      render_menu_item 6 "卸载 Vless-xhttp-reality 节点"
     else
-      echo -e "  ${D}6) Vless-xhttp-reality-enc 未安装${N}"
+      echo -e "  ${D}6) Vless-xhttp-reality 未安装${N}"
     fi
     render_menu_item 0 "返回上级"
     render_divider
@@ -9672,7 +9564,7 @@ show_update_menu(){
         xray_label="升级 Xray 内核  ${D}(版本未知)${N}"
       fi
     else
-      xray_label="升级 Xray 内核  ${D}(未安装，仅 xhttp-reality-enc 节点需要)${N}"
+      xray_label="升级 Xray 内核  ${D}(未安装，仅 xhttp-reality 节点需要)${N}"
     fi
 
     render_section_header "更新管理"

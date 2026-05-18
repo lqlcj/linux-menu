@@ -49,7 +49,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/lqlcj/linux-menu/main/leyili
           ├── 52-node-hy2.sh
           ├── 53-nodes-anytls-tuic.sh
           ├── 54-node-ss2022.sh
-          ├── 55-node-xhr.sh           ← 改 vless-xhttp-reality-enc 节点
+          ├── 55-node-xhr.sh           ← 改 vless-xhttp-reality 节点
           ├── 56-modify-params.sh
           ├── 60-uninstall-script.sh
           ├── 70-render-ui.sh

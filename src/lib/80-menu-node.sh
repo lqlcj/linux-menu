@@ -10,7 +10,7 @@ show_node_install_menu(){
     fi
     render_menu_item 4 "创建 TUIC v5 节点$(node_installed tuic && echo "  ${D}(已安装，将覆盖)${N}")"
     render_menu_item 5 "创建 Shadowsocks-2022 节点  ${R}[谨慎]${N}$(node_installed ss2022 && echo "  ${D}(已安装，将覆盖)${N}")"
-    render_menu_item 6 "创建 Vless-xhttp-reality-enc 节点  ${C}[Xray + ENC]${N}$(node_installed xhr && echo "  ${D}(已安装，将覆盖)${N}")"
+    render_menu_item 6 "创建 Vless-xhttp-reality 节点  ${C}[Xray]${N}$(node_installed xhr && echo "  ${D}(已安装，将覆盖)${N}")"
     render_menu_item 0 "返回上级"
     render_divider
     read -p "  请输入序号: " choice
@@ -62,9 +62,9 @@ show_node_uninstall_menu(){
       echo -e "  ${D}5) Shadowsocks-2022 未安装${N}"
     fi
     if node_installed xhr; then
-      render_menu_item 6 "卸载 Vless-xhttp-reality-enc 节点"
+      render_menu_item 6 "卸载 Vless-xhttp-reality 节点"
     else
-      echo -e "  ${D}6) Vless-xhttp-reality-enc 未安装${N}"
+      echo -e "  ${D}6) Vless-xhttp-reality 未安装${N}"
     fi
     render_menu_item 0 "返回上级"
     render_divider
@@ -175,7 +175,7 @@ show_update_menu(){
         xray_label="升级 Xray 内核  ${D}(版本未知)${N}"
       fi
     else
-      xray_label="升级 Xray 内核  ${D}(未安装，仅 xhttp-reality-enc 节点需要)${N}"
+      xray_label="升级 Xray 内核  ${D}(未安装，仅 xhttp-reality 节点需要)${N}"
     fi
 
     render_section_header "更新管理"

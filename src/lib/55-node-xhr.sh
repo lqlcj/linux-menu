@@ -1,7 +1,7 @@
 install_xhr_node(){
   local port_input="" sni_input="" tag_input=""
-  local x25519_out="" vlessenc_out=""
-  local private_key="" public_key="" dec_key="" enc_key=""
+  local x25519_out=""
+  local private_key="" public_key=""
   local access_ip="" link="" ipv6_link=""
   local public_ipv4="" public_ipv6=""
   local install_mode="ipv4" mode_label=""
@@ -9,13 +9,13 @@ install_xhr_node(){
 
   if ! require_root; then return 1; fi
 
-  render_section_header "创建 Vless-xhttp-reality-enc 节点"
+  render_section_header "创建 Vless-xhttp-reality 节点"
   echo -e "  ${Y}直接回车使用括号内默认值${N}"
-  echo -e "  ${D}（基于 Xray 25.x，需 v2rayN 6.x / NekoBox-starifly 等支持 ENC + xhttp 的客户端）${N}"
+  echo -e "  ${D}（基于 Xray 25.x，需 v2rayN / NekoBox / Happ 等支持 xhttp 的客户端）${N}"
   echo ""
 
   if node_installed xhr; then
-    echo -e "${Y}检测到已存在 Vless-xhttp-reality-enc 节点，继续将覆盖原节点配置${N}"
+    echo -e "${Y}检测到已存在 Vless-xhttp-reality 节点，继续将覆盖原节点配置${N}"
     read -p "  继续？(y/N): " confirm
     if [ "$confirm" != "y" ] && [ "$confirm" != "Y" ]; then
       echo -e "  已取消"
@@ -79,7 +79,7 @@ install_xhr_node(){
   # 装 Xray 内核（不影响 sing-box）
   if ! is_xray_installed; then
     echo ""
-    echo -e "${Y}==> 安装 Xray 内核（用于 xhttp + ENC）...${N}"
+    echo -e "${Y}==> 安装 Xray 内核（用于 xhttp）...${N}"
     if ! install_xray; then
       echo ""
       echo -e "${R}Xray 安装失败，请检查上方输出${N}"
@@ -93,7 +93,7 @@ install_xhr_node(){
   xray_install_systemd_unit
   xray_config_ensure_skeleton || { pause_screen; return 1; }
 
-  echo -e "${Y}==> 生成 UUID / ShortID / Reality 密钥对 / ENC 密钥对...${N}"
+  echo -e "${Y}==> 生成 UUID / ShortID / Reality 密钥对...${N}"
   UUID=$(cat /proc/sys/kernel/random/uuid)
   SHORT_ID=$(openssl rand -hex 4)
   # 用 CDN / API 风格的固定路径，避免 UUID 形态的明显特征
@@ -112,26 +112,6 @@ install_xhr_node(){
   if [ -z "$private_key" ] || [ -z "$public_key" ]; then
     echo -e "${R}Reality 密钥对解析失败，原始输出：${N}"
     printf '%s\n' "$x25519_out" | sed 's/^/    /'
-    pause_screen
-    return 1
-  fi
-
-  # ENC 密钥对（参考 argosbx.sh:222-224）
-  # xray vlessenc 输出包含 server / client 两块 JSON，每块都有
-  # "decryption": "..." 和 "encryption": "..."，但 server 的 decryption 才是
-  # 服务器要的，client 的 encryption 才是客户端要的（取第 2 个匹配）
-  if ! vlessenc_out=$("$XRAY_BIN_PATH" vlessenc 2>&1); then
-    echo -e "${R}xray vlessenc 执行失败 — 你的 Xray 版本可能太旧不支持 ENC：${N}"
-    printf '%s\n' "$vlessenc_out" | sed 's/^/    /'
-    echo -e "${Y}请通过菜单「更新管理」升级 Xray 内核到 25.x 以上${N}"
-    pause_screen
-    return 1
-  fi
-  dec_key=$(printf '%s\n' "$vlessenc_out" | grep '"decryption":' | sed -n '2p' | cut -d' ' -f2- | tr -d '",')
-  enc_key=$(printf '%s\n' "$vlessenc_out" | grep '"encryption":' | sed -n '2p' | cut -d' ' -f2- | tr -d '",')
-  if [ -z "$dec_key" ] || [ -z "$enc_key" ]; then
-    echo -e "${R}ENC 密钥对解析失败，原始输出：${N}"
-    printf '%s\n' "$vlessenc_out" | sed 's/^/    /'
     pause_screen
     return 1
   fi
@@ -179,7 +159,6 @@ install_xhr_node(){
     --arg listen "$LISTEN_ADDR" \
     --argjson port "$PORT" \
     --arg uuid "$UUID" \
-    --arg dec "$dec_key" \
     --arg sni "$SNI" \
     --arg priv "$private_key" \
     --arg sid "$SHORT_ID" \
@@ -190,7 +169,7 @@ install_xhr_node(){
       protocol: "vless",
       settings: {
         clients: [{id: $uuid}],
-        decryption: $dec
+        decryption: "none"
       },
       streamSettings: {
         network: "xhttp",
@@ -230,11 +209,11 @@ install_xhr_node(){
   fi
 
   node_apply_firewall_for_mode "$PORT" tcp "$install_mode"
-  print_firewall_hint "$PORT" tcp "Vless-xhttp-reality-enc 节点入站"
+  print_firewall_hint "$PORT" tcp "Vless-xhttp-reality 节点入站"
 
-  link=$(build_xhr_link "$UUID" "$access_ip" "$PORT" "$SNI" "$public_key" "$SHORT_ID" "$enc_key" "$PATH_TOKEN" "$TAG" 2>/dev/null || true)
+  link=$(build_xhr_link "$UUID" "$access_ip" "$PORT" "$SNI" "$public_key" "$SHORT_ID" "$PATH_TOKEN" "$TAG" 2>/dev/null || true)
   if [ "$install_mode" = "dualstack" ] && [ -n "$public_ipv6" ] && [ "$public_ipv6" != "$access_ip" ]; then
-    ipv6_link=$(build_xhr_link "$UUID" "$public_ipv6" "$PORT" "$SNI" "$public_key" "$SHORT_ID" "$enc_key" "$PATH_TOKEN" "${TAG}-ipv6" 2>/dev/null || true)
+    ipv6_link=$(build_xhr_link "$UUID" "$public_ipv6" "$PORT" "$SNI" "$public_key" "$SHORT_ID" "$PATH_TOKEN" "${TAG}-ipv6" 2>/dev/null || true)
   fi
 
   ensure_nodes_dir
@@ -249,8 +228,6 @@ UUID=$UUID
 PublicKey=$public_key
 PrivateKey=$private_key
 ShortID=$SHORT_ID
-EncKey=$enc_key
-DecKey=$dec_key
 Path=$PATH_TOKEN
 IP=$access_ip
 Link=$link
@@ -260,7 +237,7 @@ EOF
 
   echo ""
   echo -e "  ${G}╔══════════════════════════════════════════════════════╗${N}"
-  echo -e "  ${G}║${N}  ${B}${W}${APP_NAME}${N}  ${G}Vless-xhttp-reality-enc 节点创建完成${N}        ${G}║${N}"
+  echo -e "  ${G}║${N}  ${B}${W}${APP_NAME}${N}  ${G}Vless-xhttp-reality 节点创建完成${N}            ${G}║${N}"
   echo -e "  ${G}╚══════════════════════════════════════════════════════╝${N}"
   echo -e "  模式      : ${C}$mode_label${N}"
   echo -e "  UUID      : ${C}$UUID${N}"
@@ -271,7 +248,7 @@ EOF
   echo -e "  端口      : ${C}$PORT${N}  ${D}(TCP)${N}"
   echo -e "  SNI       : ${C}$SNI${N}"
   echo -e "  网络层    : ${C}xhttp${N}  ${D}path=${PATH_TOKEN}${N}"
-  echo -e "  加密      : ${C}ENC (Post-Quantum)${N}"
+  echo -e "  加密      : ${C}none${N}  ${D}(VLESS 标准，Reality 已承担 TLS 加密)${N}"
   echo ""
   echo -e "  ${B}客户端链接：${N}"
   echo -e "  ${G}${link:-未生成}${N}"
@@ -283,8 +260,8 @@ EOF
     print_qrcode "$ipv6_link"
   fi
   echo ""
-  echo -e "  ${Y}注意：此协议需要支持 ENC + xhttp + Reality 的客户端${N}"
-  echo -e "  ${D}  · v2rayN 6.x+ / NekoBox-starifly fork (Android) / Happ (iOS)${N}"
+  echo -e "  ${Y}注意：此协议需要支持 xhttp + Reality 的客户端${N}"
+  echo -e "  ${D}  · v2rayN / NekoBox / Happ (iOS) / sing-box GUI 等${N}"
   echo -e "  信息已保存至 ${Y}$(node_info_path xhr)${N}"
   echo -e "  输入 ${B}${COMMAND_NAME}${N} 进入管理菜单"
   pause_screen
@@ -293,13 +270,13 @@ EOF
 uninstall_xhr_node(){
   local confirm
   if ! node_installed xhr; then
-    echo -e "${Y}Vless-xhttp-reality-enc 节点未安装${N}"
+    echo -e "${Y}Vless-xhttp-reality 节点未安装${N}"
     pause_screen
     return 0
   fi
 
   echo ""
-  read -p "  确认卸载 Vless-xhttp-reality-enc 节点？(y/N): " confirm
+  read -p "  确认卸载 Vless-xhttp-reality 节点？(y/N): " confirm
   if [ "$confirm" != "y" ] && [ "$confirm" != "Y" ]; then
     echo -e "  已取消"
     return 0
@@ -316,7 +293,7 @@ uninstall_xhr_node(){
   xray_config_remove_inbound_by_tag "$XRAY_INBOUND_TAG" || true
   remove_node_info xhr
   post_uninstall_xray_step
-  echo -e "${G}Vless-xhttp-reality-enc 节点已卸载${N}"
+  echo -e "${G}Vless-xhttp-reality 节点已卸载${N}"
   pause_screen
 }
 
