@@ -374,7 +374,7 @@ EOF
 show_node_manage_menu(){
   while true; do
     render_section_header "节点管理"
-    render_menu_item 1 "创建节点 (Reality / Hysteria2 / AnyTLS / TUIC / SS-2022)"
+    render_menu_item 1 "创建节点 (Reality / Hysteria2 / AnyTLS / TUIC / SS-2022 / Vless-xhttp-reality)"
     render_menu_item 2 "卸载单个节点"
     render_menu_item 3 "Reality 域名检测工具"
     render_menu_item 4 "WARP 谷歌解锁分流"
