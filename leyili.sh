@@ -9763,7 +9763,7 @@ EOF
 show_node_manage_menu(){
   while true; do
     render_section_header "节点管理"
-    render_menu_item 1 "创建节点 (Reality / Hysteria2 / AnyTLS / TUIC / SS-2022)"
+    render_menu_item 1 "创建节点 (Reality / Hysteria2 / AnyTLS / TUIC / SS-2022 / Vless-xhttp-reality)"
     render_menu_item 2 "卸载单个节点"
     render_menu_item 3 "Reality 域名检测工具"
     render_menu_item 4 "WARP 谷歌解锁分流"
@@ -11204,7 +11204,7 @@ show_menu(){
   while true; do
     migrate_legacy_info
 
-    if is_singbox_installed && [ "$(count_installed_nodes)" -gt 0 ]; then
+    if [ "$(count_installed_nodes)" -gt 0 ]; then
       main_action_label="节点管理"
     else
       main_action_label="创建节点"
@@ -11235,7 +11235,7 @@ show_menu(){
         show_system_menu
         ;;
       3)
-        if ! is_singbox_installed || [ "$(count_installed_nodes)" -eq 0 ]; then
+        if [ "$(count_installed_nodes)" -eq 0 ]; then
           show_node_install_menu
         else
           show_node_manage_menu
