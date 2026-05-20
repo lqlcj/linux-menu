@@ -153,6 +153,15 @@ ip4_init_firewall(){
   local ssh_port confirm conflicts
   local backup_rules="" rb_choice="y" rb_pid="" rb_seconds=180
 
+  # 缺 ss 工具无法验证 sshd 监听，直接拒绝避免应用规则后被回滚守护偷偷恢复
+  if ! command -v ss >/dev/null 2>&1; then
+    echo ""
+    echo -e "  ${R}本机未安装 ss 命令（iproute2 包），无法安全验证 SSH 监听端口${N}"
+    echo -e "  ${Y}请先执行：apt install -y iproute2${N}"
+    pause_screen
+    return 1
+  fi
+
   ssh_port=$(ip6_detect_ssh_port)
   conflicts=$(ip4_detect_conflicts)
 

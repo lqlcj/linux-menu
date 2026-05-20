@@ -70,12 +70,12 @@ show_node_uninstall_menu(){
     render_divider
     read -p "  请输入序号: " choice
     case $choice in
-      1) node_installed reality && uninstall_reality_node; return ;;
-      2) node_installed hy2 && uninstall_hy2_node; return ;;
-      3) node_installed anytls && uninstall_anytls_node; return ;;
-      4) node_installed tuic && uninstall_tuic_node; return ;;
-      5) node_installed ss2022 && uninstall_ss2022_node; return ;;
-      6) node_installed xhr && uninstall_xhr_node; return ;;
+      1) if node_installed reality; then uninstall_reality_node; return; else notify_invalid_choice; fi ;;
+      2) if node_installed hy2;     then uninstall_hy2_node;     return; else notify_invalid_choice; fi ;;
+      3) if node_installed anytls;  then uninstall_anytls_node;  return; else notify_invalid_choice; fi ;;
+      4) if node_installed tuic;    then uninstall_tuic_node;    return; else notify_invalid_choice; fi ;;
+      5) if node_installed ss2022;  then uninstall_ss2022_node;  return; else notify_invalid_choice; fi ;;
+      6) if node_installed xhr;     then uninstall_xhr_node;     return; else notify_invalid_choice; fi ;;
       0) return ;;
       *) notify_invalid_choice ;;
     esac

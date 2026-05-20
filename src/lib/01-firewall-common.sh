@@ -413,9 +413,9 @@ ip4_handover_to_1panel(){
 verify_sshd_listening_on_port(){
   local port="$1"
   if [ -z "$port" ]; then return 1; fi
-  if ! command -v ss >/dev/null 2>&1; then
-    return 0  # 无 ss 工具时不阻塞调用方
-  fi
+  # 无 ss 工具时无法验证 → 视为未通过，让调用方触发回滚保护
+  # （ss 在 Debian/Ubuntu 默认 iproute2 内，缺失极罕见）
+  command -v ss >/dev/null 2>&1 || return 1
   ss -tlnp 2>/dev/null \
     | awk -v p=":${port}$" '$4 ~ p && $0 ~ /sshd/ {found=1} END {exit !found}'
 }

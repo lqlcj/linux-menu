@@ -333,6 +333,11 @@ realm_menu_add(){
     echo -e "${R}落地机 IP 不能为空${N}"
     return 1
   fi
+  # 仅允许 IPv4 / IPv6 字符集，挡掉 TOML 写入注入（"、=、; 等）
+  if printf '%s' "$remote_ip" | grep -q '[^0-9a-fA-F:.]'; then
+    echo -e "${R}IP 含非法字符（仅支持数字 / a-f / : / .）${N}"
+    return 1
+  fi
   # 判定 IPv6（含冒号且非纯数字端口形式）
   remote_is_v6=0
   if [ "${remote_ip#*:}" != "$remote_ip" ]; then

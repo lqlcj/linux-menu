@@ -43,10 +43,11 @@ build_anytls_link(){
     return 1
   fi
 
-  local host
+  local host enc_pw
   host=$(url_encode_host "$ip")
+  enc_pw=$(printf '%s' "$password" | jq -sRr @uri)
   printf 'anytls://%s@%s:%s/?security=reality&sni=%s&fp=chrome&pbk=%s&sid=%s&insecure=0#%s\n' \
-    "$password" "$host" "$port" "$sni" "$public_key" "$short_id" "$tag"
+    "$enc_pw" "$host" "$port" "$sni" "$public_key" "$short_id" "$tag"
 }
 
 build_hy2_link(){
@@ -144,12 +145,10 @@ build_xhr_link(){
     return 1
   fi
 
-  local host encoded_path
+  local host
   host=$(url_encode_host "$ip")
-  # 将 path 中的 / 编码为 %2F，避免部分客户端解析查询串时被截断
-  encoded_path=$(printf '%s' "$path" | sed 's|/|%2F|g')
   printf 'vless://%s@%s:%s?encryption=none&security=reality&sni=%s&fp=chrome&pbk=%s&sid=%s&type=xhttp&path=%s&mode=auto#%s\n' \
-    "$uuid" "$host" "$port" "$sni" "$public_key" "$short_id" "$encoded_path" "$tag"
+    "$uuid" "$host" "$port" "$sni" "$public_key" "$short_id" "$path" "$tag"
 }
 
 

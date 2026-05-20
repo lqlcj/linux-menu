@@ -171,8 +171,8 @@ modify_ss2022_params(){
 }
 
 modify_anytls_params(){
-  local new_port="" new_sni="" new_pw=""
-  local cur_port cur_sni cur_pw backup_path="" confirm
+  local new_port="" new_sni="" new_pw="" new_tag=""
+  local cur_port cur_sni cur_pw cur_tag backup_path="" confirm
 
   if ! require_root; then return 1; fi
   if ! require_singbox_installed; then return 1; fi
@@ -192,6 +192,7 @@ modify_anytls_params(){
   cur_port=$(get_node_value anytls Port 2>/dev/null || true)
   cur_sni=$(get_node_value anytls SNI 2>/dev/null || true)
   cur_pw=$(get_node_value anytls Password 2>/dev/null || true)
+  cur_tag=$(get_node_value anytls Tag 2>/dev/null || echo anytls)
 
   echo ""
   echo -e "  ${B}${C}修改 AnyTLS 节点参数${N}  ${D}直接回车保留当前值${N}"
@@ -231,6 +232,9 @@ modify_anytls_params(){
     return 1
   fi
 
+  read -p "  节点名称 (${cur_tag}): " new_tag
+  new_tag="${new_tag:-$cur_tag}"
+
   echo ""
   echo -e "  即将应用："
   echo -e "    端口     ${cur_port:-?} ${D}→${N} ${C}${new_port}${N}"
@@ -239,6 +243,11 @@ modify_anytls_params(){
     echo -e "    Password ${cur_pw:-?} ${D}→${N} ${C}${new_pw}${N}"
   else
     echo -e "    Password ${D}保留${N}"
+  fi
+  if [ "$new_tag" != "$cur_tag" ]; then
+    echo -e "    Tag      ${cur_tag} ${D}→${N} ${C}${new_tag}${N}"
+  else
+    echo -e "    Tag      ${D}保留${N}"
   fi
   read -p "  确认？(y/N): " confirm
   if [ "$confirm" != "y" ] && [ "$confirm" != "Y" ]; then
@@ -254,6 +263,7 @@ modify_anytls_params(){
 
   local tmp jq_filter
   tmp=$(mktemp)
+  trap 'rm -f "$tmp"' RETURN
   jq_filter='(.inbounds[] | select(.tag == "anytls-in"))
        |= (.listen_port = ($port | tonumber)
            | .users[0].password = $pw
@@ -263,7 +273,6 @@ modify_anytls_params(){
           --arg sni "$new_sni" \
           --arg pw "$new_pw" \
           "$jq_filter" "$CONFIG_PATH" > "$tmp" 2>/dev/null; then
-    rm -f "$tmp"
     echo -e "${R}配置写入失败（jq 过滤错误）${N}"
     pause_screen
     return 1
@@ -290,14 +299,14 @@ modify_anytls_params(){
   set_node_value anytls Port "$new_port"
   set_node_value anytls SNI "$new_sni"
   set_node_value anytls Password "$new_pw"
+  set_node_value anytls Tag "$new_tag"
 
   # 重生成 Link
-  local cur_ip cur_tag pub sid new_link ipv6_new_link
+  local cur_ip pub sid new_link ipv6_new_link
   cur_ip=$(get_node_value anytls IP 2>/dev/null || true)
-  cur_tag=$(get_node_value anytls Tag 2>/dev/null || echo anytls)
   pub=$(get_node_value anytls PublicKey 2>/dev/null || true)
   sid=$(get_node_value anytls ShortID 2>/dev/null || true)
-  new_link=$(build_anytls_link "$new_pw" "$cur_ip" "$new_port" "$new_sni" "$pub" "$sid" "${cur_tag:-anytls}" 2>/dev/null || true)
+  new_link=$(build_anytls_link "$new_pw" "$cur_ip" "$new_port" "$new_sni" "$pub" "$sid" "$new_tag" 2>/dev/null || true)
   ipv6_new_link=$(build_dualstack_ipv6_link_for_node anytls 2>/dev/null || true)
   [ -n "$new_link" ] && set_node_value anytls Link "$new_link"
 
@@ -319,8 +328,8 @@ modify_anytls_params(){
 }
 
 modify_tuic_params(){
-  local new_port="" new_sni="" new_uuid="" new_pw="" new_cc=""
-  local cur_port cur_sni cur_uuid cur_pw cur_cc cur_cert_src cur_email cur_mode cur_insecure
+  local new_port="" new_sni="" new_uuid="" new_pw="" new_cc="" new_tag=""
+  local cur_port cur_sni cur_uuid cur_pw cur_cc cur_cert_src cur_email cur_mode cur_insecure cur_tag
   local cur_cert_path cur_key_path
   local backup_path="" confirm cc_choice regen_uuid regen_pw
 
@@ -350,6 +359,7 @@ modify_tuic_params(){
   cur_insecure=$(get_node_value tuic Insecure 2>/dev/null || echo 0)
   cur_cert_path=$(get_node_value tuic CertPath 2>/dev/null || true)
   cur_key_path=$(get_node_value tuic KeyPath 2>/dev/null || true)
+  cur_tag=$(get_node_value tuic Tag 2>/dev/null || echo tuic)
 
   echo ""
   echo -e "  ${B}${C}修改 TUIC v5 节点参数${N}  ${D}直接回车保留当前值${N}"
@@ -420,6 +430,10 @@ modify_tuic_params(){
     *) new_cc="$cur_cc" ;;
   esac
 
+  # 节点名称
+  read -p "  节点名称 (${cur_tag}): " new_tag
+  new_tag="${new_tag:-$cur_tag}"
+
   # 应用前确认
   echo ""
   echo -e "  即将应用："
@@ -439,6 +453,11 @@ modify_tuic_params(){
     echo -e "    拥塞控制     ${cur_cc:-?} ${D}→${N} ${C}${new_cc}${N}"
   else
     echo -e "    拥塞控制     ${D}保留${N}"
+  fi
+  if [ "$new_tag" != "$cur_tag" ]; then
+    echo -e "    Tag          ${cur_tag} ${D}→${N} ${C}${new_tag}${N}"
+  else
+    echo -e "    Tag          ${D}保留${N}"
   fi
   read -p "  确认？(y/N): " confirm
   if [ "$confirm" != "y" ] && [ "$confirm" != "Y" ]; then
@@ -465,6 +484,7 @@ modify_tuic_params(){
   # jq 修改 inbound
   local tmp jq_filter
   tmp=$(mktemp)
+  trap 'rm -f "$tmp"' RETURN
   jq_filter='(.inbounds[] | select(.tag == "tuic-in"))
        |= (.listen_port = ($port | tonumber)
            | .users[0].uuid = $uuid
@@ -478,7 +498,6 @@ modify_tuic_params(){
           --arg pw "$new_pw" \
           --arg cc "$new_cc" \
           "$jq_filter" "$CONFIG_PATH" > "$tmp" 2>/dev/null; then
-    rm -f "$tmp"
     echo -e "${R}配置写入失败（jq 过滤错误）${N}"
     pause_screen
     return 1
@@ -505,12 +524,12 @@ modify_tuic_params(){
   set_node_value tuic UUID "$new_uuid"
   set_node_value tuic Password "$new_pw"
   set_node_value tuic CongestionControl "$new_cc"
+  set_node_value tuic Tag "$new_tag"
 
   # 重生成 Link
-  local cur_ip cur_tag new_link ipv6_new_link
+  local cur_ip new_link ipv6_new_link
   cur_ip=$(get_node_value tuic IP 2>/dev/null || true)
-  cur_tag=$(get_node_value tuic Tag 2>/dev/null || echo tuic)
-  new_link=$(build_tuic_link "$new_uuid" "$new_pw" "$cur_ip" "$new_port" "$new_sni" "$cur_insecure" "$new_cc" "${cur_tag:-tuic}" 2>/dev/null || true)
+  new_link=$(build_tuic_link "$new_uuid" "$new_pw" "$cur_ip" "$new_port" "$new_sni" "$cur_insecure" "$new_cc" "$new_tag" 2>/dev/null || true)
   ipv6_new_link=$(build_dualstack_ipv6_link_for_node tuic 2>/dev/null || true)
   [ -n "$new_link" ] && set_node_value tuic Link "$new_link"
 

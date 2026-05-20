@@ -186,7 +186,7 @@ EOF
   if jq '
       .log = (.log // {"disabled": false, "level": "warn", "timestamp": true})
     | del(.dns)
-    | .inbounds = ((.inbounds // []) | map(select(.tag == "reality-in" or .tag == "hy2-in" or .tag == "anytls-in" or .tag == "tuic-in")))
+    | .inbounds = ((.inbounds // []) | map(select(.tag == "reality-in" or .tag == "hy2-in" or .tag == "anytls-in" or .tag == "tuic-in" or .tag == "ss2022-in")))
     | .outbounds = (if ((.outbounds // []) | length) == 0
                     then [{"type":"direct","tag":"direct-out"}]
                     else (.outbounds | map(
