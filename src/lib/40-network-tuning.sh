@@ -959,10 +959,20 @@ configure_swap(){
     chmod 600 "$SWAPFILE_PATH"
 
     echo -e "${Y}==> 格式化 SWAP...${N}"
-    mkswap "$SWAPFILE_PATH"
+    if ! mkswap "$SWAPFILE_PATH"; then
+      echo -e "${R}mkswap 失败${N}"
+      rm -f "$SWAPFILE_PATH"
+      pause_screen
+      return 1
+    fi
 
     echo -e "${Y}==> 启用 SWAP...${N}"
-    swapon "$SWAPFILE_PATH"
+    if ! swapon "$SWAPFILE_PATH"; then
+      echo -e "${R}swapon 失败${N}"
+      rm -f "$SWAPFILE_PATH"
+      pause_screen
+      return 1
+    fi
   fi
 
   echo -e "${Y}==> 写入开机自动挂载...${N}"

@@ -14,7 +14,7 @@ generate_hy2_random_port(){
 # AnyTLS 默认端口生成：避开本机已占端口与已安装节点已用端口
 generate_anytls_random_port(){
   local p attempts=0 t taken_ports=""
-  for t in reality hy2 tuic ss2022; do
+  for t in reality hy2 tuic ss2022 xhr; do
     if node_installed "$t"; then
       taken_ports="$taken_ports $(get_node_value "$t" Port 2>/dev/null || true)"
     fi

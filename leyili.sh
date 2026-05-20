@@ -564,9 +564,9 @@ ip4_handover_to_1panel(){
 verify_sshd_listening_on_port(){
   local port="$1"
   if [ -z "$port" ]; then return 1; fi
-  if ! command -v ss >/dev/null 2>&1; then
-    return 0  # 无 ss 工具时不阻塞调用方
-  fi
+  # 无 ss 工具时无法验证 → 视为未通过，让调用方触发回滚保护
+  # （ss 在 Debian/Ubuntu 默认 iproute2 内，缺失极罕见）
+  command -v ss >/dev/null 2>&1 || return 1
   ss -tlnp 2>/dev/null \
     | awk -v p=":${port}$" '$4 ~ p && $0 ~ /sshd/ {found=1} END {exit !found}'
 }
@@ -1759,7 +1759,7 @@ EOF
   if jq '
       .log = (.log // {"disabled": false, "level": "warn", "timestamp": true})
     | del(.dns)
-    | .inbounds = ((.inbounds // []) | map(select(.tag == "reality-in" or .tag == "hy2-in" or .tag == "anytls-in" or .tag == "tuic-in")))
+    | .inbounds = ((.inbounds // []) | map(select(.tag == "reality-in" or .tag == "hy2-in" or .tag == "anytls-in" or .tag == "tuic-in" or .tag == "ss2022-in")))
     | .outbounds = (if ((.outbounds // []) | length) == 0
                     then [{"type":"direct","tag":"direct-out"}]
                     else (.outbounds | map(
@@ -2124,10 +2124,11 @@ build_anytls_link(){
     return 1
   fi
 
-  local host
+  local host enc_pw
   host=$(url_encode_host "$ip")
+  enc_pw=$(printf '%s' "$password" | jq -sRr @uri)
   printf 'anytls://%s@%s:%s/?security=reality&sni=%s&fp=chrome&pbk=%s&sid=%s&insecure=0#%s\n' \
-    "$password" "$host" "$port" "$sni" "$public_key" "$short_id" "$tag"
+    "$enc_pw" "$host" "$port" "$sni" "$public_key" "$short_id" "$tag"
 }
 
 build_hy2_link(){
@@ -2225,12 +2226,10 @@ build_xhr_link(){
     return 1
   fi
 
-  local host encoded_path
+  local host
   host=$(url_encode_host "$ip")
-  # 将 path 中的 / 编码为 %2F，避免部分客户端解析查询串时被截断
-  encoded_path=$(printf '%s' "$path" | sed 's|/|%2F|g')
   printf 'vless://%s@%s:%s?encryption=none&security=reality&sni=%s&fp=chrome&pbk=%s&sid=%s&type=xhttp&path=%s&mode=auto#%s\n' \
-    "$uuid" "$host" "$port" "$sni" "$public_key" "$short_id" "$encoded_path" "$tag"
+    "$uuid" "$host" "$port" "$sni" "$public_key" "$short_id" "$path" "$tag"
 }
 
 
@@ -3038,6 +3037,15 @@ ip4_view_listening(){
 ip4_init_firewall(){
   local ssh_port confirm conflicts
   local backup_rules="" rb_choice="y" rb_pid="" rb_seconds=180
+
+  # 缺 ss 工具无法验证 sshd 监听，直接拒绝避免应用规则后被回滚守护偷偷恢复
+  if ! command -v ss >/dev/null 2>&1; then
+    echo ""
+    echo -e "  ${R}本机未安装 ss 命令（iproute2 包），无法安全验证 SSH 监听端口${N}"
+    echo -e "  ${Y}请先执行：apt install -y iproute2${N}"
+    pause_screen
+    return 1
+  fi
 
   ssh_port=$(ip6_detect_ssh_port)
   conflicts=$(ip4_detect_conflicts)
@@ -5394,10 +5402,20 @@ configure_swap(){
     chmod 600 "$SWAPFILE_PATH"
 
     echo -e "${Y}==> 格式化 SWAP...${N}"
-    mkswap "$SWAPFILE_PATH"
+    if ! mkswap "$SWAPFILE_PATH"; then
+      echo -e "${R}mkswap 失败${N}"
+      rm -f "$SWAPFILE_PATH"
+      pause_screen
+      return 1
+    fi
 
     echo -e "${Y}==> 启用 SWAP...${N}"
-    swapon "$SWAPFILE_PATH"
+    if ! swapon "$SWAPFILE_PATH"; then
+      echo -e "${R}swapon 失败${N}"
+      rm -f "$SWAPFILE_PATH"
+      pause_screen
+      return 1
+    fi
   fi
 
   echo -e "${Y}==> 写入开机自动挂载...${N}"
@@ -6300,7 +6318,7 @@ generate_hy2_random_port(){
 # AnyTLS 默认端口生成：避开本机已占端口与已安装节点已用端口
 generate_anytls_random_port(){
   local p attempts=0 t taken_ports=""
-  for t in reality hy2 tuic ss2022; do
+  for t in reality hy2 tuic ss2022 xhr; do
     if node_installed "$t"; then
       taken_ports="$taken_ports $(get_node_value "$t" Port 2>/dev/null || true)"
     fi
@@ -8586,8 +8604,8 @@ modify_ss2022_params(){
 }
 
 modify_anytls_params(){
-  local new_port="" new_sni="" new_pw=""
-  local cur_port cur_sni cur_pw backup_path="" confirm
+  local new_port="" new_sni="" new_pw="" new_tag=""
+  local cur_port cur_sni cur_pw cur_tag backup_path="" confirm
 
   if ! require_root; then return 1; fi
   if ! require_singbox_installed; then return 1; fi
@@ -8607,6 +8625,7 @@ modify_anytls_params(){
   cur_port=$(get_node_value anytls Port 2>/dev/null || true)
   cur_sni=$(get_node_value anytls SNI 2>/dev/null || true)
   cur_pw=$(get_node_value anytls Password 2>/dev/null || true)
+  cur_tag=$(get_node_value anytls Tag 2>/dev/null || echo anytls)
 
   echo ""
   echo -e "  ${B}${C}修改 AnyTLS 节点参数${N}  ${D}直接回车保留当前值${N}"
@@ -8646,6 +8665,9 @@ modify_anytls_params(){
     return 1
   fi
 
+  read -p "  节点名称 (${cur_tag}): " new_tag
+  new_tag="${new_tag:-$cur_tag}"
+
   echo ""
   echo -e "  即将应用："
   echo -e "    端口     ${cur_port:-?} ${D}→${N} ${C}${new_port}${N}"
@@ -8654,6 +8676,11 @@ modify_anytls_params(){
     echo -e "    Password ${cur_pw:-?} ${D}→${N} ${C}${new_pw}${N}"
   else
     echo -e "    Password ${D}保留${N}"
+  fi
+  if [ "$new_tag" != "$cur_tag" ]; then
+    echo -e "    Tag      ${cur_tag} ${D}→${N} ${C}${new_tag}${N}"
+  else
+    echo -e "    Tag      ${D}保留${N}"
   fi
   read -p "  确认？(y/N): " confirm
   if [ "$confirm" != "y" ] && [ "$confirm" != "Y" ]; then
@@ -8669,6 +8696,7 @@ modify_anytls_params(){
 
   local tmp jq_filter
   tmp=$(mktemp)
+  trap 'rm -f "$tmp"' RETURN
   jq_filter='(.inbounds[] | select(.tag == "anytls-in"))
        |= (.listen_port = ($port | tonumber)
            | .users[0].password = $pw
@@ -8678,7 +8706,6 @@ modify_anytls_params(){
           --arg sni "$new_sni" \
           --arg pw "$new_pw" \
           "$jq_filter" "$CONFIG_PATH" > "$tmp" 2>/dev/null; then
-    rm -f "$tmp"
     echo -e "${R}配置写入失败（jq 过滤错误）${N}"
     pause_screen
     return 1
@@ -8705,14 +8732,14 @@ modify_anytls_params(){
   set_node_value anytls Port "$new_port"
   set_node_value anytls SNI "$new_sni"
   set_node_value anytls Password "$new_pw"
+  set_node_value anytls Tag "$new_tag"
 
   # 重生成 Link
-  local cur_ip cur_tag pub sid new_link ipv6_new_link
+  local cur_ip pub sid new_link ipv6_new_link
   cur_ip=$(get_node_value anytls IP 2>/dev/null || true)
-  cur_tag=$(get_node_value anytls Tag 2>/dev/null || echo anytls)
   pub=$(get_node_value anytls PublicKey 2>/dev/null || true)
   sid=$(get_node_value anytls ShortID 2>/dev/null || true)
-  new_link=$(build_anytls_link "$new_pw" "$cur_ip" "$new_port" "$new_sni" "$pub" "$sid" "${cur_tag:-anytls}" 2>/dev/null || true)
+  new_link=$(build_anytls_link "$new_pw" "$cur_ip" "$new_port" "$new_sni" "$pub" "$sid" "$new_tag" 2>/dev/null || true)
   ipv6_new_link=$(build_dualstack_ipv6_link_for_node anytls 2>/dev/null || true)
   [ -n "$new_link" ] && set_node_value anytls Link "$new_link"
 
@@ -8734,8 +8761,8 @@ modify_anytls_params(){
 }
 
 modify_tuic_params(){
-  local new_port="" new_sni="" new_uuid="" new_pw="" new_cc=""
-  local cur_port cur_sni cur_uuid cur_pw cur_cc cur_cert_src cur_email cur_mode cur_insecure
+  local new_port="" new_sni="" new_uuid="" new_pw="" new_cc="" new_tag=""
+  local cur_port cur_sni cur_uuid cur_pw cur_cc cur_cert_src cur_email cur_mode cur_insecure cur_tag
   local cur_cert_path cur_key_path
   local backup_path="" confirm cc_choice regen_uuid regen_pw
 
@@ -8765,6 +8792,7 @@ modify_tuic_params(){
   cur_insecure=$(get_node_value tuic Insecure 2>/dev/null || echo 0)
   cur_cert_path=$(get_node_value tuic CertPath 2>/dev/null || true)
   cur_key_path=$(get_node_value tuic KeyPath 2>/dev/null || true)
+  cur_tag=$(get_node_value tuic Tag 2>/dev/null || echo tuic)
 
   echo ""
   echo -e "  ${B}${C}修改 TUIC v5 节点参数${N}  ${D}直接回车保留当前值${N}"
@@ -8835,6 +8863,10 @@ modify_tuic_params(){
     *) new_cc="$cur_cc" ;;
   esac
 
+  # 节点名称
+  read -p "  节点名称 (${cur_tag}): " new_tag
+  new_tag="${new_tag:-$cur_tag}"
+
   # 应用前确认
   echo ""
   echo -e "  即将应用："
@@ -8854,6 +8886,11 @@ modify_tuic_params(){
     echo -e "    拥塞控制     ${cur_cc:-?} ${D}→${N} ${C}${new_cc}${N}"
   else
     echo -e "    拥塞控制     ${D}保留${N}"
+  fi
+  if [ "$new_tag" != "$cur_tag" ]; then
+    echo -e "    Tag          ${cur_tag} ${D}→${N} ${C}${new_tag}${N}"
+  else
+    echo -e "    Tag          ${D}保留${N}"
   fi
   read -p "  确认？(y/N): " confirm
   if [ "$confirm" != "y" ] && [ "$confirm" != "Y" ]; then
@@ -8880,6 +8917,7 @@ modify_tuic_params(){
   # jq 修改 inbound
   local tmp jq_filter
   tmp=$(mktemp)
+  trap 'rm -f "$tmp"' RETURN
   jq_filter='(.inbounds[] | select(.tag == "tuic-in"))
        |= (.listen_port = ($port | tonumber)
            | .users[0].uuid = $uuid
@@ -8893,7 +8931,6 @@ modify_tuic_params(){
           --arg pw "$new_pw" \
           --arg cc "$new_cc" \
           "$jq_filter" "$CONFIG_PATH" > "$tmp" 2>/dev/null; then
-    rm -f "$tmp"
     echo -e "${R}配置写入失败（jq 过滤错误）${N}"
     pause_screen
     return 1
@@ -8920,12 +8957,12 @@ modify_tuic_params(){
   set_node_value tuic UUID "$new_uuid"
   set_node_value tuic Password "$new_pw"
   set_node_value tuic CongestionControl "$new_cc"
+  set_node_value tuic Tag "$new_tag"
 
   # 重生成 Link
-  local cur_ip cur_tag new_link ipv6_new_link
+  local cur_ip new_link ipv6_new_link
   cur_ip=$(get_node_value tuic IP 2>/dev/null || true)
-  cur_tag=$(get_node_value tuic Tag 2>/dev/null || echo tuic)
-  new_link=$(build_tuic_link "$new_uuid" "$new_pw" "$cur_ip" "$new_port" "$new_sni" "$cur_insecure" "$new_cc" "${cur_tag:-tuic}" 2>/dev/null || true)
+  new_link=$(build_tuic_link "$new_uuid" "$new_pw" "$cur_ip" "$new_port" "$new_sni" "$cur_insecure" "$new_cc" "$new_tag" 2>/dev/null || true)
   ipv6_new_link=$(build_dualstack_ipv6_link_for_node tuic 2>/dev/null || true)
   [ -n "$new_link" ] && set_node_value tuic Link "$new_link"
 
@@ -9347,7 +9384,8 @@ render_realm_card_line(){
 render_main_menu_card(){
   local ver status status_str title
   if is_singbox_installed; then
-    ver=$(sing-box version 2>/dev/null | head -1 | awk '{print $3}' || echo "未知")
+    ver=$(sing-box version 2>/dev/null | head -1 | awk '{print $3}')
+    [ -z "$ver" ] && ver="未知"
     status=$(systemctl is-active sing-box 2>/dev/null || echo "未知")
     if [ "$status" = "active" ]; then
       status_str="${G}运行中${N}"
@@ -9459,12 +9497,12 @@ show_node_uninstall_menu(){
     render_divider
     read -p "  请输入序号: " choice
     case $choice in
-      1) node_installed reality && uninstall_reality_node; return ;;
-      2) node_installed hy2 && uninstall_hy2_node; return ;;
-      3) node_installed anytls && uninstall_anytls_node; return ;;
-      4) node_installed tuic && uninstall_tuic_node; return ;;
-      5) node_installed ss2022 && uninstall_ss2022_node; return ;;
-      6) node_installed xhr && uninstall_xhr_node; return ;;
+      1) if node_installed reality; then uninstall_reality_node; return; else notify_invalid_choice; fi ;;
+      2) if node_installed hy2;     then uninstall_hy2_node;     return; else notify_invalid_choice; fi ;;
+      3) if node_installed anytls;  then uninstall_anytls_node;  return; else notify_invalid_choice; fi ;;
+      4) if node_installed tuic;    then uninstall_tuic_node;    return; else notify_invalid_choice; fi ;;
+      5) if node_installed ss2022;  then uninstall_ss2022_node;  return; else notify_invalid_choice; fi ;;
+      6) if node_installed xhr;     then uninstall_xhr_node;     return; else notify_invalid_choice; fi ;;
       0) return ;;
       *) notify_invalid_choice ;;
     esac
@@ -10577,6 +10615,11 @@ realm_menu_add(){
   remote_ip=$(printf '%s' "$remote_ip" | tr -d '[:space:]' | tr -d '[]')
   if [ -z "$remote_ip" ]; then
     echo -e "${R}落地机 IP 不能为空${N}"
+    return 1
+  fi
+  # 仅允许 IPv4 / IPv6 字符集，挡掉 TOML 写入注入（"、=、; 等）
+  if printf '%s' "$remote_ip" | grep -q '[^0-9a-fA-F:.]'; then
+    echo -e "${R}IP 含非法字符（仅支持数字 / a-f / : / .）${N}"
     return 1
   fi
   # 判定 IPv6（含冒号且非纯数字端口形式）

@@ -256,7 +256,8 @@ render_realm_card_line(){
 render_main_menu_card(){
   local ver status status_str title
   if is_singbox_installed; then
-    ver=$(sing-box version 2>/dev/null | head -1 | awk '{print $3}' || echo "未知")
+    ver=$(sing-box version 2>/dev/null | head -1 | awk '{print $3}')
+    [ -z "$ver" ] && ver="未知"
     status=$(systemctl is-active sing-box 2>/dev/null || echo "未知")
     if [ "$status" = "active" ]; then
       status_str="${G}运行中${N}"
