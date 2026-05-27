@@ -4715,7 +4715,9 @@ apply_quic_tuning(){
   cat > "$QUIC_TUNING_PATH" <<EOF
 # leyili-quic-profile: region=${region} mem_tier=${mem_tier}
 # 由 leyili.sh QUIC/UDP 协议优化生成 (${region_label} / ${mem_label})
-# 与 99-proxy-optimized.conf 配合使用，互不冲突；服务对象：TUIC / Hysteria2
+# 与 99-proxy-optimized.conf 同存时，本文件因字典序在后会覆盖其 rmem_max / wmem_max
+# (这是预期：UDP/QUIC 缓冲区需求更大，覆盖是设计而非冲突；见 TCP 调优手册 §4.4)
+# 不跑 TUIC / Hysteria2 时无需此文件，可在菜单 "移除 QUIC 调优" 删除
 
 # --- UDP socket 缓冲区 (QUIC 性能命根子) ---
 # QUIC 在用户态做拥塞控制，内核缓冲区只负责暂存，过小直接 packet drop
