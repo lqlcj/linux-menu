@@ -1014,7 +1014,9 @@ apply_sshd_setting(){
   if [ "$key" = "Port" ] && command -v ss >/dev/null 2>&1; then
     local i=0
     while [ "$i" -lt 6 ]; do
-      if ss -tlnp 2>/dev/null | awk -v p=":${value}$" '$4 ~ p && $0 ~ /sshd/ {found=1} END {exit !found}'; then
+      # 只校验端口在监听即可，不强求行内进程名是 sshd：
+      # 新版 Ubuntu/Debian 默认 ssh.socket（socket activation）下监听进程是 systemd 而非 sshd
+      if ss -tlnp 2>/dev/null | awk -v p=":${value}$" '$4 ~ p {found=1} END {exit !found}'; then
         listen_ok=1
         break
       fi
@@ -2372,7 +2374,7 @@ show_status_menu(){
 
     case $choice in
       1)
-        systemctl status sing-box || true
+        systemctl status sing-box --no-pager || true
         pause_screen
         ;;
       2)
@@ -4490,7 +4492,10 @@ apply_tcp_tuning(){
     # 512MB 总内存严格防 OOM，比 1GB 档（16M）小一档，单连接占用减半
     us-west_512m) buffer_max=8388608  ;;
     us-west_1g)  buffer_max=16777216  ;;
-    us-west_2g)  buffer_max=33554432  ;;
+    # us-west_2g: CloudCone 2C2G 实测 161ms ping，cwnd 拉到 769、单流 18.6Mbps、
+    # 零 bufferbloat / 零重传。in-flight 只到 1MB，16M 已留 16 倍裕量；
+    # 升 32M 反而在 BBR ProbeBW 时探出跨洋小拥塞点（手册 §一·1 + §七）
+    us-west_2g)  buffer_max=16777216  ;;
     us-west_4g)  buffer_max=50331648  ;;
     us-west_8g)  buffer_max=67108864  ;;
     eu_512m)     buffer_max=8388608   ;;
@@ -4658,7 +4663,7 @@ remove_tcp_tuning(){
 apply_quic_tuning(){
   local region="${1:-us-west}"
   local mem_tier="${2:-2g}"
-  local region_label buffer_max mem_label
+  local region_label mem_label
 
   if ! require_root; then return 1; fi
 
@@ -4673,33 +4678,6 @@ apply_quic_tuning(){
       ;;
   esac
 
-  case "${region}_${mem_tier}" in
-    hk_512m)     buffer_max=8388608   ;;
-    hk_1g)       buffer_max=16777216  ;;
-    hk_2g)       buffer_max=33554432  ;;
-    hk_4g)       buffer_max=33554432  ;;
-    hk_8g)       buffer_max=67108864  ;;
-    jp_512m)     buffer_max=12582912  ;;
-    jp_1g)       buffer_max=16777216  ;;
-    jp_2g)       buffer_max=33554432  ;;
-    jp_4g)       buffer_max=67108864  ;;
-    jp_8g)       buffer_max=67108864  ;;
-    us-west_512m) buffer_max=16777216 ;;
-    us-west_1g)  buffer_max=25165824  ;;
-    us-west_2g)  buffer_max=67108864  ;;
-    us-west_4g)  buffer_max=100663296 ;;
-    us-west_8g)  buffer_max=134217728 ;;
-    eu_512m)     buffer_max=16777216  ;;
-    eu_1g)       buffer_max=33554432  ;;
-    eu_2g)       buffer_max=67108864  ;;
-    eu_4g)       buffer_max=134217728 ;;
-    eu_8g)       buffer_max=134217728 ;;
-    *)
-      echo -e "${R}未知组合: ${region}/${mem_tier}${N}"
-      return 1
-      ;;
-  esac
-
   case "$mem_tier" in
     512m) mem_label="512MB" ;;
     1g)  mem_label="1GB"  ;;
@@ -4710,26 +4688,16 @@ apply_quic_tuning(){
   esac
 
   echo ""
-  echo -e "${Y}==> 写入 ${region_label}/${mem_label} QUIC/UDP 参数优化配置 (上限 $((buffer_max/1024/1024))M)...${N}"
+  echo -e "${Y}==> 写入 ${region_label}/${mem_label} QUIC/UDP 参数优化配置 (仅 conntrack)...${N}"
 
   cat > "$QUIC_TUNING_PATH" <<EOF
 # leyili-quic-profile: region=${region} mem_tier=${mem_tier}
 # 由 leyili.sh QUIC/UDP 协议优化生成 (${region_label} / ${mem_label})
-# 与 99-proxy-optimized.conf 同存时，本文件因字典序在后会覆盖其 rmem_max / wmem_max
-# (这是预期：UDP/QUIC 缓冲区需求更大，覆盖是设计而非冲突；见 TCP 调优手册 §4.4)
+# 用户偏好：Reality TCP 主用、UDP 仅备用 → 本文件不写 net.core.* 通用键，
+# 避免字典序在后覆盖 TCP 调优。QUIC/UDP socket 缓冲沿用 99-proxy-optimized
+# 设置的 net.core.rmem_max / wmem_max；如出现 sing-box "failed to sufficiently
+# increase receive buffer size" 警告，再考虑单独提升 TCP 那份的 rmem_max。
 # 不跑 TUIC / Hysteria2 时无需此文件，可在菜单 "移除 QUIC 调优" 删除
-
-# --- UDP socket 缓冲区 (QUIC 性能命根子) ---
-# QUIC 在用户态做拥塞控制，内核缓冲区只负责暂存，过小直接 packet drop
-# sing-box 启动若日志出现 "failed to sufficiently increase receive buffer size"
-# 说明这两个值未生效
-net.core.rmem_max = ${buffer_max}
-net.core.wmem_max = ${buffer_max}
-net.core.rmem_default = 1048576
-net.core.wmem_default = 1048576
-
-# --- 网卡入队深度 (TCP/UDP 共享，取较大值兼容) ---
-net.core.netdev_max_backlog = 32768
 
 # --- conntrack (NAT 环境下 UDP 流易爆表，1M 条目 ≈ 200MB 内存) ---
 # 容器/LXC 内可能写不进去，sysctl -p 失败时由上层提示
@@ -4739,10 +4707,11 @@ net.netfilter.nf_conntrack_udp_timeout_stream = 180
 EOF
 
   echo -e "${Y}==> 应用 sysctl 配置...${N}"
-  if ! sysctl -p "$QUIC_TUNING_PATH"; then
-    echo -e "${R}QUIC 参数应用失败，请检查内核兼容性或 sysctl 输出${N}"
-    echo -e "${D}（容器/LXC 环境下 nf_conntrack_* 可能不可写，属正常现象）${N}"
-    return 1
+  # conntrack 写不进去多为「nf_conntrack 模块未加载」或容器受限；配置文件已落地，
+  # 加载 NAT 规则（如装节点开端口跳跃）或重启后即生效。只警告，不报整体失败。
+  if ! sysctl -p "$QUIC_TUNING_PATH" 2>/dev/null; then
+    echo -e "${Y}部分 conntrack 参数当前未能应用（容器/LXC 或 nf_conntrack 模块未加载）${N}"
+    echo -e "${D}配置已写入 ${QUIC_TUNING_PATH}，加载 NAT 规则或重启后生效，不影响节点使用${N}"
   fi
 
   return 0
@@ -4784,7 +4753,6 @@ apply_quic_optimization(){
   local region="$1"
   local mem_tier="$2"
   local region_label mem_label
-  local buffer_max
 
   if ! require_root; then return 1; fi
 
@@ -4819,15 +4787,11 @@ apply_quic_optimization(){
     return 1
   fi
 
-  buffer_max=$(awk -F'=' '/^[[:space:]]*net\.core\.rmem_max/ { gsub(/[[:space:]]/, "", $2); print $2; exit }' "$QUIC_TUNING_PATH" 2>/dev/null)
-
   echo ""
   echo -e "${G}✓ QUIC/UDP 协议优化完成${N}"
   echo -e "  地区        : ${C}$region_label${N}"
   echo -e "  内存档位    : ${C}$mem_label${N}"
-  if [ -n "$buffer_max" ] && [ "$buffer_max" -gt 0 ] 2>/dev/null; then
-    echo -e "  rmem/wmem   : ${C}$((buffer_max / 1024 / 1024))M${N}"
-  fi
+  echo -e "  说明        : ${C}仅写 conntrack，net.core.* 沿用 TCP 调优${N}"
   echo -e "  配置文件    : ${C}$QUIC_TUNING_PATH${N}"
   echo ""
   echo -e "  ${D}提示：调优生效后建议重启 sing-box 让 TUIC/HY2 重新分配缓冲区${N}"
@@ -4980,29 +4944,29 @@ remove_initcwnd_optimization(){
 }
 
 _buffer_label_for(){
-  local r="$1" m="$2"
-  case "${r}_${m}" in
-    hk_512m)     echo "4M"  ;;
-    hk_1g)       echo "16M" ;;
-    hk_2g)       echo "32M" ;;
-    hk_4g)       echo "32M" ;;
-    hk_8g)       echo "64M" ;;
-    jp_512m)     echo "6M"  ;;
-    jp_1g)       echo "16M" ;;
-    jp_2g)       echo "32M" ;;
-    jp_4g)       echo "64M" ;;
-    jp_8g)       echo "64M" ;;
-    us-west_512m) echo "8M" ;;
-    us-west_1g)  echo "24M" ;;
-    us-west_2g)  echo "64M" ;;
-    us-west_4g)  echo "96M" ;;
-    us-west_8g)  echo "128M" ;;
-    eu_512m)     echo "8M"  ;;
-    eu_1g)       echo "32M" ;;
-    eu_2g)       echo "64M" ;;
-    eu_4g)       echo "128M" ;;
-    eu_8g)       echo "128M" ;;
-    *)           echo "?" ;;
+  local protocol="$1" r="$2" m="$3"
+  case "${protocol}_${r}_${m}" in
+    tcp_hk_512m)       echo "4M"   ;;
+    tcp_hk_1g)         echo "8M"   ;;
+    tcp_hk_2g)         echo "16M"  ;;
+    tcp_hk_4g)         echo "16M"  ;;
+    tcp_hk_8g)         echo "32M"  ;;
+    tcp_jp_512m)       echo "6M"   ;;
+    tcp_jp_1g)         echo "12M"  ;;
+    tcp_jp_2g)         echo "16M"  ;;
+    tcp_jp_4g)         echo "24M"  ;;
+    tcp_jp_8g)         echo "32M"  ;;
+    tcp_us-west_512m)  echo "8M"   ;;
+    tcp_us-west_1g)    echo "16M"  ;;
+    tcp_us-west_2g)    echo "16M"  ;;
+    tcp_us-west_4g)    echo "48M"  ;;
+    tcp_us-west_8g)    echo "64M"  ;;
+    tcp_eu_512m)       echo "8M"   ;;
+    tcp_eu_1g)         echo "16M"  ;;
+    tcp_eu_2g)         echo "32M"  ;;
+    tcp_eu_4g)         echo "48M"  ;;
+    tcp_eu_8g)         echo "64M"  ;;
+    *)                 echo "?"    ;;
   esac
 }
 
@@ -5127,11 +5091,11 @@ show_tcp_optimization_picker(){
         echo ""
       fi
 
-      render_menu_item 1 "512 MB   ${D}缓冲上限 $(_buffer_label_for "$region" 512m)${N}"
-      render_menu_item 2 "1 GB     ${D}缓冲上限 $(_buffer_label_for "$region" 1g)${N}"
-      render_menu_item 3 "2 GB     ${D}缓冲上限 $(_buffer_label_for "$region" 2g)${N}"
-      render_menu_item 4 "4 GB     ${D}缓冲上限 $(_buffer_label_for "$region" 4g)${N}"
-      render_menu_item 5 "8 GB+    ${D}缓冲上限 $(_buffer_label_for "$region" 8g)${N}"
+      render_menu_item 1 "512 MB   ${D}缓冲上限 $(_buffer_label_for tcp "$region" 512m)${N}"
+      render_menu_item 2 "1 GB     ${D}缓冲上限 $(_buffer_label_for tcp "$region" 1g)${N}"
+      render_menu_item 3 "2 GB     ${D}缓冲上限 $(_buffer_label_for tcp "$region" 2g)${N}"
+      render_menu_item 4 "4 GB     ${D}缓冲上限 $(_buffer_label_for tcp "$region" 4g)${N}"
+      render_menu_item 5 "8 GB+    ${D}缓冲上限 $(_buffer_label_for tcp "$region" 8g)${N}"
       render_menu_item 0 "返回选择地区"
       render_divider
       read -p "  请选择内存档位: " mem_choice
@@ -5187,11 +5151,11 @@ show_quic_optimization_picker(){
         echo ""
       fi
 
-      render_menu_item 1 "512 MB   ${D}缓冲上限 $(_buffer_label_for "$region" 512m)${N}"
-      render_menu_item 2 "1 GB     ${D}缓冲上限 $(_buffer_label_for "$region" 1g)${N}"
-      render_menu_item 3 "2 GB     ${D}缓冲上限 $(_buffer_label_for "$region" 2g)${N}"
-      render_menu_item 4 "4 GB     ${D}缓冲上限 $(_buffer_label_for "$region" 4g)${N}"
-      render_menu_item 5 "8 GB+    ${D}缓冲上限 $(_buffer_label_for "$region" 8g)${N}"
+      render_menu_item 1 "512 MB"
+      render_menu_item 2 "1 GB"
+      render_menu_item 3 "2 GB"
+      render_menu_item 4 "4 GB"
+      render_menu_item 5 "8 GB+"
       render_menu_item 0 "返回选择地区"
       render_divider
       read -p "  请选择内存档位: " mem_choice
@@ -5314,7 +5278,7 @@ show_network_optimization_status(){
   echo ""
 
   local quic_config_status quic_profile_text="未配置"
-  local quic_rmem_max quic_wmem_max
+  local quic_rmem_max
   local conntrack_max conntrack_count
   if [ -f "$QUIC_TUNING_PATH" ]; then
     quic_config_status="已存在"
@@ -5345,16 +5309,12 @@ show_network_optimization_status(){
   fi
 
   quic_rmem_max=$(sysctl -n net.core.rmem_max 2>/dev/null || echo "")
-  quic_wmem_max=$(sysctl -n net.core.wmem_max 2>/dev/null || echo "")
 
   echo -e "  ${B}QUIC/UDP 参数状态${N}"
   echo -e "  配置文件  : ${C}$quic_config_status${N} (${QUIC_TUNING_PATH})"
   echo -e "  配置档位  : ${C}$quic_profile_text${N}"
   if [ -n "$quic_rmem_max" ] && [ "$quic_rmem_max" -gt 0 ] 2>/dev/null; then
-    echo -e "  rmem_max  : ${C}$((quic_rmem_max / 1024 / 1024))M${N}"
-  fi
-  if [ -n "$quic_wmem_max" ] && [ "$quic_wmem_max" -gt 0 ] 2>/dev/null; then
-    echo -e "  wmem_max  : ${C}$((quic_wmem_max / 1024 / 1024))M${N}"
+    echo -e "  rmem_max  : ${C}$((quic_rmem_max / 1024 / 1024))M${N} ${D}(共用 TCP)${N}"
   fi
   if [ -r /proc/sys/net/netfilter/nf_conntrack_max ]; then
     conntrack_max=$(cat /proc/sys/net/netfilter/nf_conntrack_max 2>/dev/null || echo "?")
@@ -5430,10 +5390,10 @@ configure_swap(){
 vm.swappiness = $SWAPPINESS_VALUE
 EOF
 
-  if ! sysctl -p "$SWAP_SYSCTL_PATH"; then
-    echo -e "${R}swappiness 配置加载失败，请检查 sysctl 输出${N}"
-    pause_screen
-    return 1
+  # swappiness 只是可选优化；SWAP 主体（swapon + fstab）此前已成功。
+  # 容器/精简内核 vm.swappiness 不可写时只警告，不报整体失败（否则误导用户去删正在用的 swapfile）
+  if ! sysctl -p "$SWAP_SYSCTL_PATH" 2>/dev/null; then
+    echo -e "${Y}swappiness 当前未能应用（容器/精简内核可能不可写）；SWAP 已启用，配置已写入，重启后生效${N}"
   fi
 
   echo ""
@@ -8205,7 +8165,7 @@ install_xhr_node(){
     public_ipv6=$(detect_primary_ipv6)
     if [ -z "$public_ipv6" ]; then
       echo ""
-      echo -e "${R}未检测到可用的 IPv6 地址，无法使用"仅 IPv6 入站 + 仅 IPv4 出站"模式${N}"
+      echo -e "${R}未检测到可用的 IPv6 地址，无法使用「仅 IPv6 入站 + 仅 IPv4 出站」模式${N}"
       pause_screen
       return 1
     fi
@@ -9044,9 +9004,10 @@ uninstall_script_completely(){
         hy2)
           [ -n "$port" ] && deny_port_in_firewall "$port" udp
           cert_src=$(get_node_value "$node" CertSource 2>/dev/null || true)
-          # ACME 模式安装时放行过 80/tcp，此处一并撤销
+          # ACME 模式安装时放行过 80/tcp；但 80 是公共端口（面板 / nginx 等也可能在用），
+          # 不自动撤销以免误伤同机其它 web 服务，仅提示用户按需自行处理
           if [ "$cert_src" = "acme" ]; then
-            deny_port_in_firewall 80 tcp
+            echo -e "  ${D}提示：此前为 ACME 放行过 80/tcp，如确认无其它服务使用可自行关闭${N}"
           fi
           # 端口跳跃范围撤销 ufw / firewalld 规则
           local hop_v hop_start_v hop_end_v
@@ -10327,7 +10288,7 @@ require_realm_installed(){
     return 0
   fi
   echo ""
-  echo -e "${Y}realm 尚未安装，请先在本菜单选择"安装 Realm"${N}"
+  echo -e "${Y}realm 尚未安装，请先在本菜单选择「安装 Realm」${N}"
   pause_screen
   return 1
 }
@@ -10704,7 +10665,7 @@ realm_menu_view(){
   local count
   count=$(realm_count_rules)
   if [ "$count" -eq 0 ]; then
-    echo -e "  ${D}（暂无规则，请先"添加转发规则"）${N}"
+    echo -e "  ${D}（暂无规则，请先「添加转发规则」）${N}"
   else
     printf "  ${L}│${N}  %-4s %-26s  %s\n" "ID" "本机监听" "落地"
     local idx listen_str remote_str

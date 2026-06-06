@@ -262,10 +262,11 @@ net.netfilter.nf_conntrack_udp_timeout_stream = 180
 EOF
 
   echo -e "${Y}==> 应用 sysctl 配置...${N}"
-  if ! sysctl -p "$QUIC_TUNING_PATH"; then
-    echo -e "${R}QUIC 参数应用失败，请检查内核兼容性或 sysctl 输出${N}"
-    echo -e "${D}（容器/LXC 环境下 nf_conntrack_* 可能不可写，属正常现象）${N}"
-    return 1
+  # conntrack 写不进去多为「nf_conntrack 模块未加载」或容器受限；配置文件已落地，
+  # 加载 NAT 规则（如装节点开端口跳跃）或重启后即生效。只警告，不报整体失败。
+  if ! sysctl -p "$QUIC_TUNING_PATH" 2>/dev/null; then
+    echo -e "${Y}部分 conntrack 参数当前未能应用（容器/LXC 或 nf_conntrack 模块未加载）${N}"
+    echo -e "${D}配置已写入 ${QUIC_TUNING_PATH}，加载 NAT 规则或重启后生效，不影响节点使用${N}"
   fi
 
   return 0
@@ -944,10 +945,10 @@ configure_swap(){
 vm.swappiness = $SWAPPINESS_VALUE
 EOF
 
-  if ! sysctl -p "$SWAP_SYSCTL_PATH"; then
-    echo -e "${R}swappiness 配置加载失败，请检查 sysctl 输出${N}"
-    pause_screen
-    return 1
+  # swappiness 只是可选优化；SWAP 主体（swapon + fstab）此前已成功。
+  # 容器/精简内核 vm.swappiness 不可写时只警告，不报整体失败（否则误导用户去删正在用的 swapfile）
+  if ! sysctl -p "$SWAP_SYSCTL_PATH" 2>/dev/null; then
+    echo -e "${Y}swappiness 当前未能应用（容器/精简内核可能不可写）；SWAP 已启用，配置已写入，重启后生效${N}"
   fi
 
   echo ""

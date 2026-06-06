@@ -41,7 +41,7 @@ require_realm_installed(){
     return 0
   fi
   echo ""
-  echo -e "${Y}realm 尚未安装，请先在本菜单选择"安装 Realm"${N}"
+  echo -e "${Y}realm 尚未安装，请先在本菜单选择「安装 Realm」${N}"
   pause_screen
   return 1
 }
@@ -418,7 +418,7 @@ realm_menu_view(){
   local count
   count=$(realm_count_rules)
   if [ "$count" -eq 0 ]; then
-    echo -e "  ${D}（暂无规则，请先"添加转发规则"）${N}"
+    echo -e "  ${D}（暂无规则，请先「添加转发规则」）${N}"
   else
     printf "  ${L}│${N}  %-4s %-26s  %s\n" "ID" "本机监听" "落地"
     local idx listen_str remote_str

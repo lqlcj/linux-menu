@@ -49,9 +49,10 @@ uninstall_script_completely(){
         hy2)
           [ -n "$port" ] && deny_port_in_firewall "$port" udp
           cert_src=$(get_node_value "$node" CertSource 2>/dev/null || true)
-          # ACME 模式安装时放行过 80/tcp，此处一并撤销
+          # ACME 模式安装时放行过 80/tcp；但 80 是公共端口（面板 / nginx 等也可能在用），
+          # 不自动撤销以免误伤同机其它 web 服务，仅提示用户按需自行处理
           if [ "$cert_src" = "acme" ]; then
-            deny_port_in_firewall 80 tcp
+            echo -e "  ${D}提示：此前为 ACME 放行过 80/tcp，如确认无其它服务使用可自行关闭${N}"
           fi
           # 端口跳跃范围撤销 ufw / firewalld 规则
           local hop_v hop_start_v hop_end_v

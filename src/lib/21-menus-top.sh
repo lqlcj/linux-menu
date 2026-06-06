@@ -21,7 +21,7 @@ show_status_menu(){
 
     case $choice in
       1)
-        systemctl status sing-box || true
+        systemctl status sing-box --no-pager || true
         pause_screen
         ;;
       2)
