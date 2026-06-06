@@ -302,7 +302,9 @@ apply_sshd_setting(){
   if [ "$key" = "Port" ] && command -v ss >/dev/null 2>&1; then
     local i=0
     while [ "$i" -lt 6 ]; do
-      if ss -tlnp 2>/dev/null | awk -v p=":${value}$" '$4 ~ p && $0 ~ /sshd/ {found=1} END {exit !found}'; then
+      # 只校验端口在监听即可，不强求行内进程名是 sshd：
+      # 新版 Ubuntu/Debian 默认 ssh.socket（socket activation）下监听进程是 systemd 而非 sshd
+      if ss -tlnp 2>/dev/null | awk -v p=":${value}$" '$4 ~ p {found=1} END {exit !found}'; then
         listen_ok=1
         break
       fi

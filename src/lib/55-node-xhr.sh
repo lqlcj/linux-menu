@@ -70,7 +70,7 @@ install_xhr_node(){
     public_ipv6=$(detect_primary_ipv6)
     if [ -z "$public_ipv6" ]; then
       echo ""
-      echo -e "${R}未检测到可用的 IPv6 地址，无法使用"仅 IPv6 入站 + 仅 IPv4 出站"模式${N}"
+      echo -e "${R}未检测到可用的 IPv6 地址，无法使用「仅 IPv6 入站 + 仅 IPv4 出站」模式${N}"
       pause_screen
       return 1
     fi
