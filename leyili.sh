@@ -4466,6 +4466,11 @@ apply_tcp_tuning(){
       notsent_lowat=16384
       fin_timeout=10
       ;;
+    us-west-100m)
+      region_label="美西 100M"
+      notsent_lowat=16384
+      fin_timeout=10
+      ;;
     eu)
       region_label="欧洲"
       notsent_lowat=16384
@@ -4498,6 +4503,13 @@ apply_tcp_tuning(){
     us-west_2g)  buffer_max=16777216  ;;
     us-west_4g)  buffer_max=50331648  ;;
     us-west_8g)  buffer_max=67108864  ;;
+    # HostDare / 9929 等 100Mbps 硬限速美西：理论 BDP 约 3-4M，
+    # 但 9929 低丢包实测 8M 比 4M/16M 更稳，保留探测余量且避免 16M 队列堆积。
+    us-west-100m_512m) buffer_max=8388608 ;;
+    us-west-100m_1g)   buffer_max=8388608 ;;
+    us-west-100m_2g)   buffer_max=8388608 ;;
+    us-west-100m_4g)   buffer_max=8388608 ;;
+    us-west-100m_8g)   buffer_max=8388608 ;;
     eu_512m)     buffer_max=8388608   ;;
     eu_1g)       buffer_max=16777216  ;;
     eu_2g)       buffer_max=33554432  ;;
@@ -4961,6 +4973,11 @@ _buffer_label_for(){
     tcp_us-west_2g)    echo "16M"  ;;
     tcp_us-west_4g)    echo "48M"  ;;
     tcp_us-west_8g)    echo "64M"  ;;
+    tcp_us-west-100m_512m) echo "8M" ;;
+    tcp_us-west-100m_1g)   echo "8M" ;;
+    tcp_us-west-100m_2g)   echo "8M" ;;
+    tcp_us-west-100m_4g)   echo "8M" ;;
+    tcp_us-west-100m_8g)   echo "8M" ;;
     tcp_eu_512m)       echo "8M"   ;;
     tcp_eu_1g)         echo "16M"  ;;
     tcp_eu_2g)         echo "32M"  ;;
@@ -4982,6 +4999,7 @@ apply_network_optimization(){
     hk)      region_label="香港"; initcwnd_value=32 ;;
     jp)      region_label="日本"; initcwnd_value=32 ;;
     us-west) region_label="美西"; initcwnd_value=32 ;;
+    us-west-100m) region_label="美西 100M"; initcwnd_value=32 ;;
     eu)      region_label="欧洲"; initcwnd_value=32 ;;
     *)
       echo -e "${R}未知地区: $region${N}"
@@ -5067,7 +5085,8 @@ show_tcp_optimization_picker(){
     render_menu_item 1 "香港   ${D}(RTT≈80ms,  BDP≈10M)${N}"
     render_menu_item 2 "日本   ${D}(RTT≈120ms, BDP≈15M)${N}"
     render_menu_item 3 "美西   ${D}(RTT≈200ms, BDP≈25M)${N}"
-    render_menu_item 4 "欧洲   ${D}(RTT≈280ms, BDP≈35M)${N}"
+    render_menu_item 4 "美西 100M ${D}(9929/低丢包, 缓冲≈8M)${N}"
+    render_menu_item 5 "欧洲   ${D}(RTT≈280ms, BDP≈35M)${N}"
     render_menu_item 0 "返回上级"
     render_divider
     read -p "  请选择地区: " region_choice
@@ -5076,7 +5095,8 @@ show_tcp_optimization_picker(){
       1) region="hk";      region_label="香港" ;;
       2) region="jp";      region_label="日本" ;;
       3) region="us-west"; region_label="美西" ;;
-      4) region="eu";      region_label="欧洲" ;;
+      4) region="us-west-100m"; region_label="美西 100M" ;;
+      5) region="eu";      region_label="欧洲" ;;
       0) return ;;
       *) notify_invalid_choice; continue ;;
     esac
@@ -5240,12 +5260,13 @@ show_network_optimization_status(){
     local profile_line region mem_tier region_label="" mem_label=""
     profile_line=$(awk '/^# leyili-profile:/ { print; exit }' "$TCP_TUNING_PATH" 2>/dev/null)
     if [ -n "$profile_line" ]; then
-      region=$(printf '%s\n' "$profile_line" | sed -n 's/.*region=\([a-z-]\+\).*/\1/p')
+      region=$(printf '%s\n' "$profile_line" | sed -n 's/.*region=\([a-z0-9-]\+\).*/\1/p')
       mem_tier=$(printf '%s\n' "$profile_line" | sed -n 's/.*mem_tier=\([a-z0-9]\+\).*/\1/p')
       case "$region" in
         hk)      region_label="香港" ;;
         jp)      region_label="日本" ;;
         us-west) region_label="美西" ;;
+        us-west-100m) region_label="美西 100M" ;;
         eu)      region_label="欧洲" ;;
       esac
       case "$mem_tier" in
@@ -5285,7 +5306,7 @@ show_network_optimization_status(){
     local quic_profile_line region mem_tier region_label="" mem_label=""
     quic_profile_line=$(awk '/^# leyili-quic-profile:/ { print; exit }' "$QUIC_TUNING_PATH" 2>/dev/null)
     if [ -n "$quic_profile_line" ]; then
-      region=$(printf '%s\n' "$quic_profile_line" | sed -n 's/.*region=\([a-z-]\+\).*/\1/p')
+      region=$(printf '%s\n' "$quic_profile_line" | sed -n 's/.*region=\([a-z0-9-]\+\).*/\1/p')
       mem_tier=$(printf '%s\n' "$quic_profile_line" | sed -n 's/.*mem_tier=\([a-z0-9]\+\).*/\1/p')
       case "$region" in
         hk)      region_label="香港" ;;
@@ -9229,12 +9250,13 @@ render_tcp_card_line(){
   local profile_line region="" mem_tier="" region_label="" mem_label=""
   profile_line=$(awk '/^# leyili-profile:/ { print; exit }' "$TCP_TUNING_PATH" 2>/dev/null)
   if [ -n "$profile_line" ]; then
-    region=$(printf '%s\n' "$profile_line" | sed -n 's/.*region=\([a-z-]\+\).*/\1/p')
+    region=$(printf '%s\n' "$profile_line" | sed -n 's/.*region=\([a-z0-9-]\+\).*/\1/p')
     mem_tier=$(printf '%s\n' "$profile_line" | sed -n 's/.*mem_tier=\([a-z0-9]\+\).*/\1/p')
     case "$region" in
       hk)      region_label="香港" ;;
       jp)      region_label="日本" ;;
       us-west) region_label="美西" ;;
+      us-west-100m) region_label="美西 100M" ;;
       eu)      region_label="欧洲" ;;
     esac
     case "$mem_tier" in
@@ -9264,7 +9286,7 @@ render_quic_card_line(){
   local profile_line region="" mem_tier="" region_label="" mem_label=""
   profile_line=$(awk '/^# leyili-quic-profile:/ { print; exit }' "$QUIC_TUNING_PATH" 2>/dev/null)
   if [ -n "$profile_line" ]; then
-    region=$(printf '%s\n' "$profile_line" | sed -n 's/.*region=\([a-z-]\+\).*/\1/p')
+    region=$(printf '%s\n' "$profile_line" | sed -n 's/.*region=\([a-z0-9-]\+\).*/\1/p')
     mem_tier=$(printf '%s\n' "$profile_line" | sed -n 's/.*mem_tier=\([a-z0-9]\+\).*/\1/p')
     case "$region" in
       hk)      region_label="香港" ;;
