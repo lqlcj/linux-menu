@@ -138,12 +138,13 @@ render_tcp_card_line(){
   local profile_line region="" mem_tier="" region_label="" mem_label=""
   profile_line=$(awk '/^# leyili-profile:/ { print; exit }' "$TCP_TUNING_PATH" 2>/dev/null)
   if [ -n "$profile_line" ]; then
-    region=$(printf '%s\n' "$profile_line" | sed -n 's/.*region=\([a-z-]\+\).*/\1/p')
+    region=$(printf '%s\n' "$profile_line" | sed -n 's/.*region=\([a-z0-9-]\+\).*/\1/p')
     mem_tier=$(printf '%s\n' "$profile_line" | sed -n 's/.*mem_tier=\([a-z0-9]\+\).*/\1/p')
     case "$region" in
       hk)      region_label="香港" ;;
       jp)      region_label="日本" ;;
       us-west) region_label="美西" ;;
+      us-west-100m) region_label="美西 100M" ;;
       eu)      region_label="欧洲" ;;
     esac
     case "$mem_tier" in
@@ -173,7 +174,7 @@ render_quic_card_line(){
   local profile_line region="" mem_tier="" region_label="" mem_label=""
   profile_line=$(awk '/^# leyili-quic-profile:/ { print; exit }' "$QUIC_TUNING_PATH" 2>/dev/null)
   if [ -n "$profile_line" ]; then
-    region=$(printf '%s\n' "$profile_line" | sed -n 's/.*region=\([a-z-]\+\).*/\1/p')
+    region=$(printf '%s\n' "$profile_line" | sed -n 's/.*region=\([a-z0-9-]\+\).*/\1/p')
     mem_tier=$(printf '%s\n' "$profile_line" | sed -n 's/.*mem_tier=\([a-z0-9]\+\).*/\1/p')
     case "$region" in
       hk)      region_label="香港" ;;
