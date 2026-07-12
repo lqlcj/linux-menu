@@ -2,6 +2,7 @@ apply_tcp_tuning(){
   local region="${1:-us-west}"
   local mem_tier="${2:-2g}"
   local region_label notsent_lowat fin_timeout buffer_max mem_label
+  local cc_algo qdisc_algo iface _q
 
   if ! require_root; then return 1; fi
 
@@ -85,6 +86,30 @@ apply_tcp_tuning(){
     *)   mem_label="$mem_tier" ;;
   esac
 
+  # --- 拥塞控制探测：BBR 不是所有内核都编译进去（精简内核 / 老 OpenVZ）---
+  # 写死 bbr 会让 sysctl -p 在那一行静默报错后回落 cubic，用户以为开了 BBR。
+  # 先尝试加载模块，再查 tcp_available_congestion_control，不可用时明确降级并告警。
+  cc_algo="bbr"
+  modprobe tcp_bbr >/dev/null 2>&1 || true
+  if ! grep -qw bbr /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null; then
+    cc_algo="cubic"
+    echo -e "${Y}==> 当前内核不支持 BBR，拥塞算法降级为 cubic${N}"
+    echo -e "${D}    （精简内核 / 老 OpenVZ 常见；如需 BBR 请更换支持的内核后重跑）${N}"
+  fi
+
+  # --- qdisc 选择：fq 配合 BBR 的 pacing 效果最好，但同样可能未编译 ---
+  # 用 sysctl -w 依次探测 fq → fq_codel（写成功即代表内核支持该 qdisc；
+  # 这步顺带把全局 default_qdisc 设成选中值，与稍后写入配置文件的值一致）。
+  # 两者都不支持时留空，不写该行、保持内核默认。
+  qdisc_algo=""
+  modprobe sch_fq >/dev/null 2>&1 || true
+  for _q in fq fq_codel; do
+    if sysctl -w "net.core.default_qdisc=${_q}" >/dev/null 2>&1; then
+      qdisc_algo="$_q"
+      break
+    fi
+  done
+
   echo ""
   echo -e "${Y}==> 写入 ${region_label}/${mem_label} TCP 参数优化配置 (上限 $((buffer_max/1024/1024))M)...${N}"
 
@@ -94,10 +119,12 @@ apply_tcp_tuning(){
 # 偏好：交互流（网页 / 社交 / 流媒体），非吞吐党
 
 # --- 拥塞控制 + 调度 ---
-net.core.default_qdisc = fq
-net.ipv4.tcp_congestion_control = bbr
+${qdisc_algo:+net.core.default_qdisc = ${qdisc_algo}}
+net.ipv4.tcp_congestion_control = ${cc_algo}
 # TFO = 1 仅客户端方向；服务端在国内出口常被运营商干扰 cookie，
 # 首包失败比首包提前 1RTT 更常见，因此服务端关闭
+# 注意：本机 sing-box 入站也不要开 tcp_fast_open（服务端 accept 方向需 bit2，
+# 即此值需为 3 才生效）；两侧保持一致，避免节点开了 TFO 但内核未支撑的空配
 net.ipv4.tcp_fastopen = 1
 
 # --- 缓冲区 (按地区 BDP 与内存档计算) ---
@@ -108,7 +135,9 @@ net.core.rmem_default = 524288
 net.core.wmem_default = 524288
 net.ipv4.tcp_rmem = 16384 524288 ${buffer_max}
 net.ipv4.tcp_wmem = 16384 524288 ${buffer_max}
-# 路径不稳时偏 receiver 应用层 buffer，跨境丢包场景更跟手
+# adv_win_scale=2：内核按 space-(space>>2) 把约 3/4 划给接收窗口、1/4 留应用层
+# overhead（默认 1 是各半）。跨境高 BDP 下更大的接收窗口利于吃满带宽。
+# 注：6.x 内核逐步弱化此旋钮，长期留意
 net.ipv4.tcp_adv_win_scale = 2
 
 # --- 长连接 / 慢启动 / MTU ---
@@ -164,12 +193,27 @@ EOF
     return 1
   fi
 
+  # default_qdisc 只在「网卡注册时」读取；系统启动时 eth0 早已建好，
+  # 改这个值不会动现有网卡。这里对当前默认网卡手动 replace，让 fq 本次即生效
+  # （否则要等重启，用户跑完却仍是 pfifo_fast）。BBR 自带 pacing，缺 fq 不致命，
+  # 故 tc 失败只警告不算整体失败。
+  if [ -n "$qdisc_algo" ] && command -v tc >/dev/null 2>&1; then
+    iface=$(ip route show default 2>/dev/null | awk '/^default/ {print $5; exit}')
+    if [ -n "$iface" ]; then
+      if tc qdisc replace dev "$iface" root "$qdisc_algo" >/dev/null 2>&1; then
+        echo -e "${D}    已对 ${iface} 应用 ${qdisc_algo} qdisc（本次生效）${N}"
+      else
+        echo -e "${Y}    对 ${iface} 应用 ${qdisc_algo} qdisc 失败，重启后由 default_qdisc 生效${N}"
+      fi
+    fi
+  fi
+
   return 0
 }
 
 remove_tcp_tuning(){
   local confirm=""
-  local service_name route_line route_spec
+  local service_name route_line route_spec iface
 
   if ! require_root; then
     return 1
@@ -197,6 +241,13 @@ remove_tcp_tuning(){
   sysctl -w net.core.default_qdisc=pfifo_fast >/dev/null 2>&1 || true
   sysctl -w net.ipv4.tcp_congestion_control=cubic >/dev/null 2>&1 || true
   sysctl --system >/dev/null 2>&1 || true
+
+  # 与 apply 对称：default_qdisc 改回默认值不会动现有网卡，需对 live 网卡显式复位。
+  # 回退到 pfifo_fast（内核传统默认），失败仅忽略（可能内核无此 qdisc 或无 tc）
+  if command -v tc >/dev/null 2>&1; then
+    iface=$(ip route show default 2>/dev/null | awk '/^default/ {print $5; exit}')
+    [ -n "$iface" ] && tc qdisc replace dev "$iface" root pfifo_fast >/dev/null 2>&1 || true
+  fi
 
   # 配套撤销 initcwnd（apply_network_optimization 是把 TCP+initcwnd 当一组应用的，对称地撤）
   service_name=$(basename "$INITCWND_SERVICE_PATH")
@@ -547,6 +598,7 @@ apply_network_optimization(){
   local mem_tier="$2"
   local region_label initcwnd_value mem_label
   local buffer_max notsent_lowat fin_timeout
+  local live_cc live_iface live_qdisc
 
   if ! require_root; then return 1; fi
 
@@ -602,7 +654,15 @@ apply_network_optimization(){
   echo -e "  notsent     : ${C}$notsent_lowat${N}"
   echo -e "  fin_timeout : ${C}$fin_timeout${N}"
   echo -e "  initcwnd    : ${C}$initcwnd_value${N}"
-  echo -e "  qdisc / cc  : ${C}$(sysctl -n net.core.default_qdisc 2>/dev/null) / $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)${N}"
+  # 显示「实际生效」的拥塞算法与网卡 qdisc：cc 读运行值可反映 BBR 是否降级；
+  # qdisc 读 tc 实际值（而非全局 default_qdisc），避免误报 fq 已生效
+  live_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "?")
+  live_iface=$(ip route show default 2>/dev/null | awk '/^default/ {print $5; exit}')
+  if [ -n "$live_iface" ] && command -v tc >/dev/null 2>&1; then
+    live_qdisc=$(tc qdisc show dev "$live_iface" 2>/dev/null | awk 'NR==1 {print $2; exit}')
+  fi
+  [ -z "$live_qdisc" ] && live_qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null || echo "?")
+  echo -e "  qdisc / cc  : ${C}${live_qdisc} / ${live_cc}${N}${live_iface:+ ${D}(${live_iface})${N}}"
   echo -e "  配置文件    : ${C}$TCP_TUNING_PATH${N}"
   pause_screen
 }
@@ -754,7 +814,7 @@ show_quic_optimization_picker(){
 show_network_optimization_status(){
   local route_line initcwnd_current initrwnd_current initcwnd_enabled initcwnd_active
   local tcp_qdisc tcp_cc tcp_fastopen tcp_notsent tcp_fin_timeout tcp_keepalive
-  local tcp_config_status
+  local tcp_config_status tcp_qdisc_live status_iface
 
   echo ""
   echo -e "  ${B}${C}网络优化状态${N}"
@@ -807,6 +867,12 @@ show_network_optimization_status(){
   tcp_fin_timeout=$(sysctl -n net.ipv4.tcp_fin_timeout 2>/dev/null || echo "未知")
   tcp_keepalive=$(sysctl -n net.ipv4.tcp_keepalive_time 2>/dev/null || echo "未知")
 
+  # 默认网卡上「实际生效」的 qdisc（区别于全局 default_qdisc；后者改了不动现有网卡）
+  status_iface=$(printf '%s\n' "$route_line" | awk '/^default/ {print $5; exit}')
+  if [ -n "$status_iface" ] && command -v tc >/dev/null 2>&1; then
+    tcp_qdisc_live=$(tc qdisc show dev "$status_iface" 2>/dev/null | awk 'NR==1 {print $2; exit}')
+  fi
+
   local tcp_profile_text="未配置"
   local tcp_rmem_max
   tcp_rmem_max=$(sysctl -n net.core.rmem_max 2>/dev/null || echo "")
@@ -845,8 +911,8 @@ show_network_optimization_status(){
   if [ -n "$tcp_rmem_max" ] && [ "$tcp_rmem_max" -gt 0 ] 2>/dev/null; then
     echo -e "  rmem_max  : ${C}$((tcp_rmem_max / 1024 / 1024))M${N}"
   fi
-  echo -e "  qdisc     : ${C}$tcp_qdisc${N}"
-  echo -e "  BBR       : ${C}$tcp_cc${N}"
+  echo -e "  qdisc     : ${C}$tcp_qdisc${N}${tcp_qdisc_live:+ ${D}(${status_iface} 实际: ${tcp_qdisc_live})${N}}"
+  echo -e "  拥塞算法  : ${C}$tcp_cc${N}$([ "$tcp_cc" = "bbr" ] && printf ' %b(BBR)%b' "$G" "$N")"
   echo -e "  Fast Open : ${C}$tcp_fastopen${N}"
   echo -e "  notsent   : ${C}$tcp_notsent${N}"
   echo -e "  fin_timeout : ${C}$tcp_fin_timeout${N}"

@@ -254,6 +254,30 @@ render_realm_card_line(){
   render_card_line " ${C}✧${N} ${C}${label}${N}${C}v${ver}${N} ${D}·${N} ${status_str} ${D}·${N} ${C}${count}${N} ${D}条规则${N}"
 }
 
+# sing-box 内核版本行：当前版本 vs 最新稳定版（GitHub releases/latest 只返回稳定版）
+# 最新版走带缓存的查询，首页反复刷新也不会每次都打 GitHub。
+render_singbox_version_card_line(){
+  local label="内核版本   "  # 11 可见列
+  if ! is_singbox_installed; then
+    return  # 未安装时标题栏已显示「未安装」，此处不再重复
+  fi
+  local cur latest
+  cur=$(get_current_singbox_version 2>/dev/null)
+  [ -z "$cur" ] && cur="?"
+  latest=$(get_latest_singbox_version_cached 2>/dev/null)
+  if [ -z "$latest" ]; then
+    render_card_line " ${C}✦${N} ${C}${label}${N}${C}v${cur}${N} ${D}·${N} ${D}最新版待联网${N}"
+  elif [ "$cur" = "$latest" ]; then
+    render_card_line " ${C}✦${N} ${C}${label}${N}${C}v${cur}${N} ${D}·${N} ${G}已是最新${N}"
+  elif _singbox_ver_lt "$cur" "$latest"; then
+    render_card_line " ${C}✦${N} ${C}${label}${N}${C}v${cur}${N} ${Y}→${N} ${G}v${latest}${N} ${Y}可升级${N}"
+  else
+    # 当前版本比稳定版新（装了 alpha/beta 预览版）
+    render_card_line " ${C}✦${N} ${C}${label}${N}${C}v${cur}${N} ${D}·${N} ${D}稳定版 v${latest}${N}"
+  fi
+  render_card_blank
+}
+
 render_main_menu_card(){
   local ver status status_str title
   if is_singbox_installed; then
@@ -273,6 +297,7 @@ render_main_menu_card(){
   title="${B}${C}管理菜单${N} ${D}·${N} ${C}v${ver}${N}"
   render_card_top "$title" "$status_str"
   render_card_blank
+  render_singbox_version_card_line
   render_node_card_block reality
   render_card_blank
   render_node_card_block hy2

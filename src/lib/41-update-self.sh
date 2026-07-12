@@ -5,6 +5,35 @@ get_latest_singbox_version(){
   printf '%s' "$ver"
 }
 
+# 带缓存的「最新稳定版」查询：首页每次刷新都会调用它，不能每次都打 GitHub。
+# 命中且未过期 → 直接读缓存；过期/不存在 → 拉一次并写回。
+# 拉取失败时写空内容作为「负缓存」，短 TTL 内不再重试，避免每次刷新都卡 5 秒。
+get_latest_singbox_version_cached(){
+  local now mtime age content ttl ver
+  if [ -f "$SINGBOX_LATEST_CACHE" ]; then
+    now=$(date +%s 2>/dev/null || echo 0)
+    mtime=$(stat -c %Y "$SINGBOX_LATEST_CACHE" 2>/dev/null || echo 0)
+    age=$((now - mtime))
+    content=$(cat "$SINGBOX_LATEST_CACHE" 2>/dev/null)
+    if [ -n "$content" ]; then ttl="$SINGBOX_LATEST_TTL"; else ttl="$SINGBOX_LATEST_NEG_TTL"; fi
+    if [ "$now" -gt 0 ] && [ "$age" -ge 0 ] && [ "$age" -lt "$ttl" ]; then
+      printf '%s' "$content"
+      return 0
+    fi
+  fi
+  ver=$(get_latest_singbox_version)
+  printf '%s' "$ver" > "$SINGBOX_LATEST_CACHE" 2>/dev/null || true
+  printf '%s' "$ver"
+}
+
+# 版本严格小于比较：$1 < $2 返回 0（真）。依赖 sort -V（coreutils，Debian/Ubuntu 自带）。
+_singbox_ver_lt(){
+  [ "$1" = "$2" ] && return 1
+  local first
+  first=$(printf '%s\n%s\n' "$1" "$2" | sort -V 2>/dev/null | head -1)
+  [ "$first" = "$1" ]
+}
+
 get_current_singbox_version(){
   if ! command -v sing-box >/dev/null 2>&1; then
     printf '%s' ""
