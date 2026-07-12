@@ -9,6 +9,11 @@ CONFIG_PATH="/etc/sing-box/config.json"
 INFO_PATH="/root/proxy-info.txt"
 NODES_DIR="/etc/sing-box/nodes"
 CERTS_DIR="/etc/sing-box/certs"
+
+# 首页展示「最新稳定版」用的缓存（避免每次刷新菜单都请求 GitHub）
+SINGBOX_LATEST_CACHE="/tmp/.leyili-singbox-latest"
+SINGBOX_LATEST_TTL="21600"     # 有效缓存 6 小时
+SINGBOX_LATEST_NEG_TTL="300"   # 联网失败后 5 分钟内不再重试
 APP_NAME="Leyili"
 COMMAND_NAME="sb"
 SCRIPT_PATH="/usr/local/bin/${COMMAND_NAME}"

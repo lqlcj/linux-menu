@@ -72,7 +72,11 @@
       "Bash(command -v jq)",
       "Bash(VPS_HOST=45.89.232.6 VPS_PORT=2222 VPS_USER=lcj VPS_PWD='Lcj13146688.' python *)",
       "Bash(gh repo *)",
-      "WebFetch(domain:v2.hysteria.network)"
+      "WebFetch(domain:v2.hysteria.network)",
+      "Bash(bunzip2 -c)",
+      "Bash(awk '/^Package: sing-box$/{p=1} p&&/^Version:/{print $2; p=0}')",
+      "Bash(rm -f /tmp/vtest.sh /tmp/wtest.sh /tmp/integ.sh /tmp/leyili_funcs.sh /tmp/sb.gz /tmp/sb_packages.txt /tmp/sb.gz.tmp*)",
+      "Bash(rm -rf 'C:\\\\Users\\\\leyili/sb_probe')"
     ]
   }
 }

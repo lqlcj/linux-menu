@@ -9,6 +9,11 @@ CONFIG_PATH="/etc/sing-box/config.json"
 INFO_PATH="/root/proxy-info.txt"
 NODES_DIR="/etc/sing-box/nodes"
 CERTS_DIR="/etc/sing-box/certs"
+
+# 首页展示「最新稳定版」用的缓存（避免每次刷新菜单都请求 GitHub）
+SINGBOX_LATEST_CACHE="/tmp/.leyili-singbox-latest"
+SINGBOX_LATEST_TTL="21600"     # 有效缓存 6 小时
+SINGBOX_LATEST_NEG_TTL="300"   # 联网失败后 5 分钟内不再重试
 APP_NAME="Leyili"
 COMMAND_NAME="sb"
 SCRIPT_PATH="/usr/local/bin/${COMMAND_NAME}"
@@ -4447,6 +4452,7 @@ apply_tcp_tuning(){
   local region="${1:-us-west}"
   local mem_tier="${2:-2g}"
   local region_label notsent_lowat fin_timeout buffer_max mem_label
+  local cc_algo qdisc_algo iface _q
 
   if ! require_root; then return 1; fi
 
@@ -4530,6 +4536,30 @@ apply_tcp_tuning(){
     *)   mem_label="$mem_tier" ;;
   esac
 
+  # --- 拥塞控制探测：BBR 不是所有内核都编译进去（精简内核 / 老 OpenVZ）---
+  # 写死 bbr 会让 sysctl -p 在那一行静默报错后回落 cubic，用户以为开了 BBR。
+  # 先尝试加载模块，再查 tcp_available_congestion_control，不可用时明确降级并告警。
+  cc_algo="bbr"
+  modprobe tcp_bbr >/dev/null 2>&1 || true
+  if ! grep -qw bbr /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null; then
+    cc_algo="cubic"
+    echo -e "${Y}==> 当前内核不支持 BBR，拥塞算法降级为 cubic${N}"
+    echo -e "${D}    （精简内核 / 老 OpenVZ 常见；如需 BBR 请更换支持的内核后重跑）${N}"
+  fi
+
+  # --- qdisc 选择：fq 配合 BBR 的 pacing 效果最好，但同样可能未编译 ---
+  # 用 sysctl -w 依次探测 fq → fq_codel（写成功即代表内核支持该 qdisc；
+  # 这步顺带把全局 default_qdisc 设成选中值，与稍后写入配置文件的值一致）。
+  # 两者都不支持时留空，不写该行、保持内核默认。
+  qdisc_algo=""
+  modprobe sch_fq >/dev/null 2>&1 || true
+  for _q in fq fq_codel; do
+    if sysctl -w "net.core.default_qdisc=${_q}" >/dev/null 2>&1; then
+      qdisc_algo="$_q"
+      break
+    fi
+  done
+
   echo ""
   echo -e "${Y}==> 写入 ${region_label}/${mem_label} TCP 参数优化配置 (上限 $((buffer_max/1024/1024))M)...${N}"
 
@@ -4539,10 +4569,12 @@ apply_tcp_tuning(){
 # 偏好：交互流（网页 / 社交 / 流媒体），非吞吐党
 
 # --- 拥塞控制 + 调度 ---
-net.core.default_qdisc = fq
-net.ipv4.tcp_congestion_control = bbr
+${qdisc_algo:+net.core.default_qdisc = ${qdisc_algo}}
+net.ipv4.tcp_congestion_control = ${cc_algo}
 # TFO = 1 仅客户端方向；服务端在国内出口常被运营商干扰 cookie，
 # 首包失败比首包提前 1RTT 更常见，因此服务端关闭
+# 注意：本机 sing-box 入站也不要开 tcp_fast_open（服务端 accept 方向需 bit2，
+# 即此值需为 3 才生效）；两侧保持一致，避免节点开了 TFO 但内核未支撑的空配
 net.ipv4.tcp_fastopen = 1
 
 # --- 缓冲区 (按地区 BDP 与内存档计算) ---
@@ -4553,7 +4585,9 @@ net.core.rmem_default = 524288
 net.core.wmem_default = 524288
 net.ipv4.tcp_rmem = 16384 524288 ${buffer_max}
 net.ipv4.tcp_wmem = 16384 524288 ${buffer_max}
-# 路径不稳时偏 receiver 应用层 buffer，跨境丢包场景更跟手
+# adv_win_scale=2：内核按 space-(space>>2) 把约 3/4 划给接收窗口、1/4 留应用层
+# overhead（默认 1 是各半）。跨境高 BDP 下更大的接收窗口利于吃满带宽。
+# 注：6.x 内核逐步弱化此旋钮，长期留意
 net.ipv4.tcp_adv_win_scale = 2
 
 # --- 长连接 / 慢启动 / MTU ---
@@ -4609,12 +4643,27 @@ EOF
     return 1
   fi
 
+  # default_qdisc 只在「网卡注册时」读取；系统启动时 eth0 早已建好，
+  # 改这个值不会动现有网卡。这里对当前默认网卡手动 replace，让 fq 本次即生效
+  # （否则要等重启，用户跑完却仍是 pfifo_fast）。BBR 自带 pacing，缺 fq 不致命，
+  # 故 tc 失败只警告不算整体失败。
+  if [ -n "$qdisc_algo" ] && command -v tc >/dev/null 2>&1; then
+    iface=$(ip route show default 2>/dev/null | awk '/^default/ {print $5; exit}')
+    if [ -n "$iface" ]; then
+      if tc qdisc replace dev "$iface" root "$qdisc_algo" >/dev/null 2>&1; then
+        echo -e "${D}    已对 ${iface} 应用 ${qdisc_algo} qdisc（本次生效）${N}"
+      else
+        echo -e "${Y}    对 ${iface} 应用 ${qdisc_algo} qdisc 失败，重启后由 default_qdisc 生效${N}"
+      fi
+    fi
+  fi
+
   return 0
 }
 
 remove_tcp_tuning(){
   local confirm=""
-  local service_name route_line route_spec
+  local service_name route_line route_spec iface
 
   if ! require_root; then
     return 1
@@ -4642,6 +4691,13 @@ remove_tcp_tuning(){
   sysctl -w net.core.default_qdisc=pfifo_fast >/dev/null 2>&1 || true
   sysctl -w net.ipv4.tcp_congestion_control=cubic >/dev/null 2>&1 || true
   sysctl --system >/dev/null 2>&1 || true
+
+  # 与 apply 对称：default_qdisc 改回默认值不会动现有网卡，需对 live 网卡显式复位。
+  # 回退到 pfifo_fast（内核传统默认），失败仅忽略（可能内核无此 qdisc 或无 tc）
+  if command -v tc >/dev/null 2>&1; then
+    iface=$(ip route show default 2>/dev/null | awk '/^default/ {print $5; exit}')
+    [ -n "$iface" ] && tc qdisc replace dev "$iface" root pfifo_fast >/dev/null 2>&1 || true
+  fi
 
   # 配套撤销 initcwnd（apply_network_optimization 是把 TCP+initcwnd 当一组应用的，对称地撤）
   service_name=$(basename "$INITCWND_SERVICE_PATH")
@@ -4992,6 +5048,7 @@ apply_network_optimization(){
   local mem_tier="$2"
   local region_label initcwnd_value mem_label
   local buffer_max notsent_lowat fin_timeout
+  local live_cc live_iface live_qdisc
 
   if ! require_root; then return 1; fi
 
@@ -5047,7 +5104,15 @@ apply_network_optimization(){
   echo -e "  notsent     : ${C}$notsent_lowat${N}"
   echo -e "  fin_timeout : ${C}$fin_timeout${N}"
   echo -e "  initcwnd    : ${C}$initcwnd_value${N}"
-  echo -e "  qdisc / cc  : ${C}$(sysctl -n net.core.default_qdisc 2>/dev/null) / $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)${N}"
+  # 显示「实际生效」的拥塞算法与网卡 qdisc：cc 读运行值可反映 BBR 是否降级；
+  # qdisc 读 tc 实际值（而非全局 default_qdisc），避免误报 fq 已生效
+  live_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "?")
+  live_iface=$(ip route show default 2>/dev/null | awk '/^default/ {print $5; exit}')
+  if [ -n "$live_iface" ] && command -v tc >/dev/null 2>&1; then
+    live_qdisc=$(tc qdisc show dev "$live_iface" 2>/dev/null | awk 'NR==1 {print $2; exit}')
+  fi
+  [ -z "$live_qdisc" ] && live_qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null || echo "?")
+  echo -e "  qdisc / cc  : ${C}${live_qdisc} / ${live_cc}${N}${live_iface:+ ${D}(${live_iface})${N}}"
   echo -e "  配置文件    : ${C}$TCP_TUNING_PATH${N}"
   pause_screen
 }
@@ -5199,7 +5264,7 @@ show_quic_optimization_picker(){
 show_network_optimization_status(){
   local route_line initcwnd_current initrwnd_current initcwnd_enabled initcwnd_active
   local tcp_qdisc tcp_cc tcp_fastopen tcp_notsent tcp_fin_timeout tcp_keepalive
-  local tcp_config_status
+  local tcp_config_status tcp_qdisc_live status_iface
 
   echo ""
   echo -e "  ${B}${C}网络优化状态${N}"
@@ -5252,6 +5317,12 @@ show_network_optimization_status(){
   tcp_fin_timeout=$(sysctl -n net.ipv4.tcp_fin_timeout 2>/dev/null || echo "未知")
   tcp_keepalive=$(sysctl -n net.ipv4.tcp_keepalive_time 2>/dev/null || echo "未知")
 
+  # 默认网卡上「实际生效」的 qdisc（区别于全局 default_qdisc；后者改了不动现有网卡）
+  status_iface=$(printf '%s\n' "$route_line" | awk '/^default/ {print $5; exit}')
+  if [ -n "$status_iface" ] && command -v tc >/dev/null 2>&1; then
+    tcp_qdisc_live=$(tc qdisc show dev "$status_iface" 2>/dev/null | awk 'NR==1 {print $2; exit}')
+  fi
+
   local tcp_profile_text="未配置"
   local tcp_rmem_max
   tcp_rmem_max=$(sysctl -n net.core.rmem_max 2>/dev/null || echo "")
@@ -5290,8 +5361,8 @@ show_network_optimization_status(){
   if [ -n "$tcp_rmem_max" ] && [ "$tcp_rmem_max" -gt 0 ] 2>/dev/null; then
     echo -e "  rmem_max  : ${C}$((tcp_rmem_max / 1024 / 1024))M${N}"
   fi
-  echo -e "  qdisc     : ${C}$tcp_qdisc${N}"
-  echo -e "  BBR       : ${C}$tcp_cc${N}"
+  echo -e "  qdisc     : ${C}$tcp_qdisc${N}${tcp_qdisc_live:+ ${D}(${status_iface} 实际: ${tcp_qdisc_live})${N}}"
+  echo -e "  拥塞算法  : ${C}$tcp_cc${N}$([ "$tcp_cc" = "bbr" ] && printf ' %b(BBR)%b' "$G" "$N")"
   echo -e "  Fast Open : ${C}$tcp_fastopen${N}"
   echo -e "  notsent   : ${C}$tcp_notsent${N}"
   echo -e "  fin_timeout : ${C}$tcp_fin_timeout${N}"
@@ -5563,6 +5634,35 @@ get_latest_singbox_version(){
   ver=$(curl -fsSL --max-time 5 "https://api.github.com/repos/SagerNet/sing-box/releases/latest" 2>/dev/null \
         | sed -n 's/.*"tag_name":[[:space:]]*"v\{0,1\}\([^"]*\)".*/\1/p' | head -1)
   printf '%s' "$ver"
+}
+
+# 带缓存的「最新稳定版」查询：首页每次刷新都会调用它，不能每次都打 GitHub。
+# 命中且未过期 → 直接读缓存；过期/不存在 → 拉一次并写回。
+# 拉取失败时写空内容作为「负缓存」，短 TTL 内不再重试，避免每次刷新都卡 5 秒。
+get_latest_singbox_version_cached(){
+  local now mtime age content ttl ver
+  if [ -f "$SINGBOX_LATEST_CACHE" ]; then
+    now=$(date +%s 2>/dev/null || echo 0)
+    mtime=$(stat -c %Y "$SINGBOX_LATEST_CACHE" 2>/dev/null || echo 0)
+    age=$((now - mtime))
+    content=$(cat "$SINGBOX_LATEST_CACHE" 2>/dev/null)
+    if [ -n "$content" ]; then ttl="$SINGBOX_LATEST_TTL"; else ttl="$SINGBOX_LATEST_NEG_TTL"; fi
+    if [ "$now" -gt 0 ] && [ "$age" -ge 0 ] && [ "$age" -lt "$ttl" ]; then
+      printf '%s' "$content"
+      return 0
+    fi
+  fi
+  ver=$(get_latest_singbox_version)
+  printf '%s' "$ver" > "$SINGBOX_LATEST_CACHE" 2>/dev/null || true
+  printf '%s' "$ver"
+}
+
+# 版本严格小于比较：$1 < $2 返回 0（真）。依赖 sort -V（coreutils，Debian/Ubuntu 自带）。
+_singbox_ver_lt(){
+  [ "$1" = "$2" ] && return 1
+  local first
+  first=$(printf '%s\n%s\n' "$1" "$2" | sort -V 2>/dev/null | head -1)
+  [ "$first" = "$1" ]
 }
 
 get_current_singbox_version(){
@@ -9366,6 +9466,30 @@ render_realm_card_line(){
   render_card_line " ${C}✧${N} ${C}${label}${N}${C}v${ver}${N} ${D}·${N} ${status_str} ${D}·${N} ${C}${count}${N} ${D}条规则${N}"
 }
 
+# sing-box 内核版本行：当前版本 vs 最新稳定版（GitHub releases/latest 只返回稳定版）
+# 最新版走带缓存的查询，首页反复刷新也不会每次都打 GitHub。
+render_singbox_version_card_line(){
+  local label="内核版本   "  # 11 可见列
+  if ! is_singbox_installed; then
+    return  # 未安装时标题栏已显示「未安装」，此处不再重复
+  fi
+  local cur latest
+  cur=$(get_current_singbox_version 2>/dev/null)
+  [ -z "$cur" ] && cur="?"
+  latest=$(get_latest_singbox_version_cached 2>/dev/null)
+  if [ -z "$latest" ]; then
+    render_card_line " ${C}✦${N} ${C}${label}${N}${C}v${cur}${N} ${D}·${N} ${D}最新版待联网${N}"
+  elif [ "$cur" = "$latest" ]; then
+    render_card_line " ${C}✦${N} ${C}${label}${N}${C}v${cur}${N} ${D}·${N} ${G}已是最新${N}"
+  elif _singbox_ver_lt "$cur" "$latest"; then
+    render_card_line " ${C}✦${N} ${C}${label}${N}${C}v${cur}${N} ${Y}→${N} ${G}v${latest}${N} ${Y}可升级${N}"
+  else
+    # 当前版本比稳定版新（装了 alpha/beta 预览版）
+    render_card_line " ${C}✦${N} ${C}${label}${N}${C}v${cur}${N} ${D}·${N} ${D}稳定版 v${latest}${N}"
+  fi
+  render_card_blank
+}
+
 render_main_menu_card(){
   local ver status status_str title
   if is_singbox_installed; then
@@ -9385,6 +9509,7 @@ render_main_menu_card(){
   title="${B}${C}管理菜单${N} ${D}·${N} ${C}v${ver}${N}"
   render_card_top "$title" "$status_str"
   render_card_blank
+  render_singbox_version_card_line
   render_node_card_block reality
   render_card_blank
   render_node_card_block hy2
