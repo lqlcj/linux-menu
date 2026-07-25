@@ -133,10 +133,28 @@ warp_jq_apply(){
   mv "$tmp" "$CONFIG_PATH"
 }
 
+# 读当前配置里 WARP endpoint 实际使用的 host port（没有则回退默认值）
+# 用途：重新注入/重新注册时保留「端点优选」选过的地址，不被默认值覆盖
+warp_current_endpoint(){
+  local ep=""
+  if command -v jq >/dev/null 2>&1 && [ -f "$CONFIG_PATH" ]; then
+    ep=$(jq -r --arg tag "$WARP_OUTBOUND_TAG" '
+      (.endpoints // [])[] | select(.tag == $tag) | .peers[0] | "\(.address) \(.port)"
+    ' "$CONFIG_PATH" 2>/dev/null | head -1)
+  fi
+  case "$ep" in
+    *null*|"") printf '%s %s' "$WARP_ENDPOINT_HOST" "$WARP_ENDPOINT_PORT" ;;
+    *)         printf '%s' "$ep" ;;
+  esac
+}
+
 warp_config_inject(){
   local v4="$1" v6="$2" pk="$3"
   ensure_jq || return 1
   [ -f "$CONFIG_PATH" ] || { warp_log_err "config.json 不存在：$CONFIG_PATH"; return 1; }
+  # 骨架兜底：保证 dns local 解析器 + route.default_domain_resolver 存在
+  # （WireGuard endpoint 是用户态网络栈，拨域名必须有内部解析器，否则命中规则的流量全断）
+  config_ensure_skeleton || return 1
 
   local addr_json
   if [ -n "$v6" ]; then
@@ -144,6 +162,9 @@ warp_config_inject(){
   else
     addr_json=$(jq -nc --arg a "$v4" '[$a]')
   fi
+
+  local host port
+  read -r host port <<< "$(warp_current_endpoint)"
 
   warp_log_info "注入 WARP endpoint / 规则集 / 路由规则..."
   warp_jq_apply '
@@ -165,7 +186,7 @@ warp_config_inject(){
             }]
           }]
     | .route = (.route // {})
-    | .route.rule_set = ((.route.rule_set // []) | map(select(.tag != $rs)))
+    | .route.rule_set = ((.route.rule_set // []) | map(select(.tag != $rs and .tag != $rsyt)))
         + [{
             "type": "remote",
             "tag": $rs,
@@ -173,23 +194,34 @@ warp_config_inject(){
             "url": $rsurl,
             "download_detour": "direct-out",
             "update_interval": "168h0m0s"
+          },
+          {
+            "type": "remote",
+            "tag": $rsyt,
+            "format": "binary",
+            "url": $rsurlyt,
+            "download_detour": "direct-out",
+            "update_interval": "168h0m0s"
           }]
     | .route.rules = (
-        ((.route.rules // []) | map(select((.outbound // "") != $tag)))
-        + [{"rule_set": [$rs], "outbound": $tag}]
+        [{"action": "sniff"}]
+        + ((.route.rules // []) | map(select(((.outbound // "") != $tag) and ((.action // "") != "sniff"))))
+        + [{"rule_set": [$rs, $rsyt], "outbound": $tag}]
       )
     | .experimental = (.experimental // {})
     | .experimental.cache_file = (.experimental.cache_file // {"enabled": true, "path": "/var/lib/sing-box/cache.db"})
   ' \
-    --arg tag    "$WARP_OUTBOUND_TAG" \
-    --arg rs     "$WARP_RULESET_TAG" \
-    --arg rsurl  "$WARP_RULESET_URL" \
-    --arg host   "$WARP_ENDPOINT_HOST" \
-    --arg port   "$WARP_ENDPOINT_PORT" \
-    --arg mtu    "$WARP_MTU" \
-    --arg pk     "$pk" \
-    --arg peerpk "$WARP_PEER_PUBLIC_KEY" \
-    --arg addrs  "$addr_json"
+    --arg tag     "$WARP_OUTBOUND_TAG" \
+    --arg rs      "$WARP_RULESET_TAG" \
+    --arg rsyt    "$WARP_RULESET_TAG_YT" \
+    --arg rsurl   "$WARP_RULESET_URL" \
+    --arg rsurlyt "$WARP_RULESET_URL_YT" \
+    --arg host    "$host" \
+    --arg port    "$port" \
+    --arg mtu     "$WARP_MTU" \
+    --arg pk      "$pk" \
+    --arg peerpk  "$WARP_PEER_PUBLIC_KEY" \
+    --arg addrs   "$addr_json"
 }
 
 warp_config_remove(){
@@ -198,11 +230,12 @@ warp_config_remove(){
   warp_jq_apply '
       .endpoints = ((.endpoints // []) | map(select(.tag != $tag)))
     | .route = (.route // {})
-    | .route.rule_set = ((.route.rule_set // []) | map(select(.tag != $rs)))
-    | .route.rules = ((.route.rules // []) | map(select((.outbound // "") != $tag)))
+    | .route.rule_set = ((.route.rule_set // []) | map(select(.tag != $rs and .tag != $rsyt)))
+    | .route.rules = ((.route.rules // []) | map(select(((.outbound // "") != $tag) and ((.action // "") != "sniff"))))
   ' \
-    --arg tag "$WARP_OUTBOUND_TAG" \
-    --arg rs  "$WARP_RULESET_TAG"
+    --arg tag  "$WARP_OUTBOUND_TAG" \
+    --arg rs   "$WARP_RULESET_TAG" \
+    --arg rsyt "$WARP_RULESET_TAG_YT"
 }
 
 warp_config_has_outbound(){
@@ -225,9 +258,10 @@ warp_do_install(){
   ensure_jq || return 1
 
   render_section_header "${WARP_APP_NAME} - 安装"
-  echo -e "  ${D}本模块只修改 /etc/sing-box/config.json，加一个 WireGuard 出站${N}"
-  echo -e "  ${D}并把 geosite:google 命中的流量改走 Cloudflare WARP，其它保持直连。${N}"
-  echo -e "  ${D}不会动 DNS / iptables / 系统路由${N}"
+  echo -e "  ${D}本模块只修改 /etc/sing-box/config.json，加一个 WireGuard 出站，${N}"
+  echo -e "  ${D}并把 geosite google/youtube 命中的流量改走 Cloudflare WARP，其它保持直连。${N}"
+  echo -e "  ${D}同时开启域名嗅探（QUIC/TLS SNI），保证按 IP 直连的流量也能命中规则。${N}"
+  echo -e "  ${D}不会动 iptables / 系统路由${N}"
   echo ""
 
   warp_install_wgcf     || { pause_screen; return 1; }
@@ -310,10 +344,14 @@ warp_do_status(){
   fi
 
   if warp_config_has_rule; then
-    render_info_line "路由规则" "${G}已生效（geosite:google → ${WARP_OUTBOUND_TAG}）${N}"
+    render_info_line "路由规则" "${G}已生效（google/youtube → ${WARP_OUTBOUND_TAG}）${N}"
   else
     render_info_line "路由规则" "${R}未生效${N}"
   fi
+
+  local ep_host ep_port
+  read -r ep_host ep_port <<< "$(warp_current_endpoint)"
+  render_info_line "端点" "${ep_host}:${ep_port}"
 
   if [ -f "$WARP_WGCF_ACCOUNT" ]; then
     render_info_line "WARP 账号" "${G}已注册${N} ${D}($(stat -c %y "$WARP_WGCF_ACCOUNT" 2>/dev/null | cut -d. -f1))${N}"
@@ -330,16 +368,89 @@ warp_do_status(){
   echo ""
   warp_log_info "config.json 中的 WARP 相关片段："
   if command -v jq >/dev/null 2>&1 && [ -f "$CONFIG_PATH" ]; then
-    jq --arg tag "$WARP_OUTBOUND_TAG" --arg rs "$WARP_RULESET_TAG" '
+    jq --arg tag "$WARP_OUTBOUND_TAG" --arg rs "$WARP_RULESET_TAG" --arg rsyt "$WARP_RULESET_TAG_YT" '
       {
-        endpoint: (.endpoints // [] | map(select(.tag == $tag)) | .[0] // null),
-        rule_set: (.route.rule_set // [] | map(select(.tag == $rs)) | .[0] // null),
-        rule:     (.route.rules // [] | map(select((.outbound // "") == $tag)) | .[0] // null)
+        endpoint:  (.endpoints // [] | map(select(.tag == $tag)) | .[0] // null),
+        rule_sets: (.route.rule_set // [] | map(select(.tag == $rs or .tag == $rsyt)) | map(.tag)),
+        rule:      (.route.rules // [] | map(select((.outbound // "") == $tag)) | .[0] // null)
       }
     ' "$CONFIG_PATH" 2>/dev/null | sed 's/^/    /'
   fi
 
   pause_screen
+}
+
+# 真实隧道自检：起一个临时 sing-box 实例（socks 入站 + 同款 WireGuard endpoint），
+# 经隧道 curl Cloudflare trace。成功把 trace 内容打到 stdout 并返回 0。
+# 注意：与主进程共用同一 WARP 账号，并发握手会漂移，测试期间主配置分流可能短暂中断。
+warp_probe_via_tunnel(){
+  local host="$1" port="$2"
+  local kv
+  kv=$(warp_parse_profile) || return 1
+  local WARP_PRIVATE_KEY WARP_LOCAL_V4 WARP_LOCAL_V6
+  eval "$kv"
+
+  local addr_json
+  if [ -n "$WARP_LOCAL_V6" ]; then
+    addr_json=$(jq -nc --arg a "$WARP_LOCAL_V4" --arg b "$WARP_LOCAL_V6" '[$a, $b]')
+  else
+    addr_json=$(jq -nc --arg a "$WARP_LOCAL_V4" '[$a]')
+  fi
+
+  local tmpcfg plog sport pid="" try
+  tmpcfg=$(mktemp)
+  plog=$(mktemp)
+  for try in 1 2 3; do
+    sport=$(( (RANDOM % 20000) + 30000 ))
+    jq -n \
+      --arg host "$host" --arg port "$port" \
+      --arg pk "$WARP_PRIVATE_KEY" --arg peerpk "$WARP_PEER_PUBLIC_KEY" \
+      --arg addrs "$addr_json" --arg mtu "$WARP_MTU" \
+      --argjson sport "$sport" '
+      {
+        "log": {"disabled": false, "level": "error"},
+        "dns": {"servers": [{"type": "local", "tag": "dns-local"}]},
+        "inbounds": [{"type": "socks", "tag": "probe-in", "listen": "127.0.0.1", "listen_port": $sport}],
+        "endpoints": [{
+          "type": "wireguard", "tag": "warp-probe", "system": false,
+          "mtu": ($mtu | tonumber), "address": ($addrs | fromjson), "private_key": $pk,
+          "peers": [{
+            "address": $host, "port": ($port | tonumber), "public_key": $peerpk,
+            "allowed_ips": ["0.0.0.0/0", "::/0"], "reserved": [0, 0, 0]
+          }]
+        }],
+        "route": {"final": "warp-probe", "default_domain_resolver": "dns-local"}
+      }' > "$tmpcfg" 2>/dev/null || { rm -f "$tmpcfg" "$plog"; return 1; }
+    sing-box run -c "$tmpcfg" >"$plog" 2>&1 &
+    pid=$!
+    sleep 1
+    kill -0 "$pid" 2>/dev/null && break
+    pid=""   # 端口被占等启动失败，换个端口重试
+  done
+  if [ -z "$pid" ]; then
+    warp_log_err "临时 sing-box 实例启动失败："
+    tail -5 "$plog" | sed 's/^/    /' >&2
+    rm -f "$tmpcfg" "$plog"
+    return 1
+  fi
+
+  # socks5://（非 socks5h）让 curl 在本机解析域名，探测不依赖隧道内 DNS
+  local trace rc
+  trace=$(curl -4 -fsS --max-time 12 -x "socks5://127.0.0.1:${sport}" \
+            https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null)
+  rc=$?
+  kill "$pid" 2>/dev/null
+  wait "$pid" 2>/dev/null
+  if [ "$rc" -ne 0 ] || [ -z "$trace" ]; then
+    if [ -s "$plog" ]; then
+      warp_log_warn "临时实例日志（最后几行）："
+      tail -3 "$plog" | sed 's/^/    /' >&2
+    fi
+    rm -f "$tmpcfg" "$plog"
+    return 1
+  fi
+  rm -f "$tmpcfg" "$plog"
+  printf '%s\n' "$trace"
 }
 
 warp_do_test(){
@@ -351,12 +462,33 @@ warp_do_test(){
     sing-box check -c "$CONFIG_PATH" 2>&1 | sed 's/^/    /'
   fi
 
-  warp_log_info "Cloudflare WARP 自检（VPS 本机直连，仅判断 wgcf 注册是否成功）："
-  local trace cf_warp
-  trace=$(curl -4 -fsS --max-time 8 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null)
-  cf_warp=$(echo "$trace" | awk -F= '/^warp=/ {print $2}')
-  if [ -n "$cf_warp" ]; then
-    echo -e "    本机直连 cloudflare：warp=${cf_warp}（${D}本机不走 WARP 是预期，因为分流只对 sing-box 客户端生效${N}）"
+  local host port
+  read -r host port <<< "$(warp_current_endpoint)"
+
+  echo ""
+  warp_log_info "WARP 隧道自检：起临时实例，真实经 ${host}:${port} 走一次隧道（约 10 秒）..."
+  echo -e "  ${D}与主服务共用同一 WARP 账号，测试期间分流可能短暂抖动，属正常${N}"
+  local trace
+  if trace=$(warp_probe_via_tunnel "$host" "$port"); then
+    local w ip loc colo
+    w=$(printf '%s\n' "$trace"    | awk -F= '/^warp=/ {print $2}')
+    ip=$(printf '%s\n' "$trace"   | awk -F= '/^ip=/   {print $2}')
+    loc=$(printf '%s\n' "$trace"  | awk -F= '/^loc=/  {print $2}')
+    colo=$(printf '%s\n' "$trace" | awk -F= '/^colo=/ {print $2}')
+    warp_log_ok "隧道可用：warp=${w:-?}  出口IP=${ip:-?}  区域=${loc:-?}  PoP=${colo:-?}"
+    case "$loc" in
+      CN|HK|MO|RU)
+        warp_log_warn "出口区域 ${loc} 在 Gemini 的不服务名单里，Gemini 仍会拒绝（油管不受影响）"
+        echo -e "  ${D}免费 WARP 出口 PoP 由 anycast 路由决定，「重新注册」基本换不了区域；${N}"
+        echo -e "  ${D}想真正选区：上 Cloudflare Zero Trust（免费 50 用户）在 device profile 选 PoP，${N}"
+        echo -e "  ${D}或用甬哥 warp-yg 的端点优选：https://github.com/yonggekkk/warp-yg${N}"
+        ;;
+    esac
+  else
+    warp_log_err "WARP 隧道不通（握手失败或无数据）"
+    echo -e "  ${D}最常见原因：本机到 Cloudflare 的 UDP ${port} 被封或严重丢包${N}"
+    echo -e "  ${D}处理：菜单「4 端点优选」自动扫描候选 IP:端口；若全部不通，${N}"
+    echo -e "  ${D}说明本机 UDP 出网被封，WireGuard/WARP 方案在这台机器不可行${N}"
   fi
 
   echo ""
@@ -365,15 +497,74 @@ warp_do_test(){
   echo -e "  ${D}2.${N} 浏览器开 https://www.google.com/search?q=my+ip — Google 应显示 Cloudflare WARP 出口位置"
   echo -e "  ${D}3.${N} 浏览器开 https://gemini.google.com — 应能正常加载"
   echo -e "  ${D}4.${N} 看 sing-box 日志：journalctl -u sing-box -f  — 命中规则的请求会显示 outbound=${WARP_OUTBOUND_TAG}"
+}
 
+# 端点优选：逐个测试候选 IP:端口，第一个能通的写入配置并重启
+# 适用：默认端点 162.159.192.1:2408 的 UDP 被封/丢包严重时
+warp_do_endpoint_pick(){
+  require_root || return 1
+  render_section_header "${WARP_APP_NAME} - 端点优选"
+  if ! warp_config_has_outbound; then
+    warp_log_err "尚未安装 WARP 分流，请先安装"
+    pause_screen
+    return 1
+  fi
+  echo -e "  ${D}逐个真实测试候选端点（每个最多约 15 秒），第一个能通的写入配置${N}"
+  echo -e "  ${D}测试期间 WARP 分流可能短暂中断，完成后自动恢复${N}"
   echo ""
-  warp_log_info "${B}如果出口区域不理想（比如落到德国延迟高）${N}"
-  echo -e "  ${D}免费 WARP 走 Cloudflare anycast，出口 PoP 由 BGP 路由决定，${N}"
-  echo -e "  ${D}用户侧不可控选区。当前可用的折腾途径：${N}"
-  echo -e "  ${D}  - 多次「3 重新注册账号」碰运气（不同 client-id 在 Cloudflare 内部 hash 不同）${N}"
-  echo -e "  ${D}  - 想真正选区：上 Cloudflare Zero Trust 注册 Teams 账户（免费 50 用户），${N}"
-  echo -e "  ${D}    在 device profile 里能选 PoP；或用甬哥 warp-yg 的端点优选脚本：${N}"
-  echo -e "  ${D}    https://github.com/yonggekkk/warp-yg${N}"
+
+  local cand host port trace
+  for cand in $WARP_ENDPOINT_CANDIDATES; do
+    host="${cand%:*}"
+    port="${cand##*:}"
+    warp_log_info "测试 ${cand} ..."
+    if trace=$(warp_probe_via_tunnel "$host" "$port"); then
+      warp_log_ok "可用：${cand}"
+      if ! warp_jq_apply '
+          .endpoints = ((.endpoints // []) | map(
+            if .tag == $tag
+            then (.peers[0].address = $host | .peers[0].port = ($port | tonumber))
+            else . end))
+        ' --arg tag "$WARP_OUTBOUND_TAG" --arg host "$host" --arg port "$port"; then
+        warp_log_err "写入配置失败"
+        pause_screen
+        return 1
+      fi
+      if config_check_and_restart; then
+        warp_log_ok "已切换端点为 ${cand} 并重启 sing-box"
+      else
+        warp_log_err "sing-box 重启失败，请用 journalctl -u sing-box 查看"
+      fi
+      pause_screen
+      return 0
+    fi
+    warp_log_warn "不通：${cand}"
+  done
+
+  warp_log_err "所有候选端点都不通 —— 本机到 Cloudflare 的 UDP 大概率被整段封锁"
+  echo -e "  ${D}WireGuard 只能走 UDP，没法换 TCP；这台机器上 WARP 方案基本不可行，${N}"
+  echo -e "  ${D}建议换机，或改用「解锁 DNS / 落地中转」类方案${N}"
+  pause_screen
+}
+
+# 重新注入分流规则：不动账号，只按当前版本的模板重写 endpoint/规则集/路由规则
+# 适用：老版本装的 WARP（缺 YouTube 规则集、缺域名嗅探、缺 DNS 解析器）升级修复
+warp_do_reinject(){
+  require_root || return 1
+  render_section_header "${WARP_APP_NAME} - 重新注入分流规则"
+  echo -e "  ${D}用途：升级旧配置（补 YouTube 规则集 / 域名嗅探 / DNS 解析器）或修复被改坏的规则${N}"
+  echo -e "  ${D}不改 WARP 账号，不改已优选的端点${N}"
+  echo ""
+
+  local kv
+  kv=$(warp_parse_profile) || { pause_screen; return 1; }
+  eval "$kv"
+
+  warp_config_inject "$WARP_LOCAL_V4" "$WARP_LOCAL_V6" "$WARP_PRIVATE_KEY" \
+    || { pause_screen; return 1; }
+  config_check_and_restart && warp_log_ok "规则已重新注入，sing-box 已重启" \
+                          || warp_log_err "sing-box 重启失败，请用 journalctl -u sing-box 查看"
+  pause_screen
 }
 
 show_warp_menu(){
@@ -396,7 +587,7 @@ show_warp_menu(){
     warp_config_has_outbound && installed=1
 
     if [ "$installed" = "1" ]; then
-      render_info_line "状态" "${G}已启用（geosite:google → WARP）${N}"
+      render_info_line "状态" "${G}已启用（google/youtube → WARP）${N}"
     else
       render_info_line "状态" "${Y}未启用${N}"
     fi
@@ -404,8 +595,10 @@ show_warp_menu(){
 
     if [ "$installed" = "1" ]; then
       render_menu_item 1 "查看状态"
-      render_menu_item 2 "测试连通性"
+      render_menu_item 2 "测试连通性 ${D}（真实走一次 WARP 隧道）${N}"
       render_menu_item 3 "重新注册 WARP 账号 ${D}（换 WARP IP）${N}"
+      render_menu_item 4 "端点优选 ${D}（隧道不通时自动换可用 IP:端口）${N}"
+      render_menu_item 5 "重新注入分流规则 ${D}（升级旧配置 / 修复规则）${N}"
       render_menu_item 9 "卸载"
     else
       render_menu_item 1 "安装 ${WARP_APP_NAME}"
@@ -428,6 +621,8 @@ show_warp_menu(){
       1) warp_do_status ;;
       2) render_section_header "${WARP_APP_NAME} - 测试"; warp_do_test; pause_screen ;;
       3) warp_do_reregister ;;
+      4) warp_do_endpoint_pick ;;
+      5) warp_do_reinject ;;
       9) warp_do_uninstall ;;
       0) return ;;
       *) notify_invalid_choice ;;

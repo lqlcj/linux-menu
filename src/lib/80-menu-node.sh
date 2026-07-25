@@ -196,7 +196,8 @@ show_update_menu(){
 }
 
 check_reality_dest_domain(){
-  local domain ips ip ipn org cdn_match handshake proto x25 alpn cipher
+  local domain ips ip ipn org cdn_match proto x25 pq alpn cipher
+  local v4s v6s vps_has_v6 conn hs1 hs2 hs3
   local cert_san cert_match=0 san san_value suffix
   local any_fail=0 fastest=999 t i testip
   local CDN_BLACKLIST="Cloudflare|Fastly|Akamai|CloudFront|Amazon|Microsoft|Google|Azure|Incapsula|Imperva"
@@ -230,7 +231,17 @@ check_reality_dest_domain(){
     return 1
   fi
   ipn=$(echo "$ips" | wc -l | tr -d ' ')
-  ip=$(echo "$ips" | head -1)
+  # 深度测试优先用 IPv4：reality 握手由 VPS 发起，v4-only 机器上测 v6 地址只会误报
+  v4s=$(echo "$ips" | grep -v ':' || true)
+  v6s=$(echo "$ips" | grep ':' || true)
+  ip=$(echo "$v4s" | head -1)
+  [ -z "$ip" ] && ip=$(echo "$v6s" | head -1)
+  vps_has_v6=$(detect_primary_ipv6 2>/dev/null || true)
+  # openssl -connect 的 IPv6 地址必须带方括号
+  case "$ip" in
+    *:*) conn="[$ip]:443" ;;
+    *)   conn="$ip:443" ;;
+  esac
   if [ "$ipn" -le 3 ]; then
     echo -e "    ${G}✓${N} 解析到 ${C}${ipn}${N} 个 IP："
   else
@@ -253,10 +264,10 @@ check_reality_dest_domain(){
     echo -e "    ${G}✓ $org${N}"
   fi
 
-  # 3. TCP 443 通断（所有 IP）
+  # 3. TCP 443 通断（v4 全测；v6 仅在本机有 IPv6 时测，否则测了必失败、纯属误报）
   echo ""
   echo -e "  ${B}[3/6] TCP 443 通断${N}"
-  for testip in $ips; do
+  for testip in $v4s; do
     if timeout 3 bash -c "echo > /dev/tcp/$testip/443" 2>/dev/null; then
       echo -e "    ${G}✓${N} $testip"
     else
@@ -264,27 +275,50 @@ check_reality_dest_domain(){
       any_fail=1
     fi
   done
+  if [ -n "$v6s" ]; then
+    if [ -n "$vps_has_v6" ]; then
+      for testip in $v6s; do
+        if timeout 3 bash -c "echo > /dev/tcp/$testip/443" 2>/dev/null; then
+          echo -e "    ${G}✓${N} $testip"
+        else
+          echo -e "    ${R}✗${N} $testip"
+          any_fail=1
+        fi
+      done
+    else
+      echo -e "    ${D}本机无 IPv6，跳过 $(echo "$v6s" | wc -l | tr -d ' ') 个 v6 地址（不影响判定）${N}"
+    fi
+  fi
 
-  # 4. TLS 1.3 + X25519 + ALPN
+  # 4. TLS 1.3 / X25519 / ALPN —— 分两次握手，才能区分「不支持 1.3」和「不支持 X25519」
   echo ""
   echo -e "  ${B}[4/6] TLS 1.3 + X25519 + ALPN（IP=${ip}）${N}"
-  handshake=$(echo | timeout 5 openssl s_client -connect "$ip:443" -servername "$domain" \
-                -tls1_3 -groups X25519 -alpn h2,http/1.1 2>/dev/null)
-  proto=$(echo "$handshake" | grep -m1 -oE 'TLSv1\.[0-9]+')
-  x25=$(echo "$handshake" | grep -q 'X25519' && echo yes || echo no)
-  alpn=$(echo "$handshake" | grep -m1 -oE 'ALPN protocol: \S+' | awk '{print $3}')
-  cipher=$(echo "$handshake" | grep -m1 -oE 'Cipher\s*:\s*\S+' | awk -F'[: ]+' '{print $NF}')
+  hs1=$(echo | timeout 5 openssl s_client -connect "$conn" -servername "$domain" \
+          -tls1_3 -alpn h2,http/1.1 2>/dev/null)
+  proto=$(echo "$hs1" | grep -m1 -oE 'TLSv1\.[0-9]+')
+  alpn=$(echo "$hs1" | grep -m1 -oE 'ALPN protocol: \S+' | awk '{print $3}')
+  cipher=$(echo "$hs1" | grep -m1 -oE 'Cipher\s*:\s*\S+' | awk -F'[: ]+' '{print $NF}')
 
   if [ "$proto" = "TLSv1.3" ]; then
     echo -e "    ${G}✓${N} Protocol: TLSv1.3"
   else
     echo -e "    ${R}✗${N} Protocol: ${proto:-握手失败} ${R}(reality 强制 TLS 1.3)${N}"
   fi
+
+  # 只提供 X25519 一个组再握手：能协商成功即支持（比 grep 输出关键字可靠，
+  # 不同 openssl 版本对协商组的输出格式不一致）
+  x25=no
+  if [ "$proto" = "TLSv1.3" ]; then
+    hs2=$(echo | timeout 5 openssl s_client -connect "$conn" -servername "$domain" \
+            -tls1_3 -groups X25519 2>/dev/null)
+    echo "$hs2" | grep -qE 'New, TLSv1\.3|Protocol[[:space:]]*:[[:space:]]*TLSv1\.3' && x25=yes
+  fi
   if [ "$x25" = "yes" ]; then
     echo -e "    ${G}✓${N} X25519 密钥交换支持"
   else
     echo -e "    ${R}✗${N} X25519 ${R}不支持（reality 默认密钥交换）${N}"
   fi
+
   case "$alpn" in
     h2)        echo -e "    ${G}✓${N} ALPN: h2 (HTTP/2，最现代)" ;;
     http/1.1)  echo -e "    ${Y}△${N} ALPN: http/1.1 (可用但伪装稍弱)" ;;
@@ -295,10 +329,30 @@ check_reality_dest_domain(){
     echo -e "    ${C}  Cipher: $cipher${N}"
   fi
 
+  # 信息项：抗量子混合组（Chrome 已默认在 ClientHello 里带，dest 支持算伪装加分）
+  # 不参与综合判定；本机 openssl < 3.5 不认识该组名时跳过
+  pq=skip
+  if [ "$proto" = "TLSv1.3" ]; then
+    hs3=$(echo | timeout 5 openssl s_client -connect "$conn" -servername "$domain" \
+            -tls1_3 -groups X25519MLKEM768 2>&1)
+    if echo "$hs3" | grep -qE 'New, TLSv1\.3|Protocol[[:space:]]*:[[:space:]]*TLSv1\.3'; then
+      pq=yes
+    elif echo "$hs3" | grep -qiE 'no such group|unknown group|unknown option|invalid argument|Error with command|SSL_CONF_cmd|failed to set'; then
+      pq=skip
+    else
+      pq=no
+    fi
+  fi
+  case "$pq" in
+    yes)  echo -e "    ${G}✓${N} 抗量子混合组 X25519MLKEM768 ${D}(加分项，更贴近真实 Chrome 流量)${N}" ;;
+    no)   echo -e "    ${D}△ 抗量子混合组不支持（信息项，不影响判定）${N}" ;;
+    skip) echo -e "    ${D}? 本机 openssl 过旧，无法检测抗量子组（不影响判定）${N}" ;;
+  esac
+
   # 5. 证书 SAN
   echo ""
   echo -e "  ${B}[5/6] 证书 SAN 是否覆盖该域名${N}"
-  cert_san=$(echo | timeout 5 openssl s_client -connect "$ip:443" -servername "$domain" 2>/dev/null \
+  cert_san=$(echo | timeout 5 openssl s_client -connect "$conn" -servername "$domain" 2>/dev/null \
               | openssl x509 -noout -ext subjectAltName 2>/dev/null \
               | grep -oE 'DNS:[^,]+' | tr -d ' ' | head -10)
   if [ -n "$cert_san" ]; then
@@ -351,8 +405,10 @@ EOF
   echo -e "  ${B}综合判定${N}"
   if [ -n "$cdn_match" ]; then
     echo -e "    ${R}✗ 不可用 — 命中 CDN/云厂商黑名单（$cdn_match）${N}"
-  elif [ "$proto" != "TLSv1.3" ] || [ "$x25" != "yes" ]; then
-    echo -e "    ${R}✗ 不可用 — TLS 1.3 + X25519 不满足${N}"
+  elif [ "$proto" != "TLSv1.3" ]; then
+    echo -e "    ${R}✗ 不可用 — 不支持 TLS 1.3（reality 硬性要求）${N}"
+  elif [ "$x25" != "yes" ]; then
+    echo -e "    ${R}✗ 不可用 — 不支持 X25519 密钥交换（reality 硬性要求）${N}"
   elif [ "$any_fail" = "1" ]; then
     echo -e "    ${Y}△ 慎用 — 有 IP 不通，可能成为定时炸弹（参考 tmu.ac.jp 案例）${N}"
   elif [ "$ipn" -gt 3 ]; then

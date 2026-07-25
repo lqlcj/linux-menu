@@ -63,10 +63,14 @@ WARP_WGCF_RELEASE_API="https://api.github.com/repos/ViRb3/wgcf/releases/latest"
 WARP_OUTBOUND_TAG="warp-out"
 WARP_RULESET_TAG="geosite-google"
 WARP_RULESET_URL="https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-google.srs"
+WARP_RULESET_TAG_YT="geosite-youtube"
+WARP_RULESET_URL_YT="https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-youtube.srs"
 WARP_PEER_PUBLIC_KEY="bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo="
 WARP_ENDPOINT_HOST="162.159.192.1"
 WARP_ENDPOINT_PORT="2408"
 WARP_MTU="1280"
+# 端点优选候选（host:port，均为 Cloudflare WARP 官方段；WireGuard 仅 UDP）
+WARP_ENDPOINT_CANDIDATES="162.159.192.1:2408 162.159.193.10:2408 188.114.96.1:2408 188.114.97.1:2408 162.159.192.1:500 162.159.192.1:894 162.159.192.1:1701 162.159.192.1:4500 162.159.193.10:943"
 
 # ─── 颜色 ────────────────────────────────────────────
 G="\033[32m" Y="\033[33m" C="\033[36m" R="\033[31m" B="\033[1m" N="\033[0m"
@@ -1243,13 +1247,13 @@ detect_primary_ipv6(){
 describe_install_mode(){
   case "$1" in
     ipv6-in-ipv4-out)
-      printf '%s' '仅 IPv6 入站 + 仅 IPv4 出站'
+      printf '%s' '仅 IPv6 入站'
       ;;
     dualstack)
-      printf '%s' '双栈入站 + 仅 IPv4 出站'
+      printf '%s' '双栈入站'
       ;;
     *)
-      printf '%s' '仅 IPv4 入站 + 仅 IPv4 出站'
+      printf '%s' '仅 IPv4 入站'
       ;;
   esac
 }
@@ -1743,13 +1747,15 @@ config_ensure_skeleton(){
     cat > "$CONFIG_PATH" <<'EOF'
 {
   "log": {"disabled": false, "level": "warn", "timestamp": true},
+  "dns": {"servers": [{"type": "local", "tag": "dns-local"}]},
   "inbounds": [],
   "outbounds": [{
     "type": "direct",
     "tag": "direct-out"
   }],
   "route": {
-    "final": "direct-out"
+    "final": "direct-out",
+    "default_domain_resolver": "dns-local"
   }
 }
 EOF
@@ -1758,14 +1764,17 @@ EOF
 
   local tmp
   tmp=$(mktemp)
-  # 透明升级（不再托管 DNS，交给系统 resolv.conf）：
-  # 1) 清理老脚本残留的 dns 块、hijack-dns 规则、domain_resolver 字段
+  # 透明升级：
+  # 1) DNS 只保留一个 local 解析器（走系统 resolv.conf），不做任何劫持/分流；
+  #    清理老脚本残留的 hijack-dns 规则与出站级 domain_resolver
+  #    （sing-box 1.12+ 用户态出站如 WireGuard endpoint 拨域名必须有内部解析器，
+  #      否则运行时报 missing domain resolver，流量全断）
   # 2) 若没 outbounds 或为空，建一条 tagged direct-out
   # 3) 若 direct outbound 没 tag，加上 tag=direct-out
-  # 4) 确保 route 块存在，final 默认 direct-out
+  # 4) 确保 route 块存在，final 默认 direct-out，default_domain_resolver 指向 local
   if jq '
       .log = (.log // {"disabled": false, "level": "warn", "timestamp": true})
-    | del(.dns)
+    | .dns = {"servers": [{"type": "local", "tag": "dns-local"}]}
     | .inbounds = ((.inbounds // []) | map(select(.tag == "reality-in" or .tag == "hy2-in" or .tag == "anytls-in" or .tag == "tuic-in" or .tag == "ss2022-in")))
     | .outbounds = (if ((.outbounds // []) | length) == 0
                     then [{"type":"direct","tag":"direct-out"}]
@@ -1776,7 +1785,7 @@ EOF
                       | map(del(.domain_resolver)))
                     end)
     | .route = (.route // {})
-    | del(.route.default_domain_resolver)
+    | .route.default_domain_resolver = "dns-local"
     | .route.rules = ((.route.rules // []) | map(select(.action != "hijack-dns" and (.port // null) != 53)))
     | .route.final = (.route.final // "direct-out")
   ' "$CONFIG_PATH" > "$tmp" 2>/dev/null; then
@@ -5960,9 +5969,9 @@ install_reality_node(){
   TAG="${TAG:-reality}"
 
   echo -e "  监听模式："
-  echo "    1) 仅 IPv4 入站 + 仅 IPv4 出站 - 0.0.0.0（默认）"
-  echo "    2) 双栈入站 + 仅 IPv4 出站 - ::"
-  echo "    3) 仅 IPv6 入站 + 仅 IPv4 出站"
+  echo "    1) 仅 IPv4 入站 - 0.0.0.0（默认）"
+  echo "    2) 双栈入站 - ::"
+  echo "    3) 仅 IPv6 入站"
   read -p "  请选择 (1): " LISTEN_CHOICE
   case "$LISTEN_CHOICE" in
     2) LISTEN_ADDR="::"; install_mode="dualstack" ;;
@@ -5974,7 +5983,7 @@ install_reality_node(){
     public_ipv6=$(detect_primary_ipv6)
     if [ -z "$public_ipv6" ]; then
       echo ""
-      echo -e "${R}未检测到可用的 IPv6 地址，无法使用“仅 IPv6 入站 + 仅 IPv4 出站”模式${N}"
+      echo -e "${R}未检测到可用的 IPv6 地址，无法使用“仅 IPv6 入站”模式${N}"
       pause_screen
       return 1
     fi
@@ -6121,7 +6130,7 @@ EOF
   echo -e "  UUID      : ${C}$UUID${N}"
   echo -e "  PublicKey : ${C}$public_key${N}"
   echo -e "  入口 IP   : ${C}${access_ip:-未知}${N}"
-  echo -e "  出站策略  : ${C}仅 IPv4${N}"
+  echo -e "  出站策略  : ${C}双栈（跟随系统路由）${N}"
   echo -e "  端口      : ${C}$PORT${N}"
   echo -e "  SNI       : ${C}$SNI${N}"
   echo ""
@@ -6515,9 +6524,9 @@ install_hy2_node(){
 
   # 监听模式
   echo -e "  监听模式："
-  echo "    1) 仅 IPv4 入站 + 仅 IPv4 出站 - 0.0.0.0（默认）"
-  echo "    2) 双栈入站 + 仅 IPv4 出站 - ::"
-  echo "    3) 仅 IPv6 入站 + 仅 IPv4 出站"
+  echo "    1) 仅 IPv4 入站 - 0.0.0.0（默认）"
+  echo "    2) 双栈入站 - ::"
+  echo "    3) 仅 IPv6 入站"
   read -p "  请选择 (1): " LISTEN_CHOICE
   case "$LISTEN_CHOICE" in
     2) LISTEN_ADDR="::"; install_mode="dualstack" ;;
@@ -6529,7 +6538,7 @@ install_hy2_node(){
     public_ipv6=$(detect_primary_ipv6)
     if [ -z "$public_ipv6" ]; then
       echo ""
-      echo -e "${R}未检测到可用的 IPv6 地址，无法使用“仅 IPv6 入站 + 仅 IPv4 出站”模式${N}"
+      echo -e "${R}未检测到可用的 IPv6 地址，无法使用“仅 IPv6 入站”模式${N}"
       pause_screen
       return 1
     fi
@@ -6873,7 +6882,7 @@ EOF
   else
     echo -e "  端口跳跃  : ${D}未启用${N}"
   fi
-  echo -e "  出站策略  : ${C}仅 IPv4${N}"
+  echo -e "  出站策略  : ${C}双栈（跟随系统路由）${N}"
   echo ""
   echo -e "  ${B}客户端链接：${N}"
   echo -e "  ${G}${link:-未生成}${N}"
@@ -7401,9 +7410,9 @@ install_anytls_node(){
   TAG="${TAG:-anytls}"
 
   echo -e "  监听模式："
-  echo "    1) 仅 IPv4 入站 + 仅 IPv4 出站 - 0.0.0.0（默认）"
-  echo "    2) 双栈入站 + 仅 IPv4 出站 - ::"
-  echo "    3) 仅 IPv6 入站 + 仅 IPv4 出站"
+  echo "    1) 仅 IPv4 入站 - 0.0.0.0（默认）"
+  echo "    2) 双栈入站 - ::"
+  echo "    3) 仅 IPv6 入站"
   read -p "  请选择 (1): " LISTEN_CHOICE
   case "$LISTEN_CHOICE" in
     2) LISTEN_ADDR="::"; install_mode="dualstack" ;;
@@ -7415,7 +7424,7 @@ install_anytls_node(){
     public_ipv6=$(detect_primary_ipv6)
     if [ -z "$public_ipv6" ]; then
       echo ""
-      echo -e "${R}未检测到可用的 IPv6 地址，无法使用“仅 IPv6 入站 + 仅 IPv4 出站”模式${N}"
+      echo -e "${R}未检测到可用的 IPv6 地址，无法使用“仅 IPv6 入站”模式${N}"
       pause_screen
       return 1
     fi
@@ -7617,9 +7626,9 @@ install_tuic_node(){
 
   # 监听模式
   echo -e "  监听模式："
-  echo "    1) 仅 IPv4 入站 + 仅 IPv4 出站 - 0.0.0.0（默认）"
-  echo "    2) 双栈入站 + 仅 IPv4 出站 - ::"
-  echo "    3) 仅 IPv6 入站 + 仅 IPv4 出站"
+  echo "    1) 仅 IPv4 入站 - 0.0.0.0（默认）"
+  echo "    2) 双栈入站 - ::"
+  echo "    3) 仅 IPv6 入站"
   read -p "  请选择 (1): " LISTEN_CHOICE
   case "$LISTEN_CHOICE" in
     2) LISTEN_ADDR="::"; install_mode="dualstack" ;;
@@ -7631,7 +7640,7 @@ install_tuic_node(){
     public_ipv6=$(detect_primary_ipv6)
     if [ -z "$public_ipv6" ]; then
       echo ""
-      echo -e "${R}未检测到可用的 IPv6 地址，无法使用“仅 IPv6 入站 + 仅 IPv4 出站”模式${N}"
+      echo -e "${R}未检测到可用的 IPv6 地址，无法使用“仅 IPv6 入站”模式${N}"
       pause_screen
       return 1
     fi
@@ -7844,7 +7853,7 @@ EOF
   echo -e "  UUID      : ${C}$UUID${N}"
   echo -e "  Password  : ${C}$PASSWORD${N}"
   echo -e "  拥塞控制  : ${C}$CC${N}"
-  echo -e "  出站策略  : ${C}仅 IPv4${N}"
+  echo -e "  出站策略  : ${C}双栈（跟随系统路由）${N}"
   echo ""
   echo -e "  ${B}客户端链接：${N}"
   echo -e "  ${G}${link:-未生成}${N}"
@@ -8015,9 +8024,9 @@ install_ss2022_node(){
   esac
 
   echo -e "  监听模式："
-  echo "    1) 仅 IPv4 入站 + 仅 IPv4 出站 - 0.0.0.0（默认）"
-  echo "    2) 双栈入站 + 仅 IPv4 出站 - ::"
-  echo "    3) 仅 IPv6 入站 + 仅 IPv4 出站"
+  echo "    1) 仅 IPv4 入站 - 0.0.0.0（默认）"
+  echo "    2) 双栈入站 - ::"
+  echo "    3) 仅 IPv6 入站"
   read -p "  请选择 (1): " LISTEN_CHOICE
   case "$LISTEN_CHOICE" in
     2) LISTEN_ADDR="::"; install_mode="dualstack" ;;
@@ -8029,7 +8038,7 @@ install_ss2022_node(){
     public_ipv6=$(detect_primary_ipv6)
     if [ -z "$public_ipv6" ]; then
       echo ""
-      echo -e "${R}未检测到可用的 IPv6 地址，无法使用“仅 IPv6 入站 + 仅 IPv4 出站”模式${N}"
+      echo -e "${R}未检测到可用的 IPv6 地址，无法使用“仅 IPv6 入站”模式${N}"
       pause_screen
       return 1
     fi
@@ -8272,9 +8281,9 @@ install_xhr_node(){
   TAG="${tag_input:-xhr}"
 
   echo -e "  监听模式："
-  echo "    1) 仅 IPv4 入站 + 仅 IPv4 出站 - 0.0.0.0（默认）"
-  echo "    2) 双栈入站 + 仅 IPv4 出站 - ::"
-  echo "    3) 仅 IPv6 入站 + 仅 IPv4 出站"
+  echo "    1) 仅 IPv4 入站 - 0.0.0.0（默认）"
+  echo "    2) 双栈入站 - ::"
+  echo "    3) 仅 IPv6 入站"
   read -p "  请选择 (1): " LISTEN_CHOICE
   case "$LISTEN_CHOICE" in
     2) LISTEN_ADDR="::"; install_mode="dualstack" ;;
@@ -8286,7 +8295,7 @@ install_xhr_node(){
     public_ipv6=$(detect_primary_ipv6)
     if [ -z "$public_ipv6" ]; then
       echo ""
-      echo -e "${R}未检测到可用的 IPv6 地址，无法使用「仅 IPv6 入站 + 仅 IPv4 出站」模式${N}"
+      echo -e "${R}未检测到可用的 IPv6 地址，无法使用「仅 IPv6 入站」模式${N}"
       pause_screen
       return 1
     fi
@@ -8460,7 +8469,7 @@ EOF
   echo -e "  PublicKey : ${C}$public_key${N}"
   echo -e "  ShortID   : ${C}$SHORT_ID${N}"
   echo -e "  入口 IP   : ${C}${access_ip:-未知}${N}"
-  echo -e "  出站策略  : ${C}仅 IPv4${N}"
+  echo -e "  出站策略  : ${C}双栈（跟随系统路由）${N}"
   echo -e "  端口      : ${C}$PORT${N}  ${D}(TCP)${N}"
   echo -e "  SNI       : ${C}$SNI${N}"
   echo -e "  网络层    : ${C}xhttp${N}  ${D}path=${PATH_TOKEN}${N}"
@@ -9733,7 +9742,8 @@ show_update_menu(){
 }
 
 check_reality_dest_domain(){
-  local domain ips ip ipn org cdn_match handshake proto x25 alpn cipher
+  local domain ips ip ipn org cdn_match proto x25 pq alpn cipher
+  local v4s v6s vps_has_v6 conn hs1 hs2 hs3
   local cert_san cert_match=0 san san_value suffix
   local any_fail=0 fastest=999 t i testip
   local CDN_BLACKLIST="Cloudflare|Fastly|Akamai|CloudFront|Amazon|Microsoft|Google|Azure|Incapsula|Imperva"
@@ -9767,7 +9777,17 @@ check_reality_dest_domain(){
     return 1
   fi
   ipn=$(echo "$ips" | wc -l | tr -d ' ')
-  ip=$(echo "$ips" | head -1)
+  # 深度测试优先用 IPv4：reality 握手由 VPS 发起，v4-only 机器上测 v6 地址只会误报
+  v4s=$(echo "$ips" | grep -v ':' || true)
+  v6s=$(echo "$ips" | grep ':' || true)
+  ip=$(echo "$v4s" | head -1)
+  [ -z "$ip" ] && ip=$(echo "$v6s" | head -1)
+  vps_has_v6=$(detect_primary_ipv6 2>/dev/null || true)
+  # openssl -connect 的 IPv6 地址必须带方括号
+  case "$ip" in
+    *:*) conn="[$ip]:443" ;;
+    *)   conn="$ip:443" ;;
+  esac
   if [ "$ipn" -le 3 ]; then
     echo -e "    ${G}✓${N} 解析到 ${C}${ipn}${N} 个 IP："
   else
@@ -9790,10 +9810,10 @@ check_reality_dest_domain(){
     echo -e "    ${G}✓ $org${N}"
   fi
 
-  # 3. TCP 443 通断（所有 IP）
+  # 3. TCP 443 通断（v4 全测；v6 仅在本机有 IPv6 时测，否则测了必失败、纯属误报）
   echo ""
   echo -e "  ${B}[3/6] TCP 443 通断${N}"
-  for testip in $ips; do
+  for testip in $v4s; do
     if timeout 3 bash -c "echo > /dev/tcp/$testip/443" 2>/dev/null; then
       echo -e "    ${G}✓${N} $testip"
     else
@@ -9801,27 +9821,50 @@ check_reality_dest_domain(){
       any_fail=1
     fi
   done
+  if [ -n "$v6s" ]; then
+    if [ -n "$vps_has_v6" ]; then
+      for testip in $v6s; do
+        if timeout 3 bash -c "echo > /dev/tcp/$testip/443" 2>/dev/null; then
+          echo -e "    ${G}✓${N} $testip"
+        else
+          echo -e "    ${R}✗${N} $testip"
+          any_fail=1
+        fi
+      done
+    else
+      echo -e "    ${D}本机无 IPv6，跳过 $(echo "$v6s" | wc -l | tr -d ' ') 个 v6 地址（不影响判定）${N}"
+    fi
+  fi
 
-  # 4. TLS 1.3 + X25519 + ALPN
+  # 4. TLS 1.3 / X25519 / ALPN —— 分两次握手，才能区分「不支持 1.3」和「不支持 X25519」
   echo ""
   echo -e "  ${B}[4/6] TLS 1.3 + X25519 + ALPN（IP=${ip}）${N}"
-  handshake=$(echo | timeout 5 openssl s_client -connect "$ip:443" -servername "$domain" \
-                -tls1_3 -groups X25519 -alpn h2,http/1.1 2>/dev/null)
-  proto=$(echo "$handshake" | grep -m1 -oE 'TLSv1\.[0-9]+')
-  x25=$(echo "$handshake" | grep -q 'X25519' && echo yes || echo no)
-  alpn=$(echo "$handshake" | grep -m1 -oE 'ALPN protocol: \S+' | awk '{print $3}')
-  cipher=$(echo "$handshake" | grep -m1 -oE 'Cipher\s*:\s*\S+' | awk -F'[: ]+' '{print $NF}')
+  hs1=$(echo | timeout 5 openssl s_client -connect "$conn" -servername "$domain" \
+          -tls1_3 -alpn h2,http/1.1 2>/dev/null)
+  proto=$(echo "$hs1" | grep -m1 -oE 'TLSv1\.[0-9]+')
+  alpn=$(echo "$hs1" | grep -m1 -oE 'ALPN protocol: \S+' | awk '{print $3}')
+  cipher=$(echo "$hs1" | grep -m1 -oE 'Cipher\s*:\s*\S+' | awk -F'[: ]+' '{print $NF}')
 
   if [ "$proto" = "TLSv1.3" ]; then
     echo -e "    ${G}✓${N} Protocol: TLSv1.3"
   else
     echo -e "    ${R}✗${N} Protocol: ${proto:-握手失败} ${R}(reality 强制 TLS 1.3)${N}"
   fi
+
+  # 只提供 X25519 一个组再握手：能协商成功即支持（比 grep 输出关键字可靠，
+  # 不同 openssl 版本对协商组的输出格式不一致）
+  x25=no
+  if [ "$proto" = "TLSv1.3" ]; then
+    hs2=$(echo | timeout 5 openssl s_client -connect "$conn" -servername "$domain" \
+            -tls1_3 -groups X25519 2>/dev/null)
+    echo "$hs2" | grep -qE 'New, TLSv1\.3|Protocol[[:space:]]*:[[:space:]]*TLSv1\.3' && x25=yes
+  fi
   if [ "$x25" = "yes" ]; then
     echo -e "    ${G}✓${N} X25519 密钥交换支持"
   else
     echo -e "    ${R}✗${N} X25519 ${R}不支持（reality 默认密钥交换）${N}"
   fi
+
   case "$alpn" in
     h2)        echo -e "    ${G}✓${N} ALPN: h2 (HTTP/2，最现代)" ;;
     http/1.1)  echo -e "    ${Y}△${N} ALPN: http/1.1 (可用但伪装稍弱)" ;;
@@ -9832,10 +9875,30 @@ check_reality_dest_domain(){
     echo -e "    ${C}  Cipher: $cipher${N}"
   fi
 
+  # 信息项：抗量子混合组（Chrome 已默认在 ClientHello 里带，dest 支持算伪装加分）
+  # 不参与综合判定；本机 openssl < 3.5 不认识该组名时跳过
+  pq=skip
+  if [ "$proto" = "TLSv1.3" ]; then
+    hs3=$(echo | timeout 5 openssl s_client -connect "$conn" -servername "$domain" \
+            -tls1_3 -groups X25519MLKEM768 2>&1)
+    if echo "$hs3" | grep -qE 'New, TLSv1\.3|Protocol[[:space:]]*:[[:space:]]*TLSv1\.3'; then
+      pq=yes
+    elif echo "$hs3" | grep -qiE 'no such group|unknown group|unknown option|invalid argument|Error with command|SSL_CONF_cmd|failed to set'; then
+      pq=skip
+    else
+      pq=no
+    fi
+  fi
+  case "$pq" in
+    yes)  echo -e "    ${G}✓${N} 抗量子混合组 X25519MLKEM768 ${D}(加分项，更贴近真实 Chrome 流量)${N}" ;;
+    no)   echo -e "    ${D}△ 抗量子混合组不支持（信息项，不影响判定）${N}" ;;
+    skip) echo -e "    ${D}? 本机 openssl 过旧，无法检测抗量子组（不影响判定）${N}" ;;
+  esac
+
   # 5. 证书 SAN
   echo ""
   echo -e "  ${B}[5/6] 证书 SAN 是否覆盖该域名${N}"
-  cert_san=$(echo | timeout 5 openssl s_client -connect "$ip:443" -servername "$domain" 2>/dev/null \
+  cert_san=$(echo | timeout 5 openssl s_client -connect "$conn" -servername "$domain" 2>/dev/null \
               | openssl x509 -noout -ext subjectAltName 2>/dev/null \
               | grep -oE 'DNS:[^,]+' | tr -d ' ' | head -10)
   if [ -n "$cert_san" ]; then
@@ -9888,8 +9951,10 @@ EOF
   echo -e "  ${B}综合判定${N}"
   if [ -n "$cdn_match" ]; then
     echo -e "    ${R}✗ 不可用 — 命中 CDN/云厂商黑名单（$cdn_match）${N}"
-  elif [ "$proto" != "TLSv1.3" ] || [ "$x25" != "yes" ]; then
-    echo -e "    ${R}✗ 不可用 — TLS 1.3 + X25519 不满足${N}"
+  elif [ "$proto" != "TLSv1.3" ]; then
+    echo -e "    ${R}✗ 不可用 — 不支持 TLS 1.3（reality 硬性要求）${N}"
+  elif [ "$x25" != "yes" ]; then
+    echo -e "    ${R}✗ 不可用 — 不支持 X25519 密钥交换（reality 硬性要求）${N}"
   elif [ "$any_fail" = "1" ]; then
     echo -e "    ${Y}△ 慎用 — 有 IP 不通，可能成为定时炸弹（参考 tmu.ac.jp 案例）${N}"
   elif [ "$ipn" -gt 3 ]; then
@@ -10076,10 +10141,28 @@ warp_jq_apply(){
   mv "$tmp" "$CONFIG_PATH"
 }
 
+# 读当前配置里 WARP endpoint 实际使用的 host port（没有则回退默认值）
+# 用途：重新注入/重新注册时保留「端点优选」选过的地址，不被默认值覆盖
+warp_current_endpoint(){
+  local ep=""
+  if command -v jq >/dev/null 2>&1 && [ -f "$CONFIG_PATH" ]; then
+    ep=$(jq -r --arg tag "$WARP_OUTBOUND_TAG" '
+      (.endpoints // [])[] | select(.tag == $tag) | .peers[0] | "\(.address) \(.port)"
+    ' "$CONFIG_PATH" 2>/dev/null | head -1)
+  fi
+  case "$ep" in
+    *null*|"") printf '%s %s' "$WARP_ENDPOINT_HOST" "$WARP_ENDPOINT_PORT" ;;
+    *)         printf '%s' "$ep" ;;
+  esac
+}
+
 warp_config_inject(){
   local v4="$1" v6="$2" pk="$3"
   ensure_jq || return 1
   [ -f "$CONFIG_PATH" ] || { warp_log_err "config.json 不存在：$CONFIG_PATH"; return 1; }
+  # 骨架兜底：保证 dns local 解析器 + route.default_domain_resolver 存在
+  # （WireGuard endpoint 是用户态网络栈，拨域名必须有内部解析器，否则命中规则的流量全断）
+  config_ensure_skeleton || return 1
 
   local addr_json
   if [ -n "$v6" ]; then
@@ -10087,6 +10170,9 @@ warp_config_inject(){
   else
     addr_json=$(jq -nc --arg a "$v4" '[$a]')
   fi
+
+  local host port
+  read -r host port <<< "$(warp_current_endpoint)"
 
   warp_log_info "注入 WARP endpoint / 规则集 / 路由规则..."
   warp_jq_apply '
@@ -10108,7 +10194,7 @@ warp_config_inject(){
             }]
           }]
     | .route = (.route // {})
-    | .route.rule_set = ((.route.rule_set // []) | map(select(.tag != $rs)))
+    | .route.rule_set = ((.route.rule_set // []) | map(select(.tag != $rs and .tag != $rsyt)))
         + [{
             "type": "remote",
             "tag": $rs,
@@ -10116,23 +10202,34 @@ warp_config_inject(){
             "url": $rsurl,
             "download_detour": "direct-out",
             "update_interval": "168h0m0s"
+          },
+          {
+            "type": "remote",
+            "tag": $rsyt,
+            "format": "binary",
+            "url": $rsurlyt,
+            "download_detour": "direct-out",
+            "update_interval": "168h0m0s"
           }]
     | .route.rules = (
-        ((.route.rules // []) | map(select((.outbound // "") != $tag)))
-        + [{"rule_set": [$rs], "outbound": $tag}]
+        [{"action": "sniff"}]
+        + ((.route.rules // []) | map(select(((.outbound // "") != $tag) and ((.action // "") != "sniff"))))
+        + [{"rule_set": [$rs, $rsyt], "outbound": $tag}]
       )
     | .experimental = (.experimental // {})
     | .experimental.cache_file = (.experimental.cache_file // {"enabled": true, "path": "/var/lib/sing-box/cache.db"})
   ' \
-    --arg tag    "$WARP_OUTBOUND_TAG" \
-    --arg rs     "$WARP_RULESET_TAG" \
-    --arg rsurl  "$WARP_RULESET_URL" \
-    --arg host   "$WARP_ENDPOINT_HOST" \
-    --arg port   "$WARP_ENDPOINT_PORT" \
-    --arg mtu    "$WARP_MTU" \
-    --arg pk     "$pk" \
-    --arg peerpk "$WARP_PEER_PUBLIC_KEY" \
-    --arg addrs  "$addr_json"
+    --arg tag     "$WARP_OUTBOUND_TAG" \
+    --arg rs      "$WARP_RULESET_TAG" \
+    --arg rsyt    "$WARP_RULESET_TAG_YT" \
+    --arg rsurl   "$WARP_RULESET_URL" \
+    --arg rsurlyt "$WARP_RULESET_URL_YT" \
+    --arg host    "$host" \
+    --arg port    "$port" \
+    --arg mtu     "$WARP_MTU" \
+    --arg pk      "$pk" \
+    --arg peerpk  "$WARP_PEER_PUBLIC_KEY" \
+    --arg addrs   "$addr_json"
 }
 
 warp_config_remove(){
@@ -10141,11 +10238,12 @@ warp_config_remove(){
   warp_jq_apply '
       .endpoints = ((.endpoints // []) | map(select(.tag != $tag)))
     | .route = (.route // {})
-    | .route.rule_set = ((.route.rule_set // []) | map(select(.tag != $rs)))
-    | .route.rules = ((.route.rules // []) | map(select((.outbound // "") != $tag)))
+    | .route.rule_set = ((.route.rule_set // []) | map(select(.tag != $rs and .tag != $rsyt)))
+    | .route.rules = ((.route.rules // []) | map(select(((.outbound // "") != $tag) and ((.action // "") != "sniff"))))
   ' \
-    --arg tag "$WARP_OUTBOUND_TAG" \
-    --arg rs  "$WARP_RULESET_TAG"
+    --arg tag  "$WARP_OUTBOUND_TAG" \
+    --arg rs   "$WARP_RULESET_TAG" \
+    --arg rsyt "$WARP_RULESET_TAG_YT"
 }
 
 warp_config_has_outbound(){
@@ -10168,9 +10266,10 @@ warp_do_install(){
   ensure_jq || return 1
 
   render_section_header "${WARP_APP_NAME} - 安装"
-  echo -e "  ${D}本模块只修改 /etc/sing-box/config.json，加一个 WireGuard 出站${N}"
-  echo -e "  ${D}并把 geosite:google 命中的流量改走 Cloudflare WARP，其它保持直连。${N}"
-  echo -e "  ${D}不会动 DNS / iptables / 系统路由${N}"
+  echo -e "  ${D}本模块只修改 /etc/sing-box/config.json，加一个 WireGuard 出站，${N}"
+  echo -e "  ${D}并把 geosite google/youtube 命中的流量改走 Cloudflare WARP，其它保持直连。${N}"
+  echo -e "  ${D}同时开启域名嗅探（QUIC/TLS SNI），保证按 IP 直连的流量也能命中规则。${N}"
+  echo -e "  ${D}不会动 iptables / 系统路由${N}"
   echo ""
 
   warp_install_wgcf     || { pause_screen; return 1; }
@@ -10253,10 +10352,14 @@ warp_do_status(){
   fi
 
   if warp_config_has_rule; then
-    render_info_line "路由规则" "${G}已生效（geosite:google → ${WARP_OUTBOUND_TAG}）${N}"
+    render_info_line "路由规则" "${G}已生效（google/youtube → ${WARP_OUTBOUND_TAG}）${N}"
   else
     render_info_line "路由规则" "${R}未生效${N}"
   fi
+
+  local ep_host ep_port
+  read -r ep_host ep_port <<< "$(warp_current_endpoint)"
+  render_info_line "端点" "${ep_host}:${ep_port}"
 
   if [ -f "$WARP_WGCF_ACCOUNT" ]; then
     render_info_line "WARP 账号" "${G}已注册${N} ${D}($(stat -c %y "$WARP_WGCF_ACCOUNT" 2>/dev/null | cut -d. -f1))${N}"
@@ -10273,16 +10376,89 @@ warp_do_status(){
   echo ""
   warp_log_info "config.json 中的 WARP 相关片段："
   if command -v jq >/dev/null 2>&1 && [ -f "$CONFIG_PATH" ]; then
-    jq --arg tag "$WARP_OUTBOUND_TAG" --arg rs "$WARP_RULESET_TAG" '
+    jq --arg tag "$WARP_OUTBOUND_TAG" --arg rs "$WARP_RULESET_TAG" --arg rsyt "$WARP_RULESET_TAG_YT" '
       {
-        endpoint: (.endpoints // [] | map(select(.tag == $tag)) | .[0] // null),
-        rule_set: (.route.rule_set // [] | map(select(.tag == $rs)) | .[0] // null),
-        rule:     (.route.rules // [] | map(select((.outbound // "") == $tag)) | .[0] // null)
+        endpoint:  (.endpoints // [] | map(select(.tag == $tag)) | .[0] // null),
+        rule_sets: (.route.rule_set // [] | map(select(.tag == $rs or .tag == $rsyt)) | map(.tag)),
+        rule:      (.route.rules // [] | map(select((.outbound // "") == $tag)) | .[0] // null)
       }
     ' "$CONFIG_PATH" 2>/dev/null | sed 's/^/    /'
   fi
 
   pause_screen
+}
+
+# 真实隧道自检：起一个临时 sing-box 实例（socks 入站 + 同款 WireGuard endpoint），
+# 经隧道 curl Cloudflare trace。成功把 trace 内容打到 stdout 并返回 0。
+# 注意：与主进程共用同一 WARP 账号，并发握手会漂移，测试期间主配置分流可能短暂中断。
+warp_probe_via_tunnel(){
+  local host="$1" port="$2"
+  local kv
+  kv=$(warp_parse_profile) || return 1
+  local WARP_PRIVATE_KEY WARP_LOCAL_V4 WARP_LOCAL_V6
+  eval "$kv"
+
+  local addr_json
+  if [ -n "$WARP_LOCAL_V6" ]; then
+    addr_json=$(jq -nc --arg a "$WARP_LOCAL_V4" --arg b "$WARP_LOCAL_V6" '[$a, $b]')
+  else
+    addr_json=$(jq -nc --arg a "$WARP_LOCAL_V4" '[$a]')
+  fi
+
+  local tmpcfg plog sport pid="" try
+  tmpcfg=$(mktemp)
+  plog=$(mktemp)
+  for try in 1 2 3; do
+    sport=$(( (RANDOM % 20000) + 30000 ))
+    jq -n \
+      --arg host "$host" --arg port "$port" \
+      --arg pk "$WARP_PRIVATE_KEY" --arg peerpk "$WARP_PEER_PUBLIC_KEY" \
+      --arg addrs "$addr_json" --arg mtu "$WARP_MTU" \
+      --argjson sport "$sport" '
+      {
+        "log": {"disabled": false, "level": "error"},
+        "dns": {"servers": [{"type": "local", "tag": "dns-local"}]},
+        "inbounds": [{"type": "socks", "tag": "probe-in", "listen": "127.0.0.1", "listen_port": $sport}],
+        "endpoints": [{
+          "type": "wireguard", "tag": "warp-probe", "system": false,
+          "mtu": ($mtu | tonumber), "address": ($addrs | fromjson), "private_key": $pk,
+          "peers": [{
+            "address": $host, "port": ($port | tonumber), "public_key": $peerpk,
+            "allowed_ips": ["0.0.0.0/0", "::/0"], "reserved": [0, 0, 0]
+          }]
+        }],
+        "route": {"final": "warp-probe", "default_domain_resolver": "dns-local"}
+      }' > "$tmpcfg" 2>/dev/null || { rm -f "$tmpcfg" "$plog"; return 1; }
+    sing-box run -c "$tmpcfg" >"$plog" 2>&1 &
+    pid=$!
+    sleep 1
+    kill -0 "$pid" 2>/dev/null && break
+    pid=""   # 端口被占等启动失败，换个端口重试
+  done
+  if [ -z "$pid" ]; then
+    warp_log_err "临时 sing-box 实例启动失败："
+    tail -5 "$plog" | sed 's/^/    /' >&2
+    rm -f "$tmpcfg" "$plog"
+    return 1
+  fi
+
+  # socks5://（非 socks5h）让 curl 在本机解析域名，探测不依赖隧道内 DNS
+  local trace rc
+  trace=$(curl -4 -fsS --max-time 12 -x "socks5://127.0.0.1:${sport}" \
+            https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null)
+  rc=$?
+  kill "$pid" 2>/dev/null
+  wait "$pid" 2>/dev/null
+  if [ "$rc" -ne 0 ] || [ -z "$trace" ]; then
+    if [ -s "$plog" ]; then
+      warp_log_warn "临时实例日志（最后几行）："
+      tail -3 "$plog" | sed 's/^/    /' >&2
+    fi
+    rm -f "$tmpcfg" "$plog"
+    return 1
+  fi
+  rm -f "$tmpcfg" "$plog"
+  printf '%s\n' "$trace"
 }
 
 warp_do_test(){
@@ -10294,12 +10470,33 @@ warp_do_test(){
     sing-box check -c "$CONFIG_PATH" 2>&1 | sed 's/^/    /'
   fi
 
-  warp_log_info "Cloudflare WARP 自检（VPS 本机直连，仅判断 wgcf 注册是否成功）："
-  local trace cf_warp
-  trace=$(curl -4 -fsS --max-time 8 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null)
-  cf_warp=$(echo "$trace" | awk -F= '/^warp=/ {print $2}')
-  if [ -n "$cf_warp" ]; then
-    echo -e "    本机直连 cloudflare：warp=${cf_warp}（${D}本机不走 WARP 是预期，因为分流只对 sing-box 客户端生效${N}）"
+  local host port
+  read -r host port <<< "$(warp_current_endpoint)"
+
+  echo ""
+  warp_log_info "WARP 隧道自检：起临时实例，真实经 ${host}:${port} 走一次隧道（约 10 秒）..."
+  echo -e "  ${D}与主服务共用同一 WARP 账号，测试期间分流可能短暂抖动，属正常${N}"
+  local trace
+  if trace=$(warp_probe_via_tunnel "$host" "$port"); then
+    local w ip loc colo
+    w=$(printf '%s\n' "$trace"    | awk -F= '/^warp=/ {print $2}')
+    ip=$(printf '%s\n' "$trace"   | awk -F= '/^ip=/   {print $2}')
+    loc=$(printf '%s\n' "$trace"  | awk -F= '/^loc=/  {print $2}')
+    colo=$(printf '%s\n' "$trace" | awk -F= '/^colo=/ {print $2}')
+    warp_log_ok "隧道可用：warp=${w:-?}  出口IP=${ip:-?}  区域=${loc:-?}  PoP=${colo:-?}"
+    case "$loc" in
+      CN|HK|MO|RU)
+        warp_log_warn "出口区域 ${loc} 在 Gemini 的不服务名单里，Gemini 仍会拒绝（油管不受影响）"
+        echo -e "  ${D}免费 WARP 出口 PoP 由 anycast 路由决定，「重新注册」基本换不了区域；${N}"
+        echo -e "  ${D}想真正选区：上 Cloudflare Zero Trust（免费 50 用户）在 device profile 选 PoP，${N}"
+        echo -e "  ${D}或用甬哥 warp-yg 的端点优选：https://github.com/yonggekkk/warp-yg${N}"
+        ;;
+    esac
+  else
+    warp_log_err "WARP 隧道不通（握手失败或无数据）"
+    echo -e "  ${D}最常见原因：本机到 Cloudflare 的 UDP ${port} 被封或严重丢包${N}"
+    echo -e "  ${D}处理：菜单「4 端点优选」自动扫描候选 IP:端口；若全部不通，${N}"
+    echo -e "  ${D}说明本机 UDP 出网被封，WireGuard/WARP 方案在这台机器不可行${N}"
   fi
 
   echo ""
@@ -10308,15 +10505,74 @@ warp_do_test(){
   echo -e "  ${D}2.${N} 浏览器开 https://www.google.com/search?q=my+ip — Google 应显示 Cloudflare WARP 出口位置"
   echo -e "  ${D}3.${N} 浏览器开 https://gemini.google.com — 应能正常加载"
   echo -e "  ${D}4.${N} 看 sing-box 日志：journalctl -u sing-box -f  — 命中规则的请求会显示 outbound=${WARP_OUTBOUND_TAG}"
+}
 
+# 端点优选：逐个测试候选 IP:端口，第一个能通的写入配置并重启
+# 适用：默认端点 162.159.192.1:2408 的 UDP 被封/丢包严重时
+warp_do_endpoint_pick(){
+  require_root || return 1
+  render_section_header "${WARP_APP_NAME} - 端点优选"
+  if ! warp_config_has_outbound; then
+    warp_log_err "尚未安装 WARP 分流，请先安装"
+    pause_screen
+    return 1
+  fi
+  echo -e "  ${D}逐个真实测试候选端点（每个最多约 15 秒），第一个能通的写入配置${N}"
+  echo -e "  ${D}测试期间 WARP 分流可能短暂中断，完成后自动恢复${N}"
   echo ""
-  warp_log_info "${B}如果出口区域不理想（比如落到德国延迟高）${N}"
-  echo -e "  ${D}免费 WARP 走 Cloudflare anycast，出口 PoP 由 BGP 路由决定，${N}"
-  echo -e "  ${D}用户侧不可控选区。当前可用的折腾途径：${N}"
-  echo -e "  ${D}  - 多次「3 重新注册账号」碰运气（不同 client-id 在 Cloudflare 内部 hash 不同）${N}"
-  echo -e "  ${D}  - 想真正选区：上 Cloudflare Zero Trust 注册 Teams 账户（免费 50 用户），${N}"
-  echo -e "  ${D}    在 device profile 里能选 PoP；或用甬哥 warp-yg 的端点优选脚本：${N}"
-  echo -e "  ${D}    https://github.com/yonggekkk/warp-yg${N}"
+
+  local cand host port trace
+  for cand in $WARP_ENDPOINT_CANDIDATES; do
+    host="${cand%:*}"
+    port="${cand##*:}"
+    warp_log_info "测试 ${cand} ..."
+    if trace=$(warp_probe_via_tunnel "$host" "$port"); then
+      warp_log_ok "可用：${cand}"
+      if ! warp_jq_apply '
+          .endpoints = ((.endpoints // []) | map(
+            if .tag == $tag
+            then (.peers[0].address = $host | .peers[0].port = ($port | tonumber))
+            else . end))
+        ' --arg tag "$WARP_OUTBOUND_TAG" --arg host "$host" --arg port "$port"; then
+        warp_log_err "写入配置失败"
+        pause_screen
+        return 1
+      fi
+      if config_check_and_restart; then
+        warp_log_ok "已切换端点为 ${cand} 并重启 sing-box"
+      else
+        warp_log_err "sing-box 重启失败，请用 journalctl -u sing-box 查看"
+      fi
+      pause_screen
+      return 0
+    fi
+    warp_log_warn "不通：${cand}"
+  done
+
+  warp_log_err "所有候选端点都不通 —— 本机到 Cloudflare 的 UDP 大概率被整段封锁"
+  echo -e "  ${D}WireGuard 只能走 UDP，没法换 TCP；这台机器上 WARP 方案基本不可行，${N}"
+  echo -e "  ${D}建议换机，或改用「解锁 DNS / 落地中转」类方案${N}"
+  pause_screen
+}
+
+# 重新注入分流规则：不动账号，只按当前版本的模板重写 endpoint/规则集/路由规则
+# 适用：老版本装的 WARP（缺 YouTube 规则集、缺域名嗅探、缺 DNS 解析器）升级修复
+warp_do_reinject(){
+  require_root || return 1
+  render_section_header "${WARP_APP_NAME} - 重新注入分流规则"
+  echo -e "  ${D}用途：升级旧配置（补 YouTube 规则集 / 域名嗅探 / DNS 解析器）或修复被改坏的规则${N}"
+  echo -e "  ${D}不改 WARP 账号，不改已优选的端点${N}"
+  echo ""
+
+  local kv
+  kv=$(warp_parse_profile) || { pause_screen; return 1; }
+  eval "$kv"
+
+  warp_config_inject "$WARP_LOCAL_V4" "$WARP_LOCAL_V6" "$WARP_PRIVATE_KEY" \
+    || { pause_screen; return 1; }
+  config_check_and_restart && warp_log_ok "规则已重新注入，sing-box 已重启" \
+                          || warp_log_err "sing-box 重启失败，请用 journalctl -u sing-box 查看"
+  pause_screen
 }
 
 show_warp_menu(){
@@ -10339,7 +10595,7 @@ show_warp_menu(){
     warp_config_has_outbound && installed=1
 
     if [ "$installed" = "1" ]; then
-      render_info_line "状态" "${G}已启用（geosite:google → WARP）${N}"
+      render_info_line "状态" "${G}已启用（google/youtube → WARP）${N}"
     else
       render_info_line "状态" "${Y}未启用${N}"
     fi
@@ -10347,8 +10603,10 @@ show_warp_menu(){
 
     if [ "$installed" = "1" ]; then
       render_menu_item 1 "查看状态"
-      render_menu_item 2 "测试连通性"
+      render_menu_item 2 "测试连通性 ${D}（真实走一次 WARP 隧道）${N}"
       render_menu_item 3 "重新注册 WARP 账号 ${D}（换 WARP IP）${N}"
+      render_menu_item 4 "端点优选 ${D}（隧道不通时自动换可用 IP:端口）${N}"
+      render_menu_item 5 "重新注入分流规则 ${D}（升级旧配置 / 修复规则）${N}"
       render_menu_item 9 "卸载"
     else
       render_menu_item 1 "安装 ${WARP_APP_NAME}"
@@ -10371,6 +10629,8 @@ show_warp_menu(){
       1) warp_do_status ;;
       2) render_section_header "${WARP_APP_NAME} - 测试"; warp_do_test; pause_screen ;;
       3) warp_do_reregister ;;
+      4) warp_do_endpoint_pick ;;
+      5) warp_do_reinject ;;
       9) warp_do_uninstall ;;
       0) return ;;
       *) notify_invalid_choice ;;

@@ -163,13 +163,15 @@ config_ensure_skeleton(){
     cat > "$CONFIG_PATH" <<'EOF'
 {
   "log": {"disabled": false, "level": "warn", "timestamp": true},
+  "dns": {"servers": [{"type": "local", "tag": "dns-local"}]},
   "inbounds": [],
   "outbounds": [{
     "type": "direct",
     "tag": "direct-out"
   }],
   "route": {
-    "final": "direct-out"
+    "final": "direct-out",
+    "default_domain_resolver": "dns-local"
   }
 }
 EOF
@@ -178,14 +180,17 @@ EOF
 
   local tmp
   tmp=$(mktemp)
-  # 透明升级（不再托管 DNS，交给系统 resolv.conf）：
-  # 1) 清理老脚本残留的 dns 块、hijack-dns 规则、domain_resolver 字段
+  # 透明升级：
+  # 1) DNS 只保留一个 local 解析器（走系统 resolv.conf），不做任何劫持/分流；
+  #    清理老脚本残留的 hijack-dns 规则与出站级 domain_resolver
+  #    （sing-box 1.12+ 用户态出站如 WireGuard endpoint 拨域名必须有内部解析器，
+  #      否则运行时报 missing domain resolver，流量全断）
   # 2) 若没 outbounds 或为空，建一条 tagged direct-out
   # 3) 若 direct outbound 没 tag，加上 tag=direct-out
-  # 4) 确保 route 块存在，final 默认 direct-out
+  # 4) 确保 route 块存在，final 默认 direct-out，default_domain_resolver 指向 local
   if jq '
       .log = (.log // {"disabled": false, "level": "warn", "timestamp": true})
-    | del(.dns)
+    | .dns = {"servers": [{"type": "local", "tag": "dns-local"}]}
     | .inbounds = ((.inbounds // []) | map(select(.tag == "reality-in" or .tag == "hy2-in" or .tag == "anytls-in" or .tag == "tuic-in" or .tag == "ss2022-in")))
     | .outbounds = (if ((.outbounds // []) | length) == 0
                     then [{"type":"direct","tag":"direct-out"}]
@@ -196,7 +201,7 @@ EOF
                       | map(del(.domain_resolver)))
                     end)
     | .route = (.route // {})
-    | del(.route.default_domain_resolver)
+    | .route.default_domain_resolver = "dns-local"
     | .route.rules = ((.route.rules // []) | map(select(.action != "hijack-dns" and (.port // null) != 53)))
     | .route.final = (.route.final // "direct-out")
   ' "$CONFIG_PATH" > "$tmp" 2>/dev/null; then

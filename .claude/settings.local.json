@@ -76,7 +76,10 @@
       "Bash(bunzip2 -c)",
       "Bash(awk '/^Package: sing-box$/{p=1} p&&/^Version:/{print $2; p=0}')",
       "Bash(rm -f /tmp/vtest.sh /tmp/wtest.sh /tmp/integ.sh /tmp/leyili_funcs.sh /tmp/sb.gz /tmp/sb_packages.txt /tmp/sb.gz.tmp*)",
-      "Bash(rm -rf 'C:\\\\Users\\\\leyili/sb_probe')"
+      "Bash(rm -rf 'C:\\\\Users\\\\leyili/sb_probe')",
+      "Bash(jq --version)",
+      "Bash(mkdir -p /tmp/jqtest)",
+      "Bash(/tmp/jqtest/jq.exe --version)"
     ]
   }
 }
