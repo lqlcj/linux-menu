@@ -4460,6 +4460,9 @@ print_qrcode(){
 apply_tcp_tuning(){
   local region="${1:-us-west}"
   local mem_tier="${2:-2g}"
+  local custom_buffer_max="${3:-}"   # region=custom 专用：按实测 BDP 算出的 buffer_max（字节）
+  local custom_rtt_ms="${4:-}"       # region=custom 专用：实测 RTT（ms，写入 marker 供状态页展示）
+  local custom_bw_mbps="${5:-}"      # region=custom 专用：有效带宽（Mbps，同上）
   local region_label notsent_lowat fin_timeout buffer_max mem_label
   local cc_algo qdisc_algo iface _q
 
@@ -4491,50 +4494,77 @@ apply_tcp_tuning(){
       notsent_lowat=16384
       fin_timeout=10
       ;;
+    custom)
+      # 智能调参（自动实测）档：buffer_max 由向导按实测 BDP 计算后经 $3 传入
+      region_label="自定义"
+      notsent_lowat=16384
+      # fin_timeout 按实测 RTT 分档：近程沿用 hk/jp 的 5s，远程沿用 us-west/eu 的 10s
+      fin_timeout=10
+      case "$custom_rtt_ms" in
+        ''|*[!0-9]*) : ;;
+        *) [ "$custom_rtt_ms" -le 150 ] && fin_timeout=5 ;;
+      esac
+      ;;
     *)
       echo -e "${R}未知地区: $region${N}"
       return 1
       ;;
   esac
 
-  case "${region}_${mem_tier}" in
-    hk_512m)     buffer_max=4194304   ;;
-    hk_1g)       buffer_max=8388608   ;;
-    hk_2g)       buffer_max=16777216  ;;
-    hk_4g)       buffer_max=16777216  ;;
-    hk_8g)       buffer_max=33554432  ;;
-    jp_512m)     buffer_max=6291456   ;;
-    jp_1g)       buffer_max=12582912  ;;
-    jp_2g)       buffer_max=16777216  ;;
-    jp_4g)       buffer_max=25165824  ;;
-    jp_8g)       buffer_max=33554432  ;;
-    # us-west_512m: CloudCone LA 实测 185ms RTT，按 200Mbps × 1.5 ≈ 8M；
-    # 512MB 总内存严格防 OOM，比 1GB 档（16M）小一档，单连接占用减半
-    us-west_512m) buffer_max=8388608  ;;
-    us-west_1g)  buffer_max=16777216  ;;
-    # us-west_2g: CloudCone 2C2G 实测 161ms ping，cwnd 拉到 769、单流 18.6Mbps、
-    # 零 bufferbloat / 零重传。in-flight 只到 1MB，16M 已留 16 倍裕量；
-    # 升 32M 反而在 BBR ProbeBW 时探出跨洋小拥塞点（手册 §一·1 + §七）
-    us-west_2g)  buffer_max=16777216  ;;
-    us-west_4g)  buffer_max=50331648  ;;
-    us-west_8g)  buffer_max=67108864  ;;
-    # HostDare / 9929 等 100Mbps 硬限速美西：理论 BDP 约 3-4M，
-    # 但 9929 低丢包实测 8M 比 4M/16M 更稳，保留探测余量且避免 16M 队列堆积。
-    us-west-100m_512m) buffer_max=8388608 ;;
-    us-west-100m_1g)   buffer_max=8388608 ;;
-    us-west-100m_2g)   buffer_max=8388608 ;;
-    us-west-100m_4g)   buffer_max=8388608 ;;
-    us-west-100m_8g)   buffer_max=8388608 ;;
-    eu_512m)     buffer_max=8388608   ;;
-    eu_1g)       buffer_max=16777216  ;;
-    eu_2g)       buffer_max=33554432  ;;
-    eu_4g)       buffer_max=50331648  ;;
-    eu_8g)       buffer_max=67108864  ;;
-    *)
-      echo -e "${R}未知组合: ${region}/${mem_tier}${N}"
+  if [ "$region" = "custom" ]; then
+    # custom 档：buffer_max 由向导按实测 BDP 计算后传入；此处防御性复检，
+    # 保证该函数被直接调用时也不会把离谱值写进 sysctl（范围 = 现有表的上下限）
+    case "$custom_buffer_max" in
+      ''|*[!0-9]*)
+        echo -e "${R}custom 档缺少合法的 buffer_max 参数${N}"
+        return 1
+        ;;
+    esac
+    if [ "$custom_buffer_max" -lt 4194304 ] || [ "$custom_buffer_max" -gt 67108864 ]; then
+      echo -e "${R}custom buffer_max 超出安全范围 (4M-64M): ${custom_buffer_max}${N}"
       return 1
-      ;;
-  esac
+    fi
+    buffer_max="$custom_buffer_max"
+  else
+    case "${region}_${mem_tier}" in
+      hk_512m)     buffer_max=4194304   ;;
+      hk_1g)       buffer_max=8388608   ;;
+      hk_2g)       buffer_max=16777216  ;;
+      hk_4g)       buffer_max=16777216  ;;
+      hk_8g)       buffer_max=33554432  ;;
+      jp_512m)     buffer_max=6291456   ;;
+      jp_1g)       buffer_max=12582912  ;;
+      jp_2g)       buffer_max=16777216  ;;
+      jp_4g)       buffer_max=25165824  ;;
+      jp_8g)       buffer_max=33554432  ;;
+      # us-west_512m: CloudCone LA 实测 185ms RTT，按 200Mbps × 1.5 ≈ 8M；
+      # 512MB 总内存严格防 OOM，比 1GB 档（16M）小一档，单连接占用减半
+      us-west_512m) buffer_max=8388608  ;;
+      us-west_1g)  buffer_max=16777216  ;;
+      # us-west_2g: CloudCone 2C2G 实测 161ms ping，cwnd 拉到 769、单流 18.6Mbps、
+      # 零 bufferbloat / 零重传。in-flight 只到 1MB，16M 已留 16 倍裕量；
+      # 升 32M 反而在 BBR ProbeBW 时探出跨洋小拥塞点（手册 §一·1 + §七）
+      us-west_2g)  buffer_max=16777216  ;;
+      us-west_4g)  buffer_max=50331648  ;;
+      us-west_8g)  buffer_max=67108864  ;;
+      # HostDare / 9929 等 100Mbps 硬限速美西：理论 BDP 约 3-4M，
+      # 但 9929 低丢包实测 8M 比 4M/16M 更稳，保留探测余量且避免 16M 队列堆积。
+      us-west-100m_512m) buffer_max=8388608 ;;
+      us-west-100m_1g)   buffer_max=8388608 ;;
+      us-west-100m_2g)   buffer_max=8388608 ;;
+      us-west-100m_4g)   buffer_max=8388608 ;;
+      us-west-100m_8g)   buffer_max=8388608 ;;
+      eu_512m)     buffer_max=8388608   ;;
+      eu_1g)       buffer_max=16777216  ;;
+      eu_2g)       buffer_max=33554432  ;;
+      eu_4g)       buffer_max=50331648  ;;
+      eu_8g)       buffer_max=67108864  ;;
+      *)
+        echo -e "${R}未知组合: ${region}/${mem_tier}${N}"
+        return 1
+        ;;
+    esac
+  fi
 
   case "$mem_tier" in
     512m) mem_label="512MB" ;;
@@ -4573,7 +4603,7 @@ apply_tcp_tuning(){
   echo -e "${Y}==> 写入 ${region_label}/${mem_label} TCP 参数优化配置 (上限 $((buffer_max/1024/1024))M)...${N}"
 
   cat > "$TCP_TUNING_PATH" <<EOF
-# leyili-profile: region=${region} mem_tier=${mem_tier}
+# leyili-profile: region=${region} mem_tier=${mem_tier}${custom_rtt_ms:+ rtt=${custom_rtt_ms}}${custom_bw_mbps:+ bw=${custom_bw_mbps}}
 # 由 leyili.sh 一键网络优化生成 (${region_label} / ${mem_label})
 # 偏好：交互流（网页 / 社交 / 流媒体），非吞吐党
 
@@ -5055,6 +5085,9 @@ _buffer_label_for(){
 apply_network_optimization(){
   local region="$1"
   local mem_tier="$2"
+  local custom_buffer_max="${3:-}"   # region=custom 专用，透传给 apply_tcp_tuning
+  local custom_rtt_ms="${4:-}"
+  local custom_bw_mbps="${5:-}"
   local region_label initcwnd_value mem_label
   local buffer_max notsent_lowat fin_timeout
   local live_cc live_iface live_qdisc
@@ -5067,6 +5100,7 @@ apply_network_optimization(){
     us-west) region_label="美西"; initcwnd_value=32 ;;
     us-west-100m) region_label="美西 100M"; initcwnd_value=32 ;;
     eu)      region_label="欧洲"; initcwnd_value=32 ;;
+    custom)  region_label="自定义"; initcwnd_value=32 ;;
     *)
       echo -e "${R}未知地区: $region${N}"
       pause_screen
@@ -5087,7 +5121,7 @@ apply_network_optimization(){
       ;;
   esac
 
-  if ! apply_tcp_tuning "$region" "$mem_tier"; then
+  if ! apply_tcp_tuning "$region" "$mem_tier" "$custom_buffer_max" "$custom_rtt_ms" "$custom_bw_mbps"; then
     echo -e "${R}TCP 调优失败，已中止${N}"
     pause_screen
     return 1
@@ -5107,6 +5141,10 @@ apply_network_optimization(){
   echo -e "${G}✓ 网络优化完成${N}"
   echo -e "  地区        : ${C}$region_label${N}"
   echo -e "  内存档位    : ${C}$mem_label${N}"
+  if [ "$region" = "custom" ] && [ -n "$custom_rtt_ms" ]; then
+    echo -e "  实测 RTT    : ${C}${custom_rtt_ms} ms${N}"
+    echo -e "  有效带宽    : ${C}${custom_bw_mbps} Mbps${N}"
+  fi
   if [ -n "$buffer_max" ] && [ "$buffer_max" -gt 0 ] 2>/dev/null; then
     echo -e "  rmem/wmem   : ${C}$((buffer_max / 1024 / 1024))M${N}"
   fi
@@ -5161,6 +5199,7 @@ show_tcp_optimization_picker(){
     render_menu_item 3 "美西   ${D}(RTT≈200ms, BDP≈25M)${N}"
     render_menu_item 4 "美西 100M ${D}(9929/低丢包, 缓冲≈8M)${N}"
     render_menu_item 5 "欧洲   ${D}(RTT≈280ms, BDP≈35M)${N}"
+    render_menu_item 6 "智能调参 ${D}(自动实测 RTT，按带宽算 BDP)${N}"
     render_menu_item 0 "返回上级"
     render_divider
     read -p "  请选择地区: " region_choice
@@ -5171,6 +5210,11 @@ show_tcp_optimization_picker(){
       3) region="us-west"; region_label="美西" ;;
       4) region="us-west-100m"; region_label="美西 100M" ;;
       5) region="eu";      region_label="欧洲" ;;
+      6)
+        # 智能调参向导：返回 0 = 已应用（与固定地区应用后一致，退出本 picker）
+        if show_tcp_auto_tune_wizard; then return; fi
+        continue
+        ;;
       0) return ;;
       *) notify_invalid_choice; continue ;;
     esac
@@ -5208,6 +5252,246 @@ show_tcp_optimization_picker(){
       return
     done
   done
+}
+
+# ── 智能 TCP 调参（自动实测）──────────────────────────────────────────
+# 思路：RTT 用两条独立通道实测取小 —— ss 直接读「本机与目标 IP 现有 TCP 连接」
+# 的内核统计（用户正 SSH 在线，天然有一条到家里的活连接，ICMP 被禁也能测）；
+# ping 5 发取 min 作交叉验证。带宽让用户报套餐值（VPS 侧无法单方面测出家宽
+# 下行）。BDP = 带宽 × RTT，buffer_max ≈ 2×BDP 留 BBR 探测余量，再按内存档
+# 封顶防 OOM，最后走 apply_network_optimization 以伪地区 custom 应用。
+
+# 读内核对「与目标 IP 的既有 TCP 连接」的实测 RTT（输出整数 ms；空 = 无数据）。
+# 优先 minrtt（连接存续期最小值，最接近纯传播时延），退化用 rtt: 平滑均值；
+# 多条连接取最小。
+_tcp_autotune_rtt_from_ss(){
+  local ip="$1" dst
+  case "$ip" in
+    *:*) dst="[$ip]" ;;   # ss 过滤器里 IPv6 字面量需要方括号
+    *)   dst="$ip" ;;
+  esac
+  ss -tin state established dst "$dst" 2>/dev/null | awk '
+    {
+      for (i = 1; i <= NF; i++) {
+        if ($i ~ /^rtt:[0-9.]+\//) {            # 锚定 ^rtt: 避免误吞 minrtt:
+          split($i, a, /[:\/]/); v = a[2] + 0
+          if (v > 0 && (avg == 0 || v < avg)) avg = v
+        } else if ($i ~ /^minrtt:[0-9.]+$/) {
+          split($i, a, ":"); v = a[2] + 0
+          if (v > 0 && (mn == 0 || v < mn)) mn = v
+        }
+      }
+    }
+    END {
+      v = (mn > 0) ? mn : avg
+      if (v > 0) { if (v < 1) v = 1; printf "%d", v + 0.5 }
+    }'
+}
+
+# ping 5 发取 min（输出整数 ms；空 = 不通/被禁）。按 " = " 切汇总行，
+# 同时兼容 iputils（rtt min/avg/max/mdev）与 busybox（round-trip min/avg/max）。
+_tcp_autotune_rtt_from_ping(){
+  local ip="$1" out=""
+  case "$ip" in
+    *:*)
+      out=$(LC_ALL=C ping -6 -n -c 5 -i 0.2 -W 1 "$ip" 2>/dev/null) \
+        || out=$(LC_ALL=C ping6 -n -c 5 -i 0.2 -W 1 "$ip" 2>/dev/null) || true
+      ;;
+    *)
+      out=$(LC_ALL=C ping -n -c 5 -i 0.2 -W 1 "$ip" 2>/dev/null) || true
+      ;;
+  esac
+  [ -n "$out" ] || return 0
+  printf '%s\n' "$out" | awk '
+    /min\/avg/ {
+      split($0, p, " = "); split(p[2], v, "/")
+      m = v[1] + 0
+      if (m > 0) { if (m < 1) m = 1; printf "%d", m + 0.5 }
+      exit
+    }'
+}
+
+# 按 MemTotal 自动定内存档（仅用于 buffer 封顶，不再让用户手选）。
+# 阈值给标称容量的实报值留裕量：512M/1G/2G/4G 实报约 480/970/1950/3900 MB。
+_tcp_autotune_mem_tier(){
+  local kb mb
+  kb=$(awk '/MemTotal/ {print $2}' /proc/meminfo 2>/dev/null)
+  case "$kb" in ''|*[!0-9]*) echo "2g"; return ;; esac
+  mb=$((kb / 1024))
+  if [ "$mb" -lt 768 ]; then echo "512m"
+  elif [ "$mb" -lt 1500 ]; then echo "1g"
+  elif [ "$mb" -lt 3000 ]; then echo "2g"
+  elif [ "$mb" -lt 6000 ]; then echo "4g"
+  else echo "8g"
+  fi
+}
+
+# 每档 buffer 上限 = 上方地区表中该内存档的历史最大值，不超出已交付过的配置
+_tcp_autotune_ceiling(){
+  case "$1" in
+    512m) echo 8388608   ;;
+    1g)   echo 16777216  ;;
+    2g)   echo 33554432  ;;
+    4g)   echo 50331648  ;;
+    *)    echo 67108864  ;;
+  esac
+}
+
+# BDP → buffer_max：2×BDP（adv_win_scale=2 下窗口≈3/4 缓冲，且给 BBR ProbeBW
+# 留余量），向上取整到 2MiB（与地区表粒度一致），floor 4M，按内存档封顶。
+_tcp_autotune_calc_buffer(){
+  local rtt_ms="$1" bw_mbps="$2" mem_tier="$3"
+  local raw buf ceiling
+  raw=$((bw_mbps * 125 * rtt_ms * 2))
+  buf=$(( (raw + 2097151) / 2097152 * 2097152 ))
+  [ "$buf" -lt 4194304 ] && buf=4194304
+  ceiling=$(_tcp_autotune_ceiling "$mem_tier")
+  [ "$buf" -gt "$ceiling" ] && buf="$ceiling"
+  echo "$buf"
+}
+
+show_tcp_auto_tune_wizard(){
+  local ssh_ip="" target_ip="" input
+  local rtt_ss="" rtt_ping="" rtt_ms="" rtt_src=""
+  local down_bw="" vps_bw="" eff_bw=""
+  local mem_tier mem_label bdp buffer_max bdp_mb buf_mb ceiling_mb
+
+  if ! require_root; then return 1; fi
+
+  render_section_header "智能 TCP 调参（自动实测）"
+  echo -e "  ${D}实测到你本地的 RTT + 你输入的带宽 → 按 BDP 自动计算缓冲区上限${N}"
+  echo ""
+
+  # --- 1/4 目标 IP：默认取当前 SSH 客户端 ---
+  [ -n "${SSH_CLIENT:-}" ] && ssh_ip=$(printf '%s' "$SSH_CLIENT" | awk '{print $1}')
+  while true; do
+    if [ -n "$ssh_ip" ]; then
+      echo -e "  ${B}检测到 SSH 客户端 IP${N} : ${C}${ssh_ip}${N}"
+      read -p "  测速目标 IP (回车用上面的，可手输 IPv4/IPv6，0 返回): " input
+      [ -z "$input" ] && input="$ssh_ip"
+    else
+      echo -e "  ${Y}未检测到 SSH 客户端 IP（可能经 su / 串口控制台进入）${N}"
+      read -p "  请输入测速目标 IP (IPv4/IPv6，0 返回): " input
+    fi
+    [ "$input" = "0" ] && return 1
+    case "$input" in
+      ''|*[!0-9a-fA-F:.]*)
+        echo -e "  ${R}IP 格式不合法${N}"
+        continue
+        ;;
+    esac
+    case "$input" in
+      *:*) is_private_ipv6 "$input" && echo -e "  ${Y}⚠ 这是内网/链路本地地址，测出的 RTT 不能代表公网路径${N}" ;;
+      *)   is_private_ipv4 "$input" && echo -e "  ${Y}⚠ 这是内网地址，如需测到你家里请用本地网络的公网出口 IP${N}" ;;
+    esac
+    target_ip="$input"
+    break
+  done
+
+  # --- 2/4 双路实测 RTT ---
+  echo ""
+  echo -e "${Y}==> 测量到 ${target_ip} 的 RTT (ss 读现有连接 + ping 5 发)...${N}"
+  rtt_ss=$(_tcp_autotune_rtt_from_ss "$target_ip")
+  rtt_ping=$(_tcp_autotune_rtt_from_ping "$target_ip")
+  [ -n "$rtt_ss" ]   && echo -e "  ${D}ss   (内核连接实测) : ${rtt_ss} ms${N}"
+  [ -n "$rtt_ping" ] && echo -e "  ${D}ping (5 发取 min)   : ${rtt_ping} ms${N}"
+
+  # 两条通道都只会高估、不会低估传播 RTT，故取可用结果的最小值
+  if [ -n "$rtt_ss" ] && [ -n "$rtt_ping" ]; then
+    if [ "$rtt_ping" -le "$rtt_ss" ]; then
+      rtt_ms="$rtt_ping"; rtt_src="ping·双路取小"
+    else
+      rtt_ms="$rtt_ss"; rtt_src="ss(tcp)·双路取小"
+    fi
+  elif [ -n "$rtt_ss" ]; then
+    rtt_ms="$rtt_ss"; rtt_src="ss(tcp)"
+  elif [ -n "$rtt_ping" ]; then
+    rtt_ms="$rtt_ping"; rtt_src="ping"
+  else
+    echo -e "  ${Y}两种方式都未测到（该 IP 无现存连接且 ICMP 不通）${N}"
+    while true; do
+      read -p "  请手动输入到该 IP 的 RTT (ms，1-2000，0 返回): " input
+      [ "$input" = "0" ] && return 1
+      case "$input" in
+        ''|*[!0-9]*) echo -e "  ${R}必须为正整数${N}"; continue ;;
+      esac
+      if [ "$input" -lt 1 ] || [ "$input" -gt 2000 ]; then
+        echo -e "  ${R}范围 1-2000 ms${N}"
+        continue
+      fi
+      rtt_ms="$input"; rtt_src="手动输入"
+      break
+    done
+  fi
+  if [ "$rtt_ms" -gt 800 ]; then
+    echo -e "  ${Y}⚠ RTT 超过 800ms，疑似测量异常，请确认目标 IP 是否正确${N}"
+  fi
+
+  # --- 3/4 带宽（家宽下行 VPS 侧测不了，报套餐值即可）---
+  echo ""
+  while true; do
+    read -p "  你本地的下载带宽 (Mbps，如 300 / 500 / 1000): " down_bw
+    case "$down_bw" in
+      ''|*[!0-9]*) echo -e "  ${R}必须为正整数${N}"; continue ;;
+    esac
+    if [ "$down_bw" -lt 1 ] || [ "$down_bw" -gt 10000 ]; then
+      echo -e "  ${R}范围 1-10000 Mbps${N}"
+      continue
+    fi
+    break
+  done
+  while true; do
+    read -p "  VPS 出口带宽 (Mbps，回车默认 1000): " vps_bw
+    vps_bw="${vps_bw:-1000}"
+    case "$vps_bw" in
+      *[!0-9]*) echo -e "  ${R}必须为正整数${N}"; continue ;;
+    esac
+    if [ "$vps_bw" -lt 1 ] || [ "$vps_bw" -gt 40000 ]; then
+      echo -e "  ${R}范围 1-40000 Mbps${N}"
+      continue
+    fi
+    break
+  done
+  eff_bw=$(( down_bw < vps_bw ? down_bw : vps_bw ))
+
+  # --- 4/4 计算 + 确认 ---
+  mem_tier=$(_tcp_autotune_mem_tier)
+  case "$mem_tier" in
+    512m) mem_label="512MB" ;;
+    1g)   mem_label="1GB"   ;;
+    2g)   mem_label="2GB"   ;;
+    4g)   mem_label="4GB"   ;;
+    *)    mem_label="8GB+"  ;;
+  esac
+  bdp=$((eff_bw * 125 * rtt_ms))
+  buffer_max=$(_tcp_autotune_calc_buffer "$rtt_ms" "$eff_bw" "$mem_tier")
+  bdp_mb=$(awk -v b="$bdp" 'BEGIN { printf "%.1f", b / 1048576 }')
+  buf_mb=$((buffer_max / 1024 / 1024))
+  ceiling_mb=$(( $(_tcp_autotune_ceiling "$mem_tier") / 1024 / 1024 ))
+
+  echo ""
+  echo -e "  ${B}${C}推荐方案${N}"
+  render_divider
+  echo -e "  实测 RTT    : ${C}${rtt_ms} ms${N} ${D}(${rtt_src})${N}"
+  echo -e "  有效带宽    : ${C}${eff_bw} Mbps${N} ${D}(本地 ${down_bw} / VPS ${vps_bw} 取小)${N}"
+  echo -e "  BDP         : ${C}${bdp_mb} MB${N} ${D}(带宽 × RTT)${N}"
+  echo -e "  buffer_max  : ${C}${buf_mb}M${N} ${D}(≈2×BDP 留探测余量; floor 4M, ${mem_label} 档顶 ${ceiling_mb}M)${N}"
+  echo -e "  rmem/wmem   : ${C}16384 524288 ${buffer_max}${N}"
+  echo -e "  拥塞 / 队列 : ${C}BBR + fq${N} ${D}(内核不支持时自动降级 cubic / fq_codel)${N}"
+  echo -e "  initcwnd    : ${C}32${N}"
+  echo -e "  内存档位    : ${C}${mem_label}${N} ${D}(自动检测，仅用于封顶)${N}"
+  render_divider
+  read -p "  确认应用以上参数? (y/N): " input
+  if [ "$input" != "y" ] && [ "$input" != "Y" ]; then
+    echo -e "  ${Y}已取消，未做任何修改${N}"
+    sleep 1
+    return 1
+  fi
+
+  if apply_network_optimization custom "$mem_tier" "$buffer_max" "$rtt_ms" "$eff_bw"; then
+    return 0
+  fi
+  return 1
 }
 
 show_quic_optimization_picker(){
@@ -5348,6 +5632,7 @@ show_network_optimization_status(){
         us-west) region_label="美西" ;;
         us-west-100m) region_label="美西 100M" ;;
         eu)      region_label="欧洲" ;;
+        custom)  region_label="自定义" ;;
       esac
       case "$mem_tier" in
         512m) mem_label="512MB" ;;
@@ -5358,6 +5643,13 @@ show_network_optimization_status(){
       esac
       if [ -n "$region_label" ] && [ -n "$mem_label" ]; then
         tcp_profile_text="${region_label} / ${mem_label}"
+        # custom 档补充展示当时的实测输入（marker 里的 rtt=/bw= 附加 token）
+        if [ "$region" = "custom" ]; then
+          local rtt_tok bw_tok
+          rtt_tok=$(printf '%s\n' "$profile_line" | sed -n 's/.*rtt=\([0-9]\+\).*/\1/p')
+          bw_tok=$(printf '%s\n' "$profile_line" | sed -n 's/.*bw=\([0-9]\+\).*/\1/p')
+          [ -n "$rtt_tok" ] && tcp_profile_text="${tcp_profile_text} (${rtt_tok}ms × ${bw_tok:-?}Mbps)"
+        fi
       fi
     fi
   else
@@ -9367,6 +9659,7 @@ render_tcp_card_line(){
       us-west) region_label="美西" ;;
       us-west-100m) region_label="美西 100M" ;;
       eu)      region_label="欧洲" ;;
+      custom)  region_label="自定义" ;;
     esac
     case "$mem_tier" in
       512m) mem_label="512M" ;;
