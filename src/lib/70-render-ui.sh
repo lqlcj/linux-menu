@@ -146,6 +146,7 @@ render_tcp_card_line(){
       us-west) region_label="美西" ;;
       us-west-100m) region_label="美西 100M" ;;
       eu)      region_label="欧洲" ;;
+      custom)  region_label="自定义" ;;
     esac
     case "$mem_tier" in
       512m) mem_label="512M" ;;
