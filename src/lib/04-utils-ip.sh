@@ -106,13 +106,13 @@ detect_primary_ipv6(){
 describe_install_mode(){
   case "$1" in
     ipv6-in-ipv4-out)
-      printf '%s' '仅 IPv6 入站 + 仅 IPv4 出站'
+      printf '%s' '仅 IPv6 入站'
       ;;
     dualstack)
-      printf '%s' '双栈入站 + 仅 IPv4 出站'
+      printf '%s' '双栈入站'
       ;;
     *)
-      printf '%s' '仅 IPv4 入站 + 仅 IPv4 出站'
+      printf '%s' '仅 IPv4 入站'
       ;;
   esac
 }

@@ -63,10 +63,14 @@ WARP_WGCF_RELEASE_API="https://api.github.com/repos/ViRb3/wgcf/releases/latest"
 WARP_OUTBOUND_TAG="warp-out"
 WARP_RULESET_TAG="geosite-google"
 WARP_RULESET_URL="https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-google.srs"
+WARP_RULESET_TAG_YT="geosite-youtube"
+WARP_RULESET_URL_YT="https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-youtube.srs"
 WARP_PEER_PUBLIC_KEY="bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo="
 WARP_ENDPOINT_HOST="162.159.192.1"
 WARP_ENDPOINT_PORT="2408"
 WARP_MTU="1280"
+# 端点优选候选（host:port，均为 Cloudflare WARP 官方段；WireGuard 仅 UDP）
+WARP_ENDPOINT_CANDIDATES="162.159.192.1:2408 162.159.193.10:2408 188.114.96.1:2408 188.114.97.1:2408 162.159.192.1:500 162.159.192.1:894 162.159.192.1:1701 162.159.192.1:4500 162.159.193.10:943"
 
 # ─── 颜色 ────────────────────────────────────────────
 G="\033[32m" Y="\033[33m" C="\033[36m" R="\033[31m" B="\033[1m" N="\033[0m"

@@ -54,9 +54,9 @@ install_reality_node(){
   TAG="${TAG:-reality}"
 
   echo -e "  监听模式："
-  echo "    1) 仅 IPv4 入站 + 仅 IPv4 出站 - 0.0.0.0（默认）"
-  echo "    2) 双栈入站 + 仅 IPv4 出站 - ::"
-  echo "    3) 仅 IPv6 入站 + 仅 IPv4 出站"
+  echo "    1) 仅 IPv4 入站 - 0.0.0.0（默认）"
+  echo "    2) 双栈入站 - ::"
+  echo "    3) 仅 IPv6 入站"
   read -p "  请选择 (1): " LISTEN_CHOICE
   case "$LISTEN_CHOICE" in
     2) LISTEN_ADDR="::"; install_mode="dualstack" ;;
@@ -68,7 +68,7 @@ install_reality_node(){
     public_ipv6=$(detect_primary_ipv6)
     if [ -z "$public_ipv6" ]; then
       echo ""
-      echo -e "${R}未检测到可用的 IPv6 地址，无法使用“仅 IPv6 入站 + 仅 IPv4 出站”模式${N}"
+      echo -e "${R}未检测到可用的 IPv6 地址，无法使用“仅 IPv6 入站”模式${N}"
       pause_screen
       return 1
     fi
@@ -215,7 +215,7 @@ EOF
   echo -e "  UUID      : ${C}$UUID${N}"
   echo -e "  PublicKey : ${C}$public_key${N}"
   echo -e "  入口 IP   : ${C}${access_ip:-未知}${N}"
-  echo -e "  出站策略  : ${C}仅 IPv4${N}"
+  echo -e "  出站策略  : ${C}双栈（跟随系统路由）${N}"
   echo -e "  端口      : ${C}$PORT${N}"
   echo -e "  SNI       : ${C}$SNI${N}"
   echo ""
