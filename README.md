@@ -26,7 +26,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/lqlcj/linux-menu/main/leyili
   └── src/
       ├── _header.sh      (70 行: shebang + 常量 + 颜色)
       ├── _entry.sh       (11 行: 入口判断 + show_menu 调用)
-      └── lib/            (31 个文件，72-1123 行不等)
+      └── lib/            (32 个文件，72-1123 行不等)
           ├── 00-utils-head.sh
           ├── 01-firewall-common.sh
           ├── 02-utils-ui.sh
@@ -57,4 +57,5 @@ bash <(curl -fsSL https://raw.githubusercontent.com/lqlcj/linux-menu/main/leyili
           ├── 90-warp.sh
           ├── 91-realm.sh
           ├── 92-status.sh
+          ├── 93-traffic.sh            ← 流量统计（累计 + 定时器落盘）
           └── 99-menu-main.sh

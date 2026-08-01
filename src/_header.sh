@@ -75,6 +75,13 @@ WARP_MTU="1280"
 # 端点优选候选（host:port，均为 Cloudflare WARP 官方段；WireGuard 仅 UDP）
 WARP_ENDPOINT_CANDIDATES="162.159.192.1:2408 162.159.193.10:2408 188.114.96.1:2408 188.114.97.1:2408 engage.cloudflareclient.com:2408 162.159.192.1:500 162.159.192.1:894 162.159.192.1:878 162.159.192.1:1701 162.159.192.1:4500 188.114.96.1:934 162.159.193.10:943"
 
+# ─── 流量统计（网卡计数累计 + systemd 定时器落盘）─────
+TRAFFIC_DIR="/etc/leyili/traffic"
+TRAFFIC_STATE_PATH="${TRAFFIC_DIR}/state.env"
+TRAFFIC_SAMPLER_PATH="${TRAFFIC_DIR}/sample.sh"
+TRAFFIC_SERVICE_PATH="/etc/systemd/system/leyili-traffic.service"
+TRAFFIC_TIMER_PATH="/etc/systemd/system/leyili-traffic.timer"
+
 # ─── 颜色 ────────────────────────────────────────────
 G="\033[32m" Y="\033[33m" C="\033[36m" R="\033[31m" B="\033[1m" N="\033[0m"
 L="\033[94m" W="\033[97m" D="\033[2m"

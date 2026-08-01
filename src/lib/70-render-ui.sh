@@ -5,10 +5,12 @@ CARD_INNER_WIDTH=52
 # 不依赖 wc -m 的 locale 行为，C / POSIX locale 下也能正确算 CJK 宽度。
 # 例外：U+2500-U+27BF 这一段（box drawing / 几何 / 杂项符号 / 装饰符）
 # 实际多为单倍宽，此处单独按 1 列计；其中 ✨ (U+2728) 是 emoji，仍按 2 列。
+# od 加 -v 防止重复字节块折叠成 *；tr 把多行并成单行，
+# 保证多字节字符不会跨 od 输出行导致 awk 取不到后续字节。
 _card_visible(){
   local s
   s=$(printf '%b' "$1" | sed $'s/\x1b\\[[0-9;]*[a-zA-Z]//g')
-  printf '%s' "$s" | od -An -tu1 | awk '
+  printf '%s' "$s" | od -An -v -tu1 | tr '\n' ' ' | awk '
     BEGIN { n = 0 }
     {
       for (i = 1; i <= NF; i++) {
@@ -256,6 +258,19 @@ render_realm_card_line(){
   render_card_line " ${C}✧${N} ${C}${label}${N}${C}v${ver}${N} ${D}·${N} ${status_str} ${D}·${N} ${C}${count}${N} ${D}条规则${N}"
 }
 
+# 流量统计行（单排）：入 / 出 / 共 用紧凑格式，实时叠加未落盘增量
+render_traffic_card_line(){
+  local label="流量统计   "  # 11 可见列
+  if ! traffic_load_state; then
+    render_card_line " ${C}✧${N} ${C}${label}${N}${D}未启用${N}"
+    return
+  fi
+  local totals rx tx sum
+  totals=$(traffic_live_totals)
+  read -r rx tx sum <<< "$totals"
+  render_card_line " ${C}✧${N} ${C}${label}${N}${D}入${N} ${C}$(traffic_format_compact "$rx")${N} ${D}·${N} ${D}出${N} ${C}$(traffic_format_compact "$tx")${N} ${D}·${N} ${D}共${N} ${C}$(traffic_format_compact "$sum")${N}"
+}
+
 # sing-box 内核版本行：当前版本 vs 最新稳定版（GitHub releases/latest 只返回稳定版）
 # 最新版走带缓存的查询，首页反复刷新也不会每次都打 GitHub。
 render_singbox_version_card_line(){
@@ -320,6 +335,7 @@ render_main_menu_card(){
   render_quic_card_line
   render_initcwnd_card_line
   render_realm_card_line
+  render_traffic_card_line
   render_card_blank
   render_card_bottom
 }
