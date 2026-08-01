@@ -44,6 +44,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/lqlcj/linux-menu/main/leyili
           ├── 30-node-render.sh
           ├── 40-network-tuning.sh
           ├── 41-update-self.sh
+          ├── 42-net-bench.sh          ← 本地链路测评（VPS ⇄ 家宽）
           ├── 50-node-reality.sh
           ├── 51-port-hop.sh
           ├── 52-node-hy2.sh

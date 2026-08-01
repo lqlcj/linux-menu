@@ -130,6 +130,15 @@ uninstall_script_completely(){
     [ -d /etc/leyili ] && rmdir --ignore-fail-on-non-empty /etc/leyili 2>/dev/null || true
   fi
 
+  # 3.6 链路测评（目标 IP 记录 + 历史报告 + 脚本自装的 nexttrace）
+  # NETBENCH_NEXTTRACE_BIN 是独立文件名，不会误删用户自装的 /usr/local/bin/nexttrace
+  if [ -f "$NETBENCH_ENV_PATH" ] || [ -f "$NETBENCH_NEXTTRACE_BIN" ] || [ -n "$(_nb_latest_report)" ]; then
+    echo -e "${Y}==> 清理链路测评数据与 nexttrace...${N}"
+    rm -f "$NETBENCH_ENV_PATH" "$NETBENCH_NEXTTRACE_BIN"
+    rm -f "${NETBENCH_REPORT_PREFIX}"-*.txt
+    [ -d /etc/leyili ] && rmdir --ignore-fail-on-non-empty /etc/leyili 2>/dev/null || true
+  fi
+
   # 4. 脚本痕迹
   echo -e "${Y}==> 清理脚本本体与 legacy 信息文件...${N}"
   rm -f "$INFO_PATH"
