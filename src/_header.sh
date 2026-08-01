@@ -56,10 +56,13 @@ IP4_RULES_PATH_RHEL="/etc/sysconfig/iptables"
 # ─── WARP 谷歌解锁分流 ───────────────────────────────
 WARP_APP_NAME="WARP 谷歌解锁分流"
 WARP_DIR="/etc/leyili/warp"
-WARP_WGCF_ACCOUNT="${WARP_DIR}/wgcf-account.toml"
-WARP_WGCF_PROFILE="${WARP_DIR}/wgcf-profile.conf"
+WARP_ACCOUNT_JSON="${WARP_DIR}/account.json"
+# 旧版 wgcf 方案的遗留二进制路径：仅在卸载时清理用
 WARP_WGCF_BIN="/usr/local/bin/wgcf"
-WARP_WGCF_RELEASE_API="https://api.github.com/repos/ViRb3/wgcf/releases/latest"
+# 模拟官方安卓客户端的注册 API（与 fscarmen/warp、warp-reg 同款参数）
+WARP_API_BASE="https://api.cloudflareclient.com/v0a2158"
+WARP_API_UA="okhttp/3.12.1"
+WARP_API_CLIENT_VER="a-6.10-2158"
 WARP_OUTBOUND_TAG="warp-out"
 WARP_RULESET_TAG="geosite-google"
 WARP_RULESET_URL="https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-google.srs"
@@ -70,7 +73,7 @@ WARP_ENDPOINT_HOST="162.159.192.1"
 WARP_ENDPOINT_PORT="2408"
 WARP_MTU="1280"
 # 端点优选候选（host:port，均为 Cloudflare WARP 官方段；WireGuard 仅 UDP）
-WARP_ENDPOINT_CANDIDATES="162.159.192.1:2408 162.159.193.10:2408 188.114.96.1:2408 188.114.97.1:2408 162.159.192.1:500 162.159.192.1:894 162.159.192.1:1701 162.159.192.1:4500 162.159.193.10:943"
+WARP_ENDPOINT_CANDIDATES="162.159.192.1:2408 162.159.193.10:2408 188.114.96.1:2408 188.114.97.1:2408 engage.cloudflareclient.com:2408 162.159.192.1:500 162.159.192.1:894 162.159.192.1:878 162.159.192.1:1701 162.159.192.1:4500 188.114.96.1:934 162.159.193.10:943"
 
 # ─── 颜色 ────────────────────────────────────────────
 G="\033[32m" Y="\033[33m" C="\033[36m" R="\033[31m" B="\033[1m" N="\033[0m"

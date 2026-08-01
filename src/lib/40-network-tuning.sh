@@ -631,8 +631,8 @@ show_network_optimization_menu(){
 # 思路：RTT 用两条独立通道实测取小 —— ss 直接读「本机与目标 IP 现有 TCP 连接」
 # 的内核统计（用户正 SSH 在线，天然有一条到家里的活连接，ICMP 被禁也能测）；
 # ping 5 发取 min 作交叉验证。带宽让用户报套餐值（VPS 侧无法单方面测出家宽
-# 下行）。BDP = 带宽 × RTT，buffer_max ≈ 2×BDP 留 BBR 探测余量，再按内存档
-# 封顶防 OOM，最后经 apply_network_optimization 落盘。
+# 下行）。BDP = 带宽 × RTT，buffer_max ≈ 3×BDP 留 BBR 探测与晚高峰余量，再按
+# 内存档封顶防 OOM，最后经 apply_network_optimization 落盘。
 
 # 读内核对「与目标 IP 的既有 TCP 连接」的实测 RTT（输出整数 ms；空 = 无数据）。
 # 优先 minrtt（连接存续期最小值，最接近纯传播时延），退化用 rtt: 平滑均值；
@@ -711,14 +711,17 @@ _tcp_autotune_ceiling(){
   esac
 }
 
-# BDP → buffer_max：2×BDP（adv_win_scale=2 下窗口≈3/4 缓冲，且给 BBR ProbeBW
-# 留余量），向上取整到 2MiB（与地区表粒度一致），floor 4M，按内存档封顶。
+# BDP → buffer_max：3×BDP，向上取整到 2MiB，floor 8M，按内存档封顶。
+# 乘数取 3：BBR cwnd 上限 = 2×BDP（cwnd_gain），内核 sndbuf 自动扩容又按
+# 「在途 ×2 + skb 开销」定目标，2×BDP 会让 ProbeBW 阶段被发送缓冲卡住；
+# 且晚高峰入国方向排队会让实际 RTT 高于实测 minRTT，3× 把这些余量都包进来。
+# floor 8M 来自 100M 跨洋线的历史实测（原 us-west-100m 档：8M 比 4M/16M 稳）。
 _tcp_autotune_calc_buffer(){
   local rtt_ms="$1" bw_mbps="$2" mem_tier="$3"
   local raw buf ceiling
-  raw=$((bw_mbps * 125 * rtt_ms * 2))
+  raw=$((bw_mbps * 125 * rtt_ms * 3))
   buf=$(( (raw + 2097151) / 2097152 * 2097152 ))
-  [ "$buf" -lt 4194304 ] && buf=4194304
+  [ "$buf" -lt 8388608 ] && buf=8388608
   ceiling=$(_tcp_autotune_ceiling "$mem_tier")
   [ "$buf" -gt "$ceiling" ] && buf="$ceiling"
   echo "$buf"
@@ -900,7 +903,7 @@ show_tcp_auto_tune_wizard(){
   echo -e "  实测 RTT    : ${C}${rtt_ms} ms${N} ${D}(${rtt_src})${N}"
   echo -e "  有效带宽    : ${C}${eff_bw} Mbps${N} ${D}(本地 ${down_bw} / VPS ${vps_bw} 取小)${N}"
   echo -e "  BDP         : ${C}${bdp_mb} MB${N} ${D}(带宽 × RTT)${N}"
-  echo -e "  buffer_max  : ${C}${buf_mb}M${N} ${D}(≈2×BDP 留探测余量; floor 4M, ${mem_label} 档顶 ${ceiling_mb}M)${N}"
+  echo -e "  buffer_max  : ${C}${buf_mb}M${N} ${D}(≈3×BDP 留探测余量; floor 8M, ${mem_label} 档顶 ${ceiling_mb}M)${N}"
   echo -e "  rmem/wmem   : ${C}16384 524288 ${buffer_max}${N}"
   echo -e "  拥塞 / 队列 : ${C}BBR + fq${N} ${D}(内核不支持时自动降级 cubic / fq_codel)${N}"
   echo -e "  initcwnd    : ${C}32${N}"
