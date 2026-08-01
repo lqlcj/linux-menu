@@ -3,115 +3,157 @@ warp_log_info() { echo -e "  ${C}●${N} $*" >&2; }
 warp_log_warn() { echo -e "  ${Y}⚠${N} $*" >&2; }
 warp_log_err()  { echo -e "  ${R}✗${N} $*" >&2; }
 
-warp_detect_arch(){
-  case "$(uname -m)" in
-    x86_64|amd64) printf 'amd64' ;;
-    aarch64|arm64) printf 'arm64' ;;
-    armv7l|armv7) printf 'armv7' ;;
-    *) printf 'unknown' ;;
-  esac
-}
+# ── 账号注册：curl 直连 Cloudflare API（wgcf 方案已废弃）──────────────
+# 旧版用 wgcf 二进制：要从 GitHub API 拿版本再下 release（VPS 上极易被限流/
+# 阻断），且 Cloudflare 收紧注册接口后老版本 wgcf 频繁 403/429 —— 这就是旧版
+# 「WARP 分流」装不上的根因。现改为主流脚本（fscarmen/warp、warp-reg）同款：
+# openssl 生成 X25519 密钥对，curl 模拟官方安卓客户端注册，一次拿全 v4/v6
+# 内网地址 + peer 公钥 + client_id，存成 ${WARP_DIR}/account.json。
+# client_id 解码出的 3 字节即 WireGuard 报文头的 reserved 字段 —— 旧版写死
+# [0,0,0]，部分 PoP 会「握手成功但无数据」，本次一并修正。
 
-warp_install_wgcf(){
-  if [ -x "$WARP_WGCF_BIN" ]; then
-    return 0
+warp_gen_keypair(){
+  local pem priv pub
+  if command -v wg >/dev/null 2>&1; then
+    priv=$(wg genkey 2>/dev/null)
+    pub=$(printf '%s' "$priv" | wg pubkey 2>/dev/null)
+  else
+    pem=$(openssl genpkey -algorithm X25519 2>/dev/null)
+    if [ -z "$pem" ]; then
+      warp_log_err "openssl 生成 X25519 密钥失败（需要 openssl 1.1.0+，或安装 wireguard-tools）"
+      return 1
+    fi
+    # PKCS8 私钥 / SPKI 公钥的 DER 最后 32 字节就是裸密钥（免依赖 xxd）
+    priv=$(printf '%s\n' "$pem" | openssl pkey -outform DER 2>/dev/null | tail -c 32 | base64)
+    pub=$(printf '%s\n' "$pem" | openssl pkey -pubout -outform DER 2>/dev/null | tail -c 32 | base64)
   fi
-  local arch tag url
-  arch=$(warp_detect_arch)
-  if [ "$arch" = "unknown" ]; then
-    warp_log_err "不支持的架构：$(uname -m)"
+  if [ -z "$priv" ] || [ -z "$pub" ]; then
+    warp_log_err "生成 WireGuard 密钥对失败"
     return 1
   fi
-  warp_log_info "下载 wgcf（${arch}）..."
-  tag=$(curl -fsSL --max-time 10 "$WARP_WGCF_RELEASE_API" 2>/dev/null | jq -r '.tag_name' 2>/dev/null)
-  if [ -z "$tag" ] || [ "$tag" = "null" ]; then
-    warp_log_warn "GitHub API 取版本失败，回退固定版本 v2.2.19"
-    tag="v2.2.19"
-  fi
-  url="https://github.com/ViRb3/wgcf/releases/download/${tag}/wgcf_${tag#v}_linux_${arch}"
-  if ! curl -fsSL --max-time 60 "$url" -o "$WARP_WGCF_BIN"; then
-    warp_log_err "wgcf 下载失败：$url"
-    return 1
-  fi
-  chmod +x "$WARP_WGCF_BIN"
-  warp_log_ok "wgcf 安装完成（${tag}）"
+  printf '%s %s\n' "$priv" "$pub"
 }
 
 warp_register_account(){
   mkdir -p "$WARP_DIR"
-  # 三种状态：
-  #  - 两个文件都在  → 跳过
-  #  - 只有 account 在 → 只跑 generate
-  #  - 都没有         → register + generate
-  if [ -f "$WARP_WGCF_ACCOUNT" ] && [ -f "$WARP_WGCF_PROFILE" ]; then
+  chmod 700 "$WARP_DIR" 2>/dev/null || true
+  if [ -s "$WARP_ACCOUNT_JSON" ]; then
     return 0
   fi
+  ensure_jq || return 1
 
-  local log
-  log=$(mktemp)
-
-  if [ ! -f "$WARP_WGCF_ACCOUNT" ]; then
-    warp_log_info "向 Cloudflare 注册 WARP 账号..."
-    if ! ( cd "$WARP_DIR" && "$WARP_WGCF_BIN" register --accept-tos ) >"$log" 2>&1; then
-      warp_log_err "wgcf register 失败，原始输出："
-      sed 's/^/    /' "$log"
-      echo ""
-      echo -e "  ${D}排查建议：${N}"
-      echo -e "  ${D}1) 手动跑：cd ${WARP_DIR} && ${WARP_WGCF_BIN} register --accept-tos${N}"
-      echo -e "  ${D}2) 若提示 429/Too Many Requests，等 5 分钟再试（Cloudflare 限流）${N}"
-      echo -e "  ${D}3) 若提示 TLS/handshake 错误，检查时间是否同步：date${N}"
-      rm -f "$log"
-      return 1
-    fi
-    warp_log_ok "账号已注册：${WARP_WGCF_ACCOUNT}"
-  else
-    warp_log_info "已存在 wgcf-account.toml，跳过 register"
-  fi
-
-  warp_log_info "生成 WireGuard 配置..."
-  if ! ( cd "$WARP_DIR" && "$WARP_WGCF_BIN" generate ) >"$log" 2>&1; then
-    warp_log_err "wgcf generate 失败，原始输出："
-    sed 's/^/    /' "$log"
-    rm -f "$log"
+  local priv pub
+  read -r priv pub <<< "$(warp_gen_keypair)"
+  if [ -z "$priv" ] || [ -z "$pub" ]; then
     return 1
   fi
-  rm -f "$log"
-  warp_log_ok "WARP 账号已生成：${WARP_WGCF_PROFILE}"
+
+  local install_id fcm_token body resp try
+  install_id=$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 22)
+  fcm_token="${install_id}:APA91b$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 134)"
+  body=$(jq -nc --arg key "$pub" --arg iid "$install_id" --arg fcm "$fcm_token" \
+        --arg tos "$(date -u +%Y-%m-%dT%H:%M:%S.000Z)" \
+        '{key:$key, install_id:$iid, fcm_token:$fcm, tos:$tos,
+          model:"PC", serial_number:$iid, locale:"zh_CN"}')
+
+  warp_log_info "向 Cloudflare 注册 WARP 账号（直连 API，不下载任何二进制）..."
+  resp=""
+  for try in 1 2 3 4 5 6; do
+    resp=$(curl -sL --tlsv1.2 --max-time 20 -X POST "${WARP_API_BASE}/reg" \
+      -H "User-Agent: ${WARP_API_UA}" \
+      -H "CF-Client-Version: ${WARP_API_CLIENT_VER}" \
+      -H 'Content-Type: application/json' \
+      --data "$body" 2>/dev/null)
+    if printf '%s' "$resp" | jq -e '(.result // .) | .config.peers[0].public_key' >/dev/null 2>&1; then
+      break
+    fi
+    # error code: 1015 = Cloudflare 按 IP 限流，机房 IP 信誉差时常见，等一等再试
+    warp_log_warn "第 ${try}/6 次注册未成功${resp:+：$(printf '%.80s' "$(printf '%s' "$resp" | tr -d '\n')")}"
+    resp=""
+    [ "$try" -lt 6 ] && sleep $((try * 5))
+  done
+  if [ -z "$resp" ]; then
+    warp_log_err "注册失败（6 次尝试后放弃）"
+    echo -e "  ${D}排查建议：${N}"
+    echo -e "  ${D}1) 限流（error code: 1015 / 429）：此 IP 注册太频繁，等 10-30 分钟再试${N}"
+    echo -e "  ${D}2) 一直无响应：跑 curl -sI --max-time 10 https://api.cloudflareclient.com${N}"
+    echo -e "  ${D}   若不通说明本机到 Cloudflare API 被阻断，需在别处注册后拷贝 account.json 过来${N}"
+    return 1
+  fi
+
+  # 兼容有无 .result 包裹两种返回，并把我们自己的私钥合进去一起落盘
+  if ! printf '%s' "$resp" | jq --arg pk "$priv" '(.result // .) + {private_key: $pk}' \
+       > "$WARP_ACCOUNT_JSON" 2>/dev/null; then
+    warp_log_err "写入 ${WARP_ACCOUNT_JSON} 失败"
+    rm -f "$WARP_ACCOUNT_JSON"
+    return 1
+  fi
+  chmod 600 "$WARP_ACCOUNT_JSON" 2>/dev/null || true
+  warp_log_ok "WARP 账号已注册：${WARP_ACCOUNT_JSON}"
 }
 
 warp_reregister_account(){
-  rm -f "$WARP_WGCF_ACCOUNT" "$WARP_WGCF_PROFILE"
+  # 连旧版 wgcf 的残留一起清，保证走新注册链路
+  rm -f "$WARP_ACCOUNT_JSON" "${WARP_DIR}/wgcf-account.toml" "${WARP_DIR}/wgcf-profile.conf"
   warp_register_account
 }
 
-# 解析 wgcf-profile.conf，输出 KEY=VALUE 行供 eval 使用
-# 兼容两种格式：
-#   - 旧版：两条独立 Address 行（v4 一条、v6 一条）
-#   - wgcf v2.2.30+：一条 Address 行，v4/v6 用逗号分隔
+# 解析 account.json，输出 KEY='VALUE' 行供 eval 使用。
+# WARP_RESERVED 为 client_id base64 解码出的 3 字节（逗号分隔），注入
+# endpoint.peers[].reserved；解不出时回退 0,0,0 并靠端点优选兜底
 warp_parse_profile(){
-  local f="$WARP_WGCF_PROFILE"
-  [ -f "$f" ] || { warp_log_err "wgcf 配置缺失：$f"; return 1; }
-  local pk addr_blob v4 v6 one
-  pk=$(awk '/^[[:space:]]*PrivateKey[[:space:]]*=/ {sub(/^[^=]*=[[:space:]]*/, ""); print; exit}' "$f" | tr -d ' \r')
-  # 收集所有 Address 行（不带 ; exit），合并后按逗号拆，逐段按是否含 ':' 分流到 v4/v6
-  addr_blob=$(awk '/^[[:space:]]*Address[[:space:]]*=/ {sub(/^[^=]*=[[:space:]]*/, ""); print}' "$f" | tr -d '\r')
-  while IFS= read -r one; do
-    one="${one//[[:space:]]/}"
-    [ -z "$one" ] && continue
-    if [[ "$one" == *:* ]]; then
-      [ -z "$v6" ] && v6="$one"
+  local f="$WARP_ACCOUNT_JSON"
+  if [ ! -s "$f" ]; then
+    if [ -f "${WARP_DIR}/wgcf-profile.conf" ]; then
+      warp_log_err "检测到旧版 wgcf 账号；新版已改用 API 直注，请走「重新注册」生成 account.json"
     else
-      [ -z "$v4" ] && v4="$one"
+      warp_log_err "WARP 账号缺失：$f（请先安装/注册）"
     fi
-  done < <(printf '%s\n' "$addr_blob" | tr ',' '\n')
-  if [ -z "$pk" ] || [ -z "$v4" ]; then
-    warp_log_err "解析 wgcf 配置失败（缺 PrivateKey 或 IPv4 Address）"
-    warp_log_err "请检查：cat $f"
     return 1
   fi
-  printf 'WARP_PRIVATE_KEY=%s\n' "$pk"
-  printf 'WARP_LOCAL_V4=%s\n'    "$v4"
-  printf 'WARP_LOCAL_V6=%s\n'    "$v6"
+  ensure_jq || return 1
+  local pk v4 v6 peerpk cid reserved
+  pk=$(jq -r '.private_key // empty' "$f" 2>/dev/null)
+  v4=$(jq -r '.config.interface.addresses.v4 // empty' "$f" 2>/dev/null)
+  v6=$(jq -r '.config.interface.addresses.v6 // empty' "$f" 2>/dev/null)
+  peerpk=$(jq -r '.config.peers[0].public_key // empty' "$f" 2>/dev/null)
+  cid=$(jq -r '.config.client_id // empty' "$f" 2>/dev/null)
+  if [ -z "$pk" ] || [ -z "$v4" ]; then
+    warp_log_err "解析 account.json 失败（缺 private_key 或 v4 地址），请「重新注册」"
+    return 1
+  fi
+  # API 返回裸地址，sing-box endpoint.address 需要 CIDR
+  case "$v4" in */*) ;; *) v4="${v4}/32" ;; esac
+  case "$v6" in ''|*/*) ;; *) v6="${v6}/128" ;; esac
+  reserved=""
+  if [ -n "$cid" ]; then
+    reserved=$(printf '%s' "$cid" | base64 -d 2>/dev/null | od -An -tu1 2>/dev/null \
+      | awk 'NF >= 3 {printf "%d,%d,%d", $1, $2, $3; exit}')
+  fi
+  [ -n "$reserved" ] || reserved="0,0,0"
+  printf "WARP_PRIVATE_KEY='%s'\n" "$pk"
+  printf "WARP_LOCAL_V4='%s'\n"    "$v4"
+  printf "WARP_LOCAL_V6='%s'\n"    "$v6"
+  printf "WARP_PEER_PK='%s'\n"     "${peerpk:-$WARP_PEER_PUBLIC_KEY}"
+  printf "WARP_RESERVED='%s'\n"    "$reserved"
+}
+
+# sing-box 版本护栏：endpoints 需 1.11+，本模块骨架用的新版 DNS/route 字段
+# （default_domain_resolver、dns type local）需 1.12+。低版本 sing-box check
+# 只会报一堆看不懂的字段错误，这里先把话说明白
+warp_require_singbox_112(){
+  local ver major minor
+  ver=$(sing-box version 2>/dev/null | awk 'NR==1 {print $3}')
+  major="${ver%%.*}"
+  minor="${ver#*.}"; minor="${minor%%.*}"; minor="${minor%%[!0-9]*}"
+  case "$major" in ''|*[!0-9]*) warp_log_warn "读不到 sing-box 版本号，跳过版本检查"; return 0 ;; esac
+  case "$minor" in ''|*[!0-9]*) minor=0 ;; esac
+  if [ "$major" -gt 1 ] || { [ "$major" -eq 1 ] && [ "$minor" -ge 12 ]; }; then
+    return 0
+  fi
+  warp_log_err "当前 sing-box ${ver} 过旧，WARP 分流需要 ≥ 1.12（endpoints + 新版 DNS 字段）"
+  echo -e "  ${D}请先到「节点管理」把 sing-box 升到最新稳定版，再回来装 WARP${N}"
+  return 1
 }
 
 # 安全编辑 sing-box 配置：写临时文件 → sing-box check 通过后才覆盖
@@ -149,7 +191,7 @@ warp_current_endpoint(){
 }
 
 warp_config_inject(){
-  local v4="$1" v6="$2" pk="$3"
+  local v4="$1" v6="$2" pk="$3" peerpk="${4:-$WARP_PEER_PUBLIC_KEY}" reserved="${5:-0,0,0}"
   ensure_jq || return 1
   [ -f "$CONFIG_PATH" ] || { warp_log_err "config.json 不存在：$CONFIG_PATH"; return 1; }
   # 骨架兜底：保证 dns local 解析器 + route.default_domain_resolver 存在
@@ -182,7 +224,7 @@ warp_config_inject(){
               "public_key": $peerpk,
               "allowed_ips": ["0.0.0.0/0", "::/0"],
               "persistent_keepalive_interval": 25,
-              "reserved": [0, 0, 0]
+              "reserved": ($reserved | split(",") | map(tonumber))
             }]
           }]
     | .route = (.route // {})
@@ -220,7 +262,8 @@ warp_config_inject(){
     --arg port    "$port" \
     --arg mtu     "$WARP_MTU" \
     --arg pk      "$pk" \
-    --arg peerpk  "$WARP_PEER_PUBLIC_KEY" \
+    --arg peerpk  "$peerpk" \
+    --arg reserved "$reserved" \
     --arg addrs   "$addr_json"
 }
 
@@ -261,17 +304,18 @@ warp_do_install(){
   echo -e "  ${D}本模块只修改 /etc/sing-box/config.json，加一个 WireGuard 出站，${N}"
   echo -e "  ${D}并把 geosite google/youtube 命中的流量改走 Cloudflare WARP，其它保持直连。${N}"
   echo -e "  ${D}同时开启域名嗅探（QUIC/TLS SNI），保证按 IP 直连的流量也能命中规则。${N}"
+  echo -e "  ${D}账号经 curl 直连 Cloudflare API 注册，不下载任何第三方二进制；${N}"
   echo -e "  ${D}不会动 iptables / 系统路由${N}"
   echo ""
 
-  warp_install_wgcf     || { pause_screen; return 1; }
-  warp_register_account || { pause_screen; return 1; }
+  warp_require_singbox_112 || { pause_screen; return 1; }
+  warp_register_account    || { pause_screen; return 1; }
 
   local kv
   kv=$(warp_parse_profile) || { pause_screen; return 1; }
   eval "$kv"
 
-  warp_config_inject "$WARP_LOCAL_V4" "$WARP_LOCAL_V6" "$WARP_PRIVATE_KEY" \
+  warp_config_inject "$WARP_LOCAL_V4" "$WARP_LOCAL_V6" "$WARP_PRIVATE_KEY" "$WARP_PEER_PK" "$WARP_RESERVED" \
     || { warp_log_err "写入 sing-box 配置失败"; pause_screen; return 1; }
   warp_log_ok "sing-box 配置已更新"
 
@@ -301,12 +345,12 @@ warp_do_uninstall(){
   config_check_and_restart >/dev/null 2>&1 || true
   warp_log_ok "已从 sing-box 配置中移除 WARP"
 
-  read -r -p "  是否同时删除 wgcf 二进制 与 ${WARP_DIR}（含账号）？[y/N]: " yn2
+  read -r -p "  是否同时删除账号目录 ${WARP_DIR}（含 account.json 与旧版 wgcf 残留）？[y/N]: " yn2
   case "$yn2" in
     [yY]*)
       rm -f "$WARP_WGCF_BIN"
       rm -rf "$WARP_DIR"
-      warp_log_ok "wgcf 与账号文件已清理"
+      warp_log_ok "账号文件与旧版 wgcf 残留已清理"
       ;;
   esac
   pause_screen
@@ -327,7 +371,7 @@ warp_do_reregister(){
   kv=$(warp_parse_profile) || { pause_screen; return 1; }
   eval "$kv"
 
-  warp_config_inject "$WARP_LOCAL_V4" "$WARP_LOCAL_V6" "$WARP_PRIVATE_KEY" \
+  warp_config_inject "$WARP_LOCAL_V4" "$WARP_LOCAL_V6" "$WARP_PRIVATE_KEY" "$WARP_PEER_PK" "$WARP_RESERVED" \
     || { pause_screen; return 1; }
   config_check_and_restart && warp_log_ok "完成，已切到新的 WARP 账号" \
                           || warp_log_err "sing-box 重启失败"
@@ -353,8 +397,10 @@ warp_do_status(){
   read -r ep_host ep_port <<< "$(warp_current_endpoint)"
   render_info_line "端点" "${ep_host}:${ep_port}"
 
-  if [ -f "$WARP_WGCF_ACCOUNT" ]; then
-    render_info_line "WARP 账号" "${G}已注册${N} ${D}($(stat -c %y "$WARP_WGCF_ACCOUNT" 2>/dev/null | cut -d. -f1))${N}"
+  if [ -s "$WARP_ACCOUNT_JSON" ]; then
+    render_info_line "WARP 账号" "${G}已注册${N} ${D}($(stat -c %y "$WARP_ACCOUNT_JSON" 2>/dev/null | cut -d. -f1))${N}"
+  elif [ -f "${WARP_DIR}/wgcf-profile.conf" ]; then
+    render_info_line "WARP 账号" "${Y}旧版 wgcf 格式，请「重新注册」迁移${N}"
   else
     render_info_line "WARP 账号" "${R}未注册${N}"
   fi
@@ -387,7 +433,7 @@ warp_probe_via_tunnel(){
   local host="$1" port="$2"
   local kv
   kv=$(warp_parse_profile) || return 1
-  local WARP_PRIVATE_KEY WARP_LOCAL_V4 WARP_LOCAL_V6
+  local WARP_PRIVATE_KEY WARP_LOCAL_V4 WARP_LOCAL_V6 WARP_PEER_PK WARP_RESERVED
   eval "$kv"
 
   local addr_json
@@ -404,7 +450,8 @@ warp_probe_via_tunnel(){
     sport=$(( (RANDOM % 20000) + 30000 ))
     jq -n \
       --arg host "$host" --arg port "$port" \
-      --arg pk "$WARP_PRIVATE_KEY" --arg peerpk "$WARP_PEER_PUBLIC_KEY" \
+      --arg pk "$WARP_PRIVATE_KEY" --arg peerpk "$WARP_PEER_PK" \
+      --arg reserved "$WARP_RESERVED" \
       --arg addrs "$addr_json" --arg mtu "$WARP_MTU" \
       --argjson sport "$sport" '
       {
@@ -416,7 +463,8 @@ warp_probe_via_tunnel(){
           "mtu": ($mtu | tonumber), "address": ($addrs | fromjson), "private_key": $pk,
           "peers": [{
             "address": $host, "port": ($port | tonumber), "public_key": $peerpk,
-            "allowed_ips": ["0.0.0.0/0", "::/0"], "reserved": [0, 0, 0]
+            "allowed_ips": ["0.0.0.0/0", "::/0"],
+            "reserved": ($reserved | split(",") | map(tonumber))
           }]
         }],
         "route": {"final": "warp-probe", "default_domain_resolver": "dns-local"}
@@ -552,15 +600,17 @@ warp_do_endpoint_pick(){
 warp_do_reinject(){
   require_root || return 1
   render_section_header "${WARP_APP_NAME} - 重新注入分流规则"
-  echo -e "  ${D}用途：升级旧配置（补 YouTube 规则集 / 域名嗅探 / DNS 解析器）或修复被改坏的规则${N}"
+  echo -e "  ${D}用途：升级旧配置（补 YouTube 规则集 / 域名嗅探 / DNS 解析器 / reserved 字段）或修复被改坏的规则${N}"
   echo -e "  ${D}不改 WARP 账号，不改已优选的端点${N}"
   echo ""
+
+  warp_require_singbox_112 || { pause_screen; return 1; }
 
   local kv
   kv=$(warp_parse_profile) || { pause_screen; return 1; }
   eval "$kv"
 
-  warp_config_inject "$WARP_LOCAL_V4" "$WARP_LOCAL_V6" "$WARP_PRIVATE_KEY" \
+  warp_config_inject "$WARP_LOCAL_V4" "$WARP_LOCAL_V6" "$WARP_PRIVATE_KEY" "$WARP_PEER_PK" "$WARP_RESERVED" \
     || { pause_screen; return 1; }
   config_check_and_restart && warp_log_ok "规则已重新注入，sing-box 已重启" \
                           || warp_log_err "sing-box 重启失败，请用 journalctl -u sing-box 查看"
