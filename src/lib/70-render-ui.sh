@@ -141,12 +141,13 @@ render_tcp_card_line(){
     region=$(printf '%s\n' "$profile_line" | sed -n 's/.*region=\([a-z0-9-]\+\).*/\1/p')
     mem_tier=$(printf '%s\n' "$profile_line" | sed -n 's/.*mem_tier=\([a-z0-9]\+\).*/\1/p')
     case "$region" in
+      # hk/jp/us-west/eu 为旧版固定地区档的存量 marker，仅保留展示映射
       hk)      region_label="香港" ;;
       jp)      region_label="日本" ;;
       us-west) region_label="美西" ;;
       us-west-100m) region_label="美西 100M" ;;
       eu)      region_label="欧洲" ;;
-      custom)  region_label="自定义" ;;
+      custom)  region_label="自动实测" ;;
     esac
     case "$mem_tier" in
       512m) mem_label="512M" ;;
