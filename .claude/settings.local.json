@@ -79,7 +79,10 @@
       "Bash(rm -rf 'C:\\\\Users\\\\leyili/sb_probe')",
       "Bash(jq --version)",
       "Bash(mkdir -p /tmp/jqtest)",
-      "Bash(/tmp/jqtest/jq.exe --version)"
+      "Bash(/tmp/jqtest/jq.exe --version)",
+      "Bash(python *)",
+      "Bash(./build.sh *)",
+      "Bash(shellcheck -S warning -s bash src/lib/42-net-bench.sh)"
     ]
   }
 }
