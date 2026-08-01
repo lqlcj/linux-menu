@@ -12,6 +12,9 @@ uninstall_script_completely(){
   if realm_is_installed; then
     echo -e "    ${L}·${N} Realm 中转服务、所有转发规则与 ${C}${REALM_CONFIG_DIR}${N} 目录"
   fi
+  if [ -f "$TRAFFIC_STATE_PATH" ] || [ -f "$TRAFFIC_TIMER_PATH" ]; then
+    echo -e "    ${L}·${N} 流量统计定时器与累计数据"
+  fi
   echo -e "    ${L}·${N} ${C}${INFO_PATH}${N} 与 ${C}${SCRIPT_PATH}${N}"
   echo ""
   echo -e "  ${D}保留：SSH 配置 / 用户账户 / sudoers / 自动更新 / IPv6 防火墙规则 / 1Panel${N}"
@@ -117,6 +120,14 @@ uninstall_script_completely(){
   if realm_is_installed; then
     echo -e "${Y}==> 卸载 Realm 中转服务...${N}"
     realm_uninstall >/dev/null 2>&1 || true
+  fi
+
+  # 3.5 流量统计（定时器 + 采样器 + 累计数据）
+  if [ -f "$TRAFFIC_STATE_PATH" ] || [ -f "$TRAFFIC_TIMER_PATH" ] || [ -f "$TRAFFIC_SERVICE_PATH" ]; then
+    echo -e "${Y}==> 清理流量统计定时器与数据...${N}"
+    traffic_remove_units
+    rm -rf "$TRAFFIC_DIR"
+    [ -d /etc/leyili ] && rmdir --ignore-fail-on-non-empty /etc/leyili 2>/dev/null || true
   fi
 
   # 4. 脚本痕迹

@@ -23,6 +23,7 @@ show_menu(){
     render_menu_item 8 "卸载脚本"
     render_menu_item 9 "更新管理"
     render_menu_item 10 "服务器状态"
+    render_menu_item 11 "流量统计"
     render_menu_item 0 "退出"
     render_divider
     read -p "  请输入序号: " choice
@@ -61,6 +62,9 @@ show_menu(){
         ;;
       10)
         show_server_status
+        ;;
+      11)
+        show_traffic_menu
         ;;
       0)
         exit 0
