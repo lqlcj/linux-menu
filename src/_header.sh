@@ -26,22 +26,6 @@ SWAPFILE_PATH="/swapfile"
 SWAP_SYSCTL_PATH="/etc/sysctl.d/99-swap-tuning.conf"
 SWAPPINESS_VALUE="10"
 
-# ─── Xray 附加内核（用于 vless-xhttp-reality）────
-# 与 sing-box 完全独立：独立 systemd 服务 + 独立配置目录，互不污染
-XRAY_DIR="/etc/leyili/xray"
-XRAY_CONFIG_PATH="${XRAY_DIR}/config.json"
-XRAY_BIN_PATH="/usr/local/bin/xray-leyili"
-XRAY_SERVICE_NAME="xray-leyili"
-XRAY_SERVICE_PATH="/etc/systemd/system/xray-leyili.service"
-XRAY_RELEASE_API="https://api.github.com/repos/XTLS/Xray-core/releases/latest"
-XRAY_FALLBACK_VERSION="v26.3.27"
-XRAY_INBOUND_TAG="xhttp-reality-in"
-
-REALM_BIN_PATH="/usr/local/bin/realm-bin"
-REALM_CONFIG_DIR="/etc/realm"
-REALM_CONFIG_PATH="/etc/realm/config.toml"
-REALM_SERVICE_PATH="/etc/systemd/system/realm.service"
-REALM_DOWNLOAD_BASE="https://github.com/zhboner/realm/releases/latest/download"
 SYSTEM_TIMEZONE="Asia/Shanghai"
 BASIC_TOOLS_PACKAGES="curl wget git vim htop unzip net-tools"
 SSHD_CONFIG_PATH="/etc/ssh/sshd_config"
@@ -74,13 +58,6 @@ WARP_ENDPOINT_PORT="2408"
 WARP_MTU="1280"
 # 端点优选候选（host:port，均为 Cloudflare WARP 官方段；WireGuard 仅 UDP）
 WARP_ENDPOINT_CANDIDATES="162.159.192.1:2408 162.159.193.10:2408 188.114.96.1:2408 188.114.97.1:2408 engage.cloudflareclient.com:2408 162.159.192.1:500 162.159.192.1:894 162.159.192.1:878 162.159.192.1:1701 162.159.192.1:4500 188.114.96.1:934 162.159.193.10:943"
-
-# ─── 流量统计（网卡计数累计 + systemd 定时器落盘）─────
-TRAFFIC_DIR="/etc/leyili/traffic"
-TRAFFIC_STATE_PATH="${TRAFFIC_DIR}/state.env"
-TRAFFIC_SAMPLER_PATH="${TRAFFIC_DIR}/sample.sh"
-TRAFFIC_SERVICE_PATH="/etc/systemd/system/leyili-traffic.service"
-TRAFFIC_TIMER_PATH="/etc/systemd/system/leyili-traffic.timer"
 
 # ─── 颜色 ────────────────────────────────────────────
 G="\033[32m" Y="\033[33m" C="\033[36m" R="\033[31m" B="\033[1m" N="\033[0m"

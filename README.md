@@ -26,14 +26,13 @@ bash <(curl -fsSL https://raw.githubusercontent.com/lqlcj/linux-menu/main/leyili
   └── src/
       ├── _header.sh      (70 行: shebang + 常量 + 颜色)
       ├── _entry.sh       (11 行: 入口判断 + show_menu 调用)
-      └── lib/            (32 个文件，72-1123 行不等)
+      └── lib/            (28 个文件，72-1123 行不等)
           ├── 00-utils-head.sh
           ├── 01-firewall-common.sh
           ├── 02-utils-ui.sh
           ├── 03-system-admin-low.sh
           ├── 04-utils-ip.sh
           ├── 10-singbox-core.sh
-          ├── 11-xray-core.sh          ← 改 Xray 内核相关
           ├── 12-singbox-config-storage.sh
           ├── 20-link-builders.sh
           ├── 21-menus-top.sh
@@ -50,13 +49,10 @@ bash <(curl -fsSL https://raw.githubusercontent.com/lqlcj/linux-menu/main/leyili
           ├── 52-node-hy2.sh
           ├── 53-nodes-anytls-tuic.sh
           ├── 54-node-ss2022.sh
-          ├── 55-node-xhr.sh           ← 改 vless-xhttp-reality 节点
           ├── 56-modify-params.sh
           ├── 60-uninstall-script.sh
           ├── 70-render-ui.sh
           ├── 80-menu-node.sh
           ├── 90-warp.sh
-          ├── 91-realm.sh
           ├── 92-status.sh
-          ├── 93-traffic.sh            ← 流量统计（累计 + 定时器落盘）
           └── 99-menu-main.sh

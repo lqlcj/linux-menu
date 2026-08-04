@@ -16,15 +16,13 @@ show_menu(){
     render_menu_item 1 "管理员设置"
     render_menu_item 2 "系统基础设置"
     render_menu_item 3 "${main_action_label}"
-    render_menu_item 4 "Realm 中转管理"
-    render_menu_item 5 "查看状态"
-    render_menu_item 6 "IPv4 防火墙管理"
-    render_menu_item 7 "IPv6 防火墙管理"
-    render_menu_item 8 "卸载脚本"
-    render_menu_item 9 "更新管理"
-    render_menu_item 10 "服务器状态"
-    render_menu_item 11 "流量统计"
-    render_menu_item 12 "本地链路测评"
+    render_menu_item 4 "查看状态"
+    render_menu_item 5 "IPv4 防火墙管理"
+    render_menu_item 6 "IPv6 防火墙管理"
+    render_menu_item 7 "卸载脚本"
+    render_menu_item 8 "更新管理"
+    render_menu_item 9 "服务器状态"
+    render_menu_item 10 "本地链路测评"
     render_menu_item 0 "退出"
     render_divider
     read -p "  请输入序号: " choice
@@ -44,30 +42,24 @@ show_menu(){
         fi
         ;;
       4)
-        show_realm_menu
-        ;;
-      5)
         show_status_menu
         ;;
-      6)
+      5)
         show_ipv4_firewall_menu
         ;;
-      7)
+      6)
         show_ipv6_firewall_menu
         ;;
-      8)
+      7)
         uninstall_script_completely
         ;;
-      9)
+      8)
         show_update_menu
         ;;
-      10)
+      9)
         show_server_status
         ;;
-      11)
-        show_traffic_menu
-        ;;
-      12)
+      10)
         show_netbench_menu
         ;;
       0)

@@ -90,7 +90,6 @@ render_node_card_block(){
     anytls)  label="AnyTLS     " ;;   # 11 可见列：6 + 5 sp
     tuic)    label="TUIC v5    " ;;   # 11 可见列：7 + 4 sp
     ss2022)  label="SS-2022    " ;;   # 11 可见列：7 + 4 sp
-    xhr)     label="VLESS-XHR  " ;;   # 11 可见列：9 + 2 sp（vless-xhttp-reality）
     *)       label=$(printf '%-11s' "$type") ;;
   esac
 
@@ -111,7 +110,7 @@ render_node_card_block(){
   [ "$gap" -lt 1 ] && gap=1
   gap_str=$(printf '%*s' "$gap" '')
 
-  # 附加信息：HY2 端口跳跃 / SS-2022 谨慎标记 / XHR 量子加密
+  # 附加信息：HY2 端口跳跃 / SS-2022 谨慎标记
   local extra=""
   if [ "$type" = "hy2" ]; then
     local hop_v
@@ -119,8 +118,6 @@ render_node_card_block(){
     [ "$hop_v" = "1" ] && extra="  ${C}+hop${N}"
   elif [ "$type" = "ss2022" ]; then
     extra="  ${R}[谨慎]${N}"
-  elif [ "$type" = "xhr" ]; then
-    extra="  ${C}+xray${N}"
   fi
 
   # 第一行：✦ + 协议名 + ● + :端口 + IP + 附加
@@ -237,40 +234,6 @@ render_initcwnd_card_line(){
   render_card_line " ${C}✧${N} ${C}${label}${N}${C}${val}${N}  ${persist}"
 }
 
-# 主菜单卡片：标题栏 + 协议块 + 系统调优行
-render_realm_card_line(){
-  local label="Realm 中转 "  # 11 可见列
-  if ! realm_is_installed; then
-    return  # 未安装时不显示这一行（保持卡片简洁）
-  fi
-  local ver status status_str count
-  ver=$(realm_get_version 2>/dev/null | head -n1)
-  [ -z "$ver" ] && ver="?"
-  status=$(systemctl is-active realm 2>/dev/null | head -n1)
-  [ -z "$status" ] && status="未知"
-  case "$status" in
-    active)              status_str="${G}运行中${N}" ;;
-    activating|reloading) status_str="${Y}${status}${N}" ;;
-    *)                   status_str="${R}${status}${N}" ;;
-  esac
-  count=$(realm_count_rules 2>/dev/null | head -n1)
-  [ -z "$count" ] && count=0
-  render_card_line " ${C}✧${N} ${C}${label}${N}${C}v${ver}${N} ${D}·${N} ${status_str} ${D}·${N} ${C}${count}${N} ${D}条规则${N}"
-}
-
-# 流量统计行（单排）：入 / 出 / 共 用紧凑格式，实时叠加未落盘增量
-render_traffic_card_line(){
-  local label="流量统计   "  # 11 可见列
-  if ! traffic_load_state; then
-    render_card_line " ${C}✧${N} ${C}${label}${N}${D}未启用${N}"
-    return
-  fi
-  local totals rx tx sum
-  totals=$(traffic_live_totals)
-  read -r rx tx sum <<< "$totals"
-  render_card_line " ${C}✧${N} ${C}${label}${N}${D}入${N} ${C}$(traffic_format_compact "$rx")${N} ${D}·${N} ${D}出${N} ${C}$(traffic_format_compact "$tx")${N} ${D}·${N} ${D}共${N} ${C}$(traffic_format_compact "$sum")${N}"
-}
-
 # sing-box 内核版本行：当前版本 vs 最新稳定版（GitHub releases/latest 只返回稳定版）
 # 最新版走带缓存的查询，首页反复刷新也不会每次都打 GitHub。
 render_singbox_version_card_line(){
@@ -295,6 +258,7 @@ render_singbox_version_card_line(){
   render_card_blank
 }
 
+# 主菜单卡片：标题栏 + 协议块 + 系统调优行
 render_main_menu_card(){
   local ver status status_str title
   if is_singbox_installed; then
@@ -326,16 +290,10 @@ render_main_menu_card(){
     render_card_blank
     render_node_card_block ss2022
   fi
-  if node_installed xhr; then
-    render_card_blank
-    render_node_card_block xhr
-  fi
   render_card_blank
   render_tcp_card_line
   render_quic_card_line
   render_initcwnd_card_line
-  render_realm_card_line
-  render_traffic_card_line
   render_card_blank
   render_card_bottom
 }

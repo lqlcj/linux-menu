@@ -125,33 +125,6 @@ build_ss2022_link(){
     "$userinfo" "$host" "$port" "$tag"
 }
 
-build_xhr_link(){
-  # build_xhr_link <uuid> <ip> <port> <sni> <public_key> <short_id> <path> <tag>
-  # vless-xhttp-reality 链接（xhttp 走 HTTP 不复用 TCP 流，无需 xtls-rprx-vision；
-  # Reality 已承担 TLS 加密，VLESS 层固定 encryption=none）：
-  # vless://<uuid>@<host>:<port>?encryption=none&security=reality
-  #         &sni=<sni>&fp=chrome&pbk=<pbk>&sid=<sid>&type=xhttp&path=<path>&mode=auto#<tag>
-  local uuid="$1"
-  local ip="$2"
-  local port="$3"
-  local sni="$4"
-  local public_key="$5"
-  local short_id="$6"
-  local path="$7"
-  local tag="${8:-xhr}"
-
-  if [ -z "$uuid" ] || [ -z "$ip" ] || [ -z "$port" ] || [ -z "$sni" ] \
-     || [ -z "$public_key" ] || [ -z "$short_id" ] || [ -z "$path" ]; then
-    return 1
-  fi
-
-  local host
-  host=$(url_encode_host "$ip")
-  printf 'vless://%s@%s:%s?encryption=none&security=reality&sni=%s&fp=chrome&pbk=%s&sid=%s&type=xhttp&path=%s&mode=auto#%s\n' \
-    "$uuid" "$host" "$port" "$sni" "$public_key" "$short_id" "$path" "$tag"
-}
-
-
 # 由节点 info 文件构造链接（dispatcher）
 build_link_for_node(){
   local type="$1"
@@ -208,14 +181,6 @@ build_link_for_node(){
       method=$(get_node_value "$type" Method 2>/dev/null || true)
       password=$(get_node_value "$type" Password 2>/dev/null || true)
       build_ss2022_link "$method" "$password" "$ip" "$port" "$tag"
-      ;;
-    xhr)
-      local uuid pubk sid path
-      uuid=$(get_node_value "$type" UUID 2>/dev/null || true)
-      pubk=$(get_node_value "$type" PublicKey 2>/dev/null || true)
-      sid=$(get_node_value "$type" ShortID 2>/dev/null || true)
-      path=$(get_node_value "$type" Path 2>/dev/null || true)
-      build_xhr_link "$uuid" "$ip" "$port" "$sni" "$pubk" "$sid" "$path" "$tag"
       ;;
     *)
       return 1

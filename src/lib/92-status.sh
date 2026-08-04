@@ -201,7 +201,6 @@ show_server_status(){
 
   echo -e "  ${B}${C}›  服务${N}"
   printf "  ${L}●${N} %-10s : %s\n" "sing-box" "$(status_service_state sing-box sing-box)"
-  printf "  ${L}●${N} %-10s : %s\n" "realm"    "$(status_service_state realm    "$REALM_BIN_PATH")"
 
   pause_screen
 }
