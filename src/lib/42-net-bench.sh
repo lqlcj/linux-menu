@@ -7,7 +7,7 @@
 NETBENCH_ENV_PATH="/etc/leyili/netbench.env"
 NETBENCH_REPORT_PREFIX="/root/netbench-report"
 NETBENCH_IPERF_PORT_DEFAULT="15201"
-# 与 xray-leyili 同思路用独立文件名：卸载时只删自己下载的，不动用户自装的 nexttrace
+# 用带 -leyili 后缀的独立文件名：卸载时只删自己下载的，不动用户自装的 nexttrace
 NETBENCH_NEXTTRACE_BIN="/usr/local/bin/nexttrace-leyili"
 NETBENCH_NEXTTRACE_BASE="https://github.com/nxtrace/NTrace-core/releases/latest/download"
 

@@ -26,22 +26,6 @@ SWAPFILE_PATH="/swapfile"
 SWAP_SYSCTL_PATH="/etc/sysctl.d/99-swap-tuning.conf"
 SWAPPINESS_VALUE="10"
 
-# ─── Xray 附加内核（用于 vless-xhttp-reality）────
-# 与 sing-box 完全独立：独立 systemd 服务 + 独立配置目录，互不污染
-XRAY_DIR="/etc/leyili/xray"
-XRAY_CONFIG_PATH="${XRAY_DIR}/config.json"
-XRAY_BIN_PATH="/usr/local/bin/xray-leyili"
-XRAY_SERVICE_NAME="xray-leyili"
-XRAY_SERVICE_PATH="/etc/systemd/system/xray-leyili.service"
-XRAY_RELEASE_API="https://api.github.com/repos/XTLS/Xray-core/releases/latest"
-XRAY_FALLBACK_VERSION="v26.3.27"
-XRAY_INBOUND_TAG="xhttp-reality-in"
-
-REALM_BIN_PATH="/usr/local/bin/realm-bin"
-REALM_CONFIG_DIR="/etc/realm"
-REALM_CONFIG_PATH="/etc/realm/config.toml"
-REALM_SERVICE_PATH="/etc/systemd/system/realm.service"
-REALM_DOWNLOAD_BASE="https://github.com/zhboner/realm/releases/latest/download"
 SYSTEM_TIMEZONE="Asia/Shanghai"
 BASIC_TOOLS_PACKAGES="curl wget git vim htop unzip net-tools"
 SSHD_CONFIG_PATH="/etc/ssh/sshd_config"
@@ -74,13 +58,6 @@ WARP_ENDPOINT_PORT="2408"
 WARP_MTU="1280"
 # 端点优选候选（host:port，均为 Cloudflare WARP 官方段；WireGuard 仅 UDP）
 WARP_ENDPOINT_CANDIDATES="162.159.192.1:2408 162.159.193.10:2408 188.114.96.1:2408 188.114.97.1:2408 engage.cloudflareclient.com:2408 162.159.192.1:500 162.159.192.1:894 162.159.192.1:878 162.159.192.1:1701 162.159.192.1:4500 188.114.96.1:934 162.159.193.10:943"
-
-# ─── 流量统计（网卡计数累计 + systemd 定时器落盘）─────
-TRAFFIC_DIR="/etc/leyili/traffic"
-TRAFFIC_STATE_PATH="${TRAFFIC_DIR}/state.env"
-TRAFFIC_SAMPLER_PATH="${TRAFFIC_DIR}/sample.sh"
-TRAFFIC_SERVICE_PATH="/etc/systemd/system/leyili-traffic.service"
-TRAFFIC_TIMER_PATH="/etc/systemd/system/leyili-traffic.timer"
 
 # ─── 颜色 ────────────────────────────────────────────
 G="\033[32m" Y="\033[33m" C="\033[36m" R="\033[31m" B="\033[1m" N="\033[0m"
@@ -1365,232 +1342,6 @@ upgrade_singbox(){
 
   return 0
 }
-
-# ═══════════════════════════════════════════════════════════════════════
-# Xray 附加内核管理（vless-xhttp-reality 专用）
-# ─────────────────────────────────────────────────────────────────────
-# 为何要用 Xray：sing-box 服务端尚不支持 xhttp 传输层，这是 Xray 25.x 才有
-# 的新特性
-# 隔离原则：独立 systemd 服务 / 独立配置 / 独立二进制路径，不污染 sing-box
-# ═══════════════════════════════════════════════════════════════════════
-
-# ═══ source: 11-xray-core.sh ═══
-xray_detect_arch(){
-  case "$(uname -m)" in
-    x86_64|amd64)    printf '64' ;;
-    aarch64|arm64)   printf 'arm64-v8a' ;;
-    armv7l|armv7)    printf 'arm32-v7a' ;;
-    *)               printf 'unknown' ;;
-  esac
-}
-
-is_xray_installed(){
-  [ -x "$XRAY_BIN_PATH" ]
-}
-
-get_current_xray_version(){
-  if ! is_xray_installed; then
-    return 1
-  fi
-  "$XRAY_BIN_PATH" version 2>/dev/null | awk '/^Xray/{print $2; exit}'
-}
-
-get_latest_xray_version(){
-  local tag
-  tag=$(curl -fsSL --max-time 10 "$XRAY_RELEASE_API" 2>/dev/null | jq -r '.tag_name // empty' 2>/dev/null)
-  if [ -z "$tag" ] || [ "$tag" = "null" ]; then
-    tag="$XRAY_FALLBACK_VERSION"
-  fi
-  printf '%s' "$tag"
-}
-
-install_xray(){
-  local arch tag url tmpdir tmpzip
-  arch=$(xray_detect_arch)
-  if [ "$arch" = "unknown" ]; then
-    echo -e "${R}不支持的架构：$(uname -m)${N}"
-    return 1
-  fi
-
-  # unzip 是必装依赖（Xray release 是 zip 包）
-  if ! command -v unzip >/dev/null 2>&1; then
-    echo -e "${Y}==> 安装 unzip...${N}"
-    DEBIAN_FRONTEND=noninteractive apt-get install -y unzip >/dev/null 2>&1 || {
-      DEBIAN_FRONTEND=noninteractive apt-get update -qq >/dev/null 2>&1 || true
-      DEBIAN_FRONTEND=noninteractive apt-get install -y unzip >/dev/null 2>&1 || {
-        echo -e "${R}unzip 安装失败，请手动执行：apt install unzip${N}"
-        return 1
-      }
-    }
-  fi
-  ensure_jq || return 1
-
-  tag=$(get_latest_xray_version)
-  url="https://github.com/XTLS/Xray-core/releases/download/${tag}/Xray-linux-${arch}.zip"
-  echo -e "${Y}==> 下载 Xray 内核 ${tag} (${arch})...${N}"
-
-  tmpdir=$(mktemp -d)
-  tmpzip="${tmpdir}/xray.zip"
-  if ! curl -fsSL --max-time 120 "$url" -o "$tmpzip"; then
-    echo -e "${R}下载失败：$url${N}"
-    rm -rf "$tmpdir"
-    return 1
-  fi
-
-  if ! unzip -o "$tmpzip" -d "$tmpdir" >/dev/null 2>&1; then
-    echo -e "${R}解压失败${N}"
-    rm -rf "$tmpdir"
-    return 1
-  fi
-
-  if [ ! -f "${tmpdir}/xray" ]; then
-    echo -e "${R}解压后未找到 xray 二进制${N}"
-    rm -rf "$tmpdir"
-    return 1
-  fi
-
-  mkdir -p "$(dirname "$XRAY_BIN_PATH")"
-  if ! install -m 0755 "${tmpdir}/xray" "$XRAY_BIN_PATH"; then
-    echo -e "${R}写入 ${XRAY_BIN_PATH} 失败${N}"
-    rm -rf "$tmpdir"
-    return 1
-  fi
-  rm -rf "$tmpdir"
-
-  local ver
-  ver=$(get_current_xray_version || echo unknown)
-  echo -e "${G}已安装 Xray 内核：v${ver}${N}"
-  return 0
-}
-
-upgrade_xray(){
-  # 与 install_xray 等价（直接覆盖二进制），单独命名是为了和 upgrade_singbox 对称
-  install_xray
-}
-
-xray_install_systemd_unit(){
-  if [ -f "$XRAY_SERVICE_PATH" ]; then
-    return 0
-  fi
-  cat > "$XRAY_SERVICE_PATH" <<EOF
-[Unit]
-Description=${XRAY_SERVICE_NAME} (Xray-core for vless-xhttp-reality)
-After=network.target nss-lookup.target
-
-[Service]
-Type=simple
-NoNewPrivileges=yes
-TimeoutStartSec=0
-ExecStart=${XRAY_BIN_PATH} run -c ${XRAY_CONFIG_PATH}
-Restart=on-failure
-RestartSec=5s
-StandardOutput=journal
-StandardError=journal
-
-[Install]
-WantedBy=multi-user.target
-EOF
-  systemctl daemon-reload >/dev/null 2>&1 || true
-  systemctl enable "$XRAY_SERVICE_NAME" >/dev/null 2>&1 || true
-  return 0
-}
-
-# Xray 配置骨架：空 inbounds + freedom direct outbound
-xray_config_ensure_skeleton(){
-  ensure_jq || return 1
-  mkdir -p "$XRAY_DIR"
-  if [ ! -f "$XRAY_CONFIG_PATH" ] || ! jq empty "$XRAY_CONFIG_PATH" >/dev/null 2>&1; then
-    cat > "$XRAY_CONFIG_PATH" <<'EOF'
-{
-  "log": {"loglevel": "warning"},
-  "inbounds": [],
-  "outbounds": [
-    {"protocol": "freedom", "tag": "direct"}
-  ]
-}
-EOF
-  fi
-  return 0
-}
-
-xray_config_add_inbound(){
-  local inbound="$1"
-  ensure_jq || return 1
-  xray_config_ensure_skeleton || return 1
-  local tmp tag
-  tag=$(printf '%s' "$inbound" | jq -r '.tag // empty' 2>/dev/null)
-  if [ -z "$tag" ]; then
-    echo -e "${R}内部错误：xray inbound 缺少 tag${N}"
-    return 1
-  fi
-  tmp=$(mktemp)
-  if ! jq --argjson nb "$inbound" --arg tag "$tag" '
-    .inbounds = ((.inbounds // []) | map(select(.tag != $tag))) + [$nb]
-  ' "$XRAY_CONFIG_PATH" > "$tmp" 2>/dev/null; then
-    rm -f "$tmp"
-    return 1
-  fi
-  mv "$tmp" "$XRAY_CONFIG_PATH"
-}
-
-xray_config_remove_inbound_by_tag(){
-  local tag="$1"
-  ensure_jq || return 1
-  [ -f "$XRAY_CONFIG_PATH" ] || return 0
-  local tmp
-  tmp=$(mktemp)
-  if ! jq --arg tag "$tag" '
-    .inbounds = ((.inbounds // []) | map(select(.tag != $tag)))
-  ' "$XRAY_CONFIG_PATH" > "$tmp" 2>/dev/null; then
-    rm -f "$tmp"
-    return 1
-  fi
-  mv "$tmp" "$XRAY_CONFIG_PATH"
-}
-
-xray_config_inbound_count(){
-  if [ ! -f "$XRAY_CONFIG_PATH" ] || ! command -v jq >/dev/null 2>&1; then
-    printf '0'
-    return
-  fi
-  jq '(.inbounds // []) | length' "$XRAY_CONFIG_PATH" 2>/dev/null || printf '0'
-}
-
-xray_config_check_and_restart(){
-  if ! is_xray_installed; then
-    echo -e "${R}xray 二进制不存在：$XRAY_BIN_PATH${N}"
-    return 1
-  fi
-  if ! "$XRAY_BIN_PATH" run -test -c "$XRAY_CONFIG_PATH" >/dev/null 2>&1; then
-    echo -e "${R}Xray 配置校验失败，下面是详细错误：${N}"
-    "$XRAY_BIN_PATH" run -test -c "$XRAY_CONFIG_PATH" 2>&1 | sed 's/^/    /' || true
-    return 1
-  fi
-  if ! systemctl restart "$XRAY_SERVICE_NAME" 2>/dev/null; then
-    echo -e "${R}Xray 服务重启失败${N}"
-    systemctl status "$XRAY_SERVICE_NAME" --no-pager 2>&1 | tail -20 | sed 's/^/    /' || true
-    return 1
-  fi
-  return 0
-}
-
-# 卸载某 xhr 节点后：剩 0 个 inbound 就停服，否则校验+重启
-post_uninstall_xray_step(){
-  if ! is_xray_installed || [ ! -f "$XRAY_CONFIG_PATH" ]; then
-    return 0
-  fi
-  local remain
-  remain=$(xray_config_inbound_count)
-  if [ "${remain:-0}" -eq 0 ]; then
-    echo -e "${Y}==> 已无 Xray 节点，停止 ${XRAY_SERVICE_NAME} 服务...${N}"
-    systemctl stop "$XRAY_SERVICE_NAME" >/dev/null 2>&1 || true
-    systemctl disable "$XRAY_SERVICE_NAME" >/dev/null 2>&1 || true
-    return 0
-  fi
-  "$XRAY_BIN_PATH" run -test -c "$XRAY_CONFIG_PATH" >/dev/null 2>&1 \
-    && systemctl restart "$XRAY_SERVICE_NAME" >/dev/null 2>&1 || true
-}
-
 # ═══ source: 12-singbox-config-storage.sh ═══
 require_singbox_installed(){
   if is_singbox_installed; then
@@ -2232,33 +1983,6 @@ build_ss2022_link(){
     "$userinfo" "$host" "$port" "$tag"
 }
 
-build_xhr_link(){
-  # build_xhr_link <uuid> <ip> <port> <sni> <public_key> <short_id> <path> <tag>
-  # vless-xhttp-reality 链接（xhttp 走 HTTP 不复用 TCP 流，无需 xtls-rprx-vision；
-  # Reality 已承担 TLS 加密，VLESS 层固定 encryption=none）：
-  # vless://<uuid>@<host>:<port>?encryption=none&security=reality
-  #         &sni=<sni>&fp=chrome&pbk=<pbk>&sid=<sid>&type=xhttp&path=<path>&mode=auto#<tag>
-  local uuid="$1"
-  local ip="$2"
-  local port="$3"
-  local sni="$4"
-  local public_key="$5"
-  local short_id="$6"
-  local path="$7"
-  local tag="${8:-xhr}"
-
-  if [ -z "$uuid" ] || [ -z "$ip" ] || [ -z "$port" ] || [ -z "$sni" ] \
-     || [ -z "$public_key" ] || [ -z "$short_id" ] || [ -z "$path" ]; then
-    return 1
-  fi
-
-  local host
-  host=$(url_encode_host "$ip")
-  printf 'vless://%s@%s:%s?encryption=none&security=reality&sni=%s&fp=chrome&pbk=%s&sid=%s&type=xhttp&path=%s&mode=auto#%s\n' \
-    "$uuid" "$host" "$port" "$sni" "$public_key" "$short_id" "$path" "$tag"
-}
-
-
 # 由节点 info 文件构造链接（dispatcher）
 build_link_for_node(){
   local type="$1"
@@ -2315,14 +2039,6 @@ build_link_for_node(){
       method=$(get_node_value "$type" Method 2>/dev/null || true)
       password=$(get_node_value "$type" Password 2>/dev/null || true)
       build_ss2022_link "$method" "$password" "$ip" "$port" "$tag"
-      ;;
-    xhr)
-      local uuid pubk sid path
-      uuid=$(get_node_value "$type" UUID 2>/dev/null || true)
-      pubk=$(get_node_value "$type" PublicKey 2>/dev/null || true)
-      sid=$(get_node_value "$type" ShortID 2>/dev/null || true)
-      path=$(get_node_value "$type" Path 2>/dev/null || true)
-      build_xhr_link "$uuid" "$ip" "$port" "$sni" "$pubk" "$sid" "$path" "$tag"
       ;;
     *)
       return 1
@@ -4163,22 +3879,6 @@ render_node_detail(){
       echo -e "  IP        : ${C}${ip:-未知}${N}"
       echo -e "  端口      : ${C}${port:-未知}${N} ${D}(TCP)${N}"
       echo -e "  ${R}⚠ 谨慎：抗主动探测较弱，避免在高 GFW 风险链路单独使用${N}"
-      ;;
-    xhr)
-      local uuid_v pubk_v sid_v path_v
-      uuid_v=$(get_node_value "$type" UUID 2>/dev/null || true)
-      pubk_v=$(get_node_value "$type" PublicKey 2>/dev/null || true)
-      sid_v=$(get_node_value "$type" ShortID 2>/dev/null || true)
-      path_v=$(get_node_value "$type" Path 2>/dev/null || true)
-      echo -e "  类型      : ${C}Vless-xhttp-reality${N}  Tag : ${C}${tag}${N}"
-      echo -e "  UUID      : ${C}${uuid_v:-未知}${N}"
-      echo -e "  PublicKey : ${C}${pubk_v:-未知}${N}"
-      echo -e "  ShortID   : ${C}${sid_v:-未知}${N}"
-      echo -e "  模式      : ${C}${mode_label}${N}"
-      echo -e "  IP        : ${C}${ip:-未知}${N}"
-      echo -e "  端口      : ${C}${port:-未知}${N} ${D}(TCP)${N}"
-      echo -e "  SNI       : ${C}${sni:-未知}${N}"
-      echo -e "  网络层    : ${C}xhttp${N}  ${D}path=${path_v}${N}"
       ;;
   esac
 }
@@ -6112,7 +5812,7 @@ cleanup_config_backups(){
 NETBENCH_ENV_PATH="/etc/leyili/netbench.env"
 NETBENCH_REPORT_PREFIX="/root/netbench-report"
 NETBENCH_IPERF_PORT_DEFAULT="15201"
-# 与 xray-leyili 同思路用独立文件名：卸载时只删自己下载的，不动用户自装的 nexttrace
+# 用带 -leyili 后缀的独立文件名：卸载时只删自己下载的，不动用户自装的 nexttrace
 NETBENCH_NEXTTRACE_BIN="/usr/local/bin/nexttrace-leyili"
 NETBENCH_NEXTTRACE_BASE="https://github.com/nxtrace/NTrace-core/releases/latest/download"
 
@@ -7520,7 +7220,7 @@ generate_hy2_random_port(){
 # AnyTLS 默认端口生成：避开本机已占端口与已安装节点已用端口
 generate_anytls_random_port(){
   local p attempts=0 t taken_ports=""
-  for t in reality hy2 tuic ss2022 xhr; do
+  for t in reality hy2 tuic ss2022; do
     if node_installed "$t"; then
       taken_ports="$taken_ports $(get_node_value "$t" Port 2>/dev/null || true)"
     fi
@@ -9323,315 +9023,6 @@ uninstall_ss2022_node(){
   echo -e "${G}Shadowsocks-2022 节点已卸载${N}"
   pause_screen
 }
-
-# ═══════════════════════════════════════════════════════════════════════
-# Vless-xhttp-reality 节点（Xray 内核）
-# ─────────────────────────────────────────────────────────────────────
-# 借鉴 yonggekkk/argosbx 项目（用户已 fork 并测试通过），核心参考
-# argosbx.sh:201-281（xray inbound 模板）+ 1225（节点链接格式）
-# 与 sing-box 节点完全独立：单独跑 xray-leyili.service，互不影响
-# ═══════════════════════════════════════════════════════════════════════
-
-# ═══ source: 55-node-xhr.sh ═══
-install_xhr_node(){
-  local port_input="" sni_input="" tag_input=""
-  local x25519_out=""
-  local private_key="" public_key=""
-  local access_ip="" link="" ipv6_link=""
-  local public_ipv4="" public_ipv6=""
-  local install_mode="ipv4" mode_label=""
-  local PORT SNI TAG LISTEN_CHOICE LISTEN_ADDR UUID SHORT_ID PATH_TOKEN confirm
-
-  if ! require_root; then return 1; fi
-
-  render_section_header "创建 Vless-xhttp-reality 节点"
-  echo -e "  ${Y}直接回车使用括号内默认值${N}"
-  echo -e "  ${D}（基于 Xray 25.x，需 v2rayN / NekoBox / Happ 等支持 xhttp 的客户端）${N}"
-  echo ""
-
-  if node_installed xhr; then
-    echo -e "${Y}检测到已存在 Vless-xhttp-reality 节点，继续将覆盖原节点配置${N}"
-    read -p "  继续？(y/N): " confirm
-    if [ "$confirm" != "y" ] && [ "$confirm" != "Y" ]; then
-      echo -e "  已取消"
-      return 0
-    fi
-  fi
-
-  while true; do
-    read -p "  端口 (8443): " port_input
-    PORT="${port_input:-8443}"
-    if ! validate_port "$PORT"; then
-      echo -e "${R}端口必须是 1-65535 的数字${N}"
-      continue
-    fi
-    PORT=$((10#$PORT))
-    if check_port_in_use "$PORT"; then
-      echo -e "${R}端口 ${PORT} 已被其他服务占用${N}"
-      local force_port=""
-      read -p "  仍然使用此端口？(y/N): " force_port
-      if [ "$force_port" != "y" ] && [ "$force_port" != "Y" ]; then
-        continue
-      fi
-    fi
-    break
-  done
-
-  while true; do
-    read -p "  Reality SNI 域名 (www.tesla.com): " sni_input
-    sni_input="${sni_input:-www.tesla.com}"
-    SNI=$(sanitize_sni "$sni_input")
-    if [ -n "$SNI" ]; then
-      break
-    fi
-    echo -e "${R}域名不能为空，且不能只包含引号或换行${N}"
-  done
-
-  read -p "  节点名称 (xhr): " tag_input
-  TAG="${tag_input:-xhr}"
-
-  echo -e "  监听模式："
-  echo "    1) 仅 IPv4 入站 - 0.0.0.0（默认）"
-  echo "    2) 双栈入站 - ::"
-  echo "    3) 仅 IPv6 入站"
-  read -p "  请选择 (1): " LISTEN_CHOICE
-  case "$LISTEN_CHOICE" in
-    2) LISTEN_ADDR="::"; install_mode="dualstack" ;;
-    3) LISTEN_ADDR=""; install_mode="ipv6-in-ipv4-out" ;;
-    *) LISTEN_ADDR="0.0.0.0"; install_mode="ipv4" ;;
-  esac
-
-  if [ "$install_mode" = "ipv6-in-ipv4-out" ]; then
-    public_ipv6=$(detect_primary_ipv6)
-    if [ -z "$public_ipv6" ]; then
-      echo ""
-      echo -e "${R}未检测到可用的 IPv6 地址，无法使用「仅 IPv6 入站」模式${N}"
-      pause_screen
-      return 1
-    fi
-  fi
-
-  # 装 Xray 内核（不影响 sing-box）
-  if ! is_xray_installed; then
-    echo ""
-    echo -e "${Y}==> 安装 Xray 内核（用于 xhttp）...${N}"
-    if ! install_xray; then
-      echo ""
-      echo -e "${R}Xray 安装失败，请检查上方输出${N}"
-      pause_screen
-      return 1
-    fi
-  else
-    echo -e "${D}  已检测到 Xray 内核：v$(get_current_xray_version)${N}"
-  fi
-
-  xray_install_systemd_unit
-  xray_config_ensure_skeleton || { pause_screen; return 1; }
-
-  echo -e "${Y}==> 生成 UUID / ShortID / Reality 密钥对...${N}"
-  UUID=$(cat /proc/sys/kernel/random/uuid)
-  SHORT_ID=$(openssl rand -hex 4)
-  # 用 CDN / API 风格的固定路径，避免 UUID 形态的明显特征
-  PATH_TOKEN="/api/v2/query"
-
-  # Reality 公私钥（参考 argosbx.sh:208-214；xray x25519 输出格式：
-  #   "PrivateKey: ..." 和 "Password: ..."，Password 即客户端用的 PublicKey）
-  if ! x25519_out=$("$XRAY_BIN_PATH" x25519 2>&1); then
-    echo -e "${R}xray x25519 执行失败：${N}"
-    printf '%s\n' "$x25519_out" | sed 's/^/    /'
-    pause_screen
-    return 1
-  fi
-  private_key=$(printf '%s\n' "$x25519_out" | awk -F':' '/PrivateKey/ {print $2}' | xargs)
-  public_key=$(printf '%s\n' "$x25519_out" | awk -F':' '/Password/ {print $2}' | xargs)
-  if [ -z "$private_key" ] || [ -z "$public_key" ]; then
-    echo -e "${R}Reality 密钥对解析失败，原始输出：${N}"
-    printf '%s\n' "$x25519_out" | sed 's/^/    /'
-    pause_screen
-    return 1
-  fi
-
-  public_ipv4=${public_ipv4:-$(detect_primary_ipv4)}
-  public_ipv6=${public_ipv6:-$(detect_primary_ipv6)}
-
-  case "$install_mode" in
-    ipv6-in-ipv4-out)
-      access_ip="$public_ipv6"
-      LISTEN_ADDR="$public_ipv6"
-      if [ -z "$access_ip" ]; then
-        echo ""
-        echo -e "${R}未检测到可用的 IPv6 地址${N}"
-        pause_screen
-        return 1
-      fi
-      ;;
-    dualstack)
-      access_ip="${public_ipv4:-$public_ipv6}"
-      if [ -z "$access_ip" ]; then
-        echo ""
-        echo -e "${R}未检测到可用的 IPv4 / IPv6 地址${N}"
-        pause_screen
-        return 1
-      fi
-      ;;
-    *)
-      access_ip="$public_ipv4"
-      if [ -z "$access_ip" ]; then
-        echo ""
-        echo -e "${R}未检测到可用的 IPv4 地址，请检查网络环境${N}"
-        pause_screen
-        return 1
-      fi
-      ;;
-  esac
-
-  mode_label=$(describe_install_mode "$install_mode")
-
-  echo -e "${Y}==> 写入 Xray 配置...${N}"
-  local inbound_json
-  inbound_json=$(jq -n \
-    --arg tag "$XRAY_INBOUND_TAG" \
-    --arg listen "$LISTEN_ADDR" \
-    --argjson port "$PORT" \
-    --arg uuid "$UUID" \
-    --arg sni "$SNI" \
-    --arg priv "$private_key" \
-    --arg sid "$SHORT_ID" \
-    --arg path "$PATH_TOKEN" '{
-      tag: $tag,
-      listen: $listen,
-      port: $port,
-      protocol: "vless",
-      settings: {
-        clients: [{id: $uuid}],
-        decryption: "none"
-      },
-      streamSettings: {
-        network: "xhttp",
-        security: "reality",
-        realitySettings: {
-          fingerprint: "chrome",
-          target: ($sni + ":443"),
-          serverNames: [$sni],
-          privateKey: $priv,
-          shortIds: [$sid]
-        },
-        xhttpSettings: {
-          host: "",
-          path: $path,
-          mode: "auto"
-        }
-      },
-      sniffing: {
-        enabled: true,
-        destOverride: ["http", "tls", "quic"],
-        metadataOnly: false
-      }
-    }')
-
-  if ! xray_config_add_inbound "$inbound_json"; then
-    echo -e "${R}写入 Xray inbound 失败${N}"
-    pause_screen
-    return 1
-  fi
-
-  echo -e "${Y}==> 校验并启动 ${XRAY_SERVICE_NAME}...${N}"
-  if ! xray_config_check_and_restart; then
-    echo ""
-    echo -e "${R}Xray 校验或重启失败${N}"
-    pause_screen
-    return 1
-  fi
-
-  node_apply_firewall_for_mode "$PORT" tcp "$install_mode"
-  print_firewall_hint "$PORT" tcp "Vless-xhttp-reality 节点入站"
-
-  link=$(build_xhr_link "$UUID" "$access_ip" "$PORT" "$SNI" "$public_key" "$SHORT_ID" "$PATH_TOKEN" "$TAG" 2>/dev/null || true)
-  if [ "$install_mode" = "dualstack" ] && [ -n "$public_ipv6" ] && [ "$public_ipv6" != "$access_ip" ]; then
-    ipv6_link=$(build_xhr_link "$UUID" "$public_ipv6" "$PORT" "$SNI" "$public_key" "$SHORT_ID" "$PATH_TOKEN" "${TAG}-ipv6" 2>/dev/null || true)
-  fi
-
-  ensure_nodes_dir
-  cat > "$(node_info_path xhr)" <<EOF
-Type=xhr
-Tag=$TAG
-Mode=$install_mode
-ListenAddr=$LISTEN_ADDR
-Port=$PORT
-SNI=$SNI
-UUID=$UUID
-PublicKey=$public_key
-PrivateKey=$private_key
-ShortID=$SHORT_ID
-Path=$PATH_TOKEN
-IP=$access_ip
-Link=$link
-EOF
-
-  register_sb_command || true
-
-  echo ""
-  echo -e "  ${G}╔══════════════════════════════════════════════════════╗${N}"
-  echo -e "  ${G}║${N}  ${B}${W}${APP_NAME}${N}  ${G}Vless-xhttp-reality 节点创建完成${N}            ${G}║${N}"
-  echo -e "  ${G}╚══════════════════════════════════════════════════════╝${N}"
-  echo -e "  模式      : ${C}$mode_label${N}"
-  echo -e "  UUID      : ${C}$UUID${N}"
-  echo -e "  PublicKey : ${C}$public_key${N}"
-  echo -e "  ShortID   : ${C}$SHORT_ID${N}"
-  echo -e "  入口 IP   : ${C}${access_ip:-未知}${N}"
-  echo -e "  出站策略  : ${C}双栈（跟随系统路由）${N}"
-  echo -e "  端口      : ${C}$PORT${N}  ${D}(TCP)${N}"
-  echo -e "  SNI       : ${C}$SNI${N}"
-  echo -e "  网络层    : ${C}xhttp${N}  ${D}path=${PATH_TOKEN}${N}"
-  echo -e "  加密      : ${C}none${N}  ${D}(VLESS 标准，Reality 已承担 TLS 加密)${N}"
-  echo ""
-  echo -e "  ${B}客户端链接：${N}"
-  echo -e "  ${G}${link:-未生成}${N}"
-  print_qrcode "${link:-}"
-  if [ -n "$ipv6_link" ]; then
-    echo ""
-    echo -e "  ${B}IPv6 客户端链接：${N}"
-    echo -e "  ${G}${ipv6_link}${N}"
-    print_qrcode "$ipv6_link"
-  fi
-  echo ""
-  echo -e "  ${Y}注意：此协议需要支持 xhttp + Reality 的客户端${N}"
-  echo -e "  ${D}  · v2rayN / NekoBox / Happ (iOS) / sing-box GUI 等${N}"
-  echo -e "  信息已保存至 ${Y}$(node_info_path xhr)${N}"
-  echo -e "  输入 ${B}${COMMAND_NAME}${N} 进入管理菜单"
-  pause_screen
-}
-
-uninstall_xhr_node(){
-  local confirm
-  if ! node_installed xhr; then
-    echo -e "${Y}Vless-xhttp-reality 节点未安装${N}"
-    pause_screen
-    return 0
-  fi
-
-  echo ""
-  read -p "  确认卸载 Vless-xhttp-reality 节点？(y/N): " confirm
-  if [ "$confirm" != "y" ] && [ "$confirm" != "Y" ]; then
-    echo -e "  已取消"
-    return 0
-  fi
-
-  # 必须在 remove_node_info 之前撤防火墙规则，否则读不到 Mode/Port
-  local rt_port rt_mode
-  rt_port=$(get_node_value xhr Port 2>/dev/null || true)
-  rt_mode=$(get_node_value xhr Mode 2>/dev/null || echo ipv4)
-  if [ -n "$rt_port" ]; then
-    node_revoke_firewall_for_mode "$rt_port" tcp "$rt_mode"
-  fi
-
-  xray_config_remove_inbound_by_tag "$XRAY_INBOUND_TAG" || true
-  remove_node_info xhr
-  post_uninstall_xray_step
-  echo -e "${G}Vless-xhttp-reality 节点已卸载${N}"
-  pause_screen
-}
-
 # ═══ source: 56-modify-params.sh ═══
 modify_ss2022_params(){
   local new_port="" new_method="" new_tag=""
@@ -10201,15 +9592,7 @@ uninstall_script_completely(){
   echo -e "  ${R}此操作将清除以下内容（不可恢复）：${N}"
   echo -e "    ${L}·${N} 所有 sing-box 节点（Reality / Hysteria2 / AnyTLS）及其防火墙端口"
   echo -e "    ${L}·${N} sing-box 服务、软件包与 ${C}/etc/sing-box${N} 整个目录"
-  if is_xray_installed || [ -d "$XRAY_DIR" ] || [ -f "$XRAY_SERVICE_PATH" ]; then
-    echo -e "    ${L}·${N} Xray 内核（vless-xhttp-reality）服务、二进制与 ${C}${XRAY_DIR}${N} 目录"
-  fi
-  if realm_is_installed; then
-    echo -e "    ${L}·${N} Realm 中转服务、所有转发规则与 ${C}${REALM_CONFIG_DIR}${N} 目录"
-  fi
-  if [ -f "$TRAFFIC_STATE_PATH" ] || [ -f "$TRAFFIC_TIMER_PATH" ]; then
-    echo -e "    ${L}·${N} 流量统计定时器与累计数据"
-  fi
+  echo -e "    ${L}·${N} 旧版遗留组件（Realm 中转 / Xray 内核 / 流量统计），如存在"
   echo -e "    ${L}·${N} ${C}${INFO_PATH}${N} 与 ${C}${SCRIPT_PATH}${N}"
   echo ""
   echo -e "  ${D}保留：SSH 配置 / 用户账户 / sudoers / 自动更新 / IPv6 防火墙规则 / 1Panel${N}"
@@ -10239,9 +9622,6 @@ uninstall_script_completely(){
           [ -n "$port" ] && deny_port_in_firewall "$port" tcp
           ;;
         ss2022)
-          [ -n "$port" ] && deny_port_in_firewall "$port" tcp
-          ;;
-        xhr)
           [ -n "$port" ] && deny_port_in_firewall "$port" tcp
           ;;
         hy2)
@@ -10296,36 +9676,23 @@ uninstall_script_completely(){
   rm -f "$SAGERNET_SOURCES" "$SAGERNET_KEYRING"
   DEBIAN_FRONTEND=noninteractive apt-get update -qq >/dev/null 2>&1 || true
 
-  # 2.5 Xray 内核（vless-xhttp-reality 节点用，独立于 sing-box）
-  if is_xray_installed || [ -f "$XRAY_SERVICE_PATH" ]; then
-    echo -e "${Y}==> 停止并禁用 ${XRAY_SERVICE_NAME} 服务...${N}"
-    systemctl stop "$XRAY_SERVICE_NAME" >/dev/null 2>&1 || true
-    systemctl disable "$XRAY_SERVICE_NAME" >/dev/null 2>&1 || true
-    rm -f "$XRAY_SERVICE_PATH"
-    systemctl daemon-reload >/dev/null 2>&1 || true
+  # 2.5 历史遗留组件清理（Realm 中转 / Xray 内核 / 流量统计已从本脚本移除，
+  #     这里兜底清掉旧版本装过的服务与数据，避免留下孤儿 unit）
+  echo -e "${Y}==> 清理旧版遗留组件（Realm / Xray / 流量统计）...${N}"
+  local legacy_u
+  for legacy_u in realm xray-leyili leyili-traffic.timer leyili-traffic; do
+    systemctl stop    "$legacy_u" >/dev/null 2>&1 || true
+    systemctl disable "$legacy_u" >/dev/null 2>&1 || true
+  done
+  rm -f /usr/local/bin/realm-bin /usr/local/bin/xray-leyili
+  rm -f /etc/systemd/system/realm.service \
+        /etc/systemd/system/xray-leyili.service \
+        /etc/systemd/system/leyili-traffic.service \
+        /etc/systemd/system/leyili-traffic.timer
+  rm -rf /etc/realm /etc/leyili/xray /etc/leyili/traffic
+  systemctl daemon-reload >/dev/null 2>&1 || true
 
-    echo -e "${Y}==> 清理 Xray 二进制与配置目录...${N}"
-    rm -f "$XRAY_BIN_PATH"
-    rm -rf "$XRAY_DIR"
-    # /etc/leyili 在为空时一并清掉（其它子模块如 warp 已自行卸载）
-    [ -d /etc/leyili ] && rmdir --ignore-fail-on-non-empty /etc/leyili 2>/dev/null || true
-  fi
-
-  # 3. Realm 中转（如已装）
-  if realm_is_installed; then
-    echo -e "${Y}==> 卸载 Realm 中转服务...${N}"
-    realm_uninstall >/dev/null 2>&1 || true
-  fi
-
-  # 3.5 流量统计（定时器 + 采样器 + 累计数据）
-  if [ -f "$TRAFFIC_STATE_PATH" ] || [ -f "$TRAFFIC_TIMER_PATH" ] || [ -f "$TRAFFIC_SERVICE_PATH" ]; then
-    echo -e "${Y}==> 清理流量统计定时器与数据...${N}"
-    traffic_remove_units
-    rm -rf "$TRAFFIC_DIR"
-    [ -d /etc/leyili ] && rmdir --ignore-fail-on-non-empty /etc/leyili 2>/dev/null || true
-  fi
-
-  # 3.6 链路测评（目标 IP 记录 + 历史报告 + 脚本自装的 nexttrace）
+  # 3. 链路测评（目标 IP 记录 + 历史报告 + 脚本自装的 nexttrace）
   # NETBENCH_NEXTTRACE_BIN 是独立文件名，不会误删用户自装的 /usr/local/bin/nexttrace
   if [ -f "$NETBENCH_ENV_PATH" ] || [ -f "$NETBENCH_NEXTTRACE_BIN" ] || [ -n "$(_nb_latest_report)" ]; then
     echo -e "${Y}==> 清理链路测评数据与 nexttrace...${N}"
@@ -10441,7 +9808,6 @@ render_node_card_block(){
     anytls)  label="AnyTLS     " ;;   # 11 可见列：6 + 5 sp
     tuic)    label="TUIC v5    " ;;   # 11 可见列：7 + 4 sp
     ss2022)  label="SS-2022    " ;;   # 11 可见列：7 + 4 sp
-    xhr)     label="VLESS-XHR  " ;;   # 11 可见列：9 + 2 sp（vless-xhttp-reality）
     *)       label=$(printf '%-11s' "$type") ;;
   esac
 
@@ -10462,7 +9828,7 @@ render_node_card_block(){
   [ "$gap" -lt 1 ] && gap=1
   gap_str=$(printf '%*s' "$gap" '')
 
-  # 附加信息：HY2 端口跳跃 / SS-2022 谨慎标记 / XHR 量子加密
+  # 附加信息：HY2 端口跳跃 / SS-2022 谨慎标记
   local extra=""
   if [ "$type" = "hy2" ]; then
     local hop_v
@@ -10470,8 +9836,6 @@ render_node_card_block(){
     [ "$hop_v" = "1" ] && extra="  ${C}+hop${N}"
   elif [ "$type" = "ss2022" ]; then
     extra="  ${R}[谨慎]${N}"
-  elif [ "$type" = "xhr" ]; then
-    extra="  ${C}+xray${N}"
   fi
 
   # 第一行：✦ + 协议名 + ● + :端口 + IP + 附加
@@ -10588,40 +9952,6 @@ render_initcwnd_card_line(){
   render_card_line " ${C}✧${N} ${C}${label}${N}${C}${val}${N}  ${persist}"
 }
 
-# 主菜单卡片：标题栏 + 协议块 + 系统调优行
-render_realm_card_line(){
-  local label="Realm 中转 "  # 11 可见列
-  if ! realm_is_installed; then
-    return  # 未安装时不显示这一行（保持卡片简洁）
-  fi
-  local ver status status_str count
-  ver=$(realm_get_version 2>/dev/null | head -n1)
-  [ -z "$ver" ] && ver="?"
-  status=$(systemctl is-active realm 2>/dev/null | head -n1)
-  [ -z "$status" ] && status="未知"
-  case "$status" in
-    active)              status_str="${G}运行中${N}" ;;
-    activating|reloading) status_str="${Y}${status}${N}" ;;
-    *)                   status_str="${R}${status}${N}" ;;
-  esac
-  count=$(realm_count_rules 2>/dev/null | head -n1)
-  [ -z "$count" ] && count=0
-  render_card_line " ${C}✧${N} ${C}${label}${N}${C}v${ver}${N} ${D}·${N} ${status_str} ${D}·${N} ${C}${count}${N} ${D}条规则${N}"
-}
-
-# 流量统计行（单排）：入 / 出 / 共 用紧凑格式，实时叠加未落盘增量
-render_traffic_card_line(){
-  local label="流量统计   "  # 11 可见列
-  if ! traffic_load_state; then
-    render_card_line " ${C}✧${N} ${C}${label}${N}${D}未启用${N}"
-    return
-  fi
-  local totals rx tx sum
-  totals=$(traffic_live_totals)
-  read -r rx tx sum <<< "$totals"
-  render_card_line " ${C}✧${N} ${C}${label}${N}${D}入${N} ${C}$(traffic_format_compact "$rx")${N} ${D}·${N} ${D}出${N} ${C}$(traffic_format_compact "$tx")${N} ${D}·${N} ${D}共${N} ${C}$(traffic_format_compact "$sum")${N}"
-}
-
 # sing-box 内核版本行：当前版本 vs 最新稳定版（GitHub releases/latest 只返回稳定版）
 # 最新版走带缓存的查询，首页反复刷新也不会每次都打 GitHub。
 render_singbox_version_card_line(){
@@ -10646,6 +9976,7 @@ render_singbox_version_card_line(){
   render_card_blank
 }
 
+# 主菜单卡片：标题栏 + 协议块 + 系统调优行
 render_main_menu_card(){
   local ver status status_str title
   if is_singbox_installed; then
@@ -10677,16 +10008,10 @@ render_main_menu_card(){
     render_card_blank
     render_node_card_block ss2022
   fi
-  if node_installed xhr; then
-    render_card_blank
-    render_node_card_block xhr
-  fi
   render_card_blank
   render_tcp_card_line
   render_quic_card_line
   render_initcwnd_card_line
-  render_realm_card_line
-  render_traffic_card_line
   render_card_blank
   render_card_bottom
 }
@@ -10704,7 +10029,6 @@ show_node_install_menu(){
     fi
     render_menu_item 4 "创建 TUIC v5 节点$(node_installed tuic && echo "  ${D}(已安装，将覆盖)${N}")"
     render_menu_item 5 "创建 Shadowsocks-2022 节点  ${R}[谨慎]${N}$(node_installed ss2022 && echo "  ${D}(已安装，将覆盖)${N}")"
-    render_menu_item 6 "创建 Vless-xhttp-reality 节点  ${C}[Xray]${N}$(node_installed xhr && echo "  ${D}(已安装，将覆盖)${N}")"
     render_menu_item 0 "返回上级"
     render_divider
     read -p "  请输入序号: " choice
@@ -10720,7 +10044,6 @@ show_node_install_menu(){
         ;;
       4) install_tuic_node; return ;;
       5) install_ss2022_node; return ;;
-      6) install_xhr_node; return ;;
       0) return ;;
       *) notify_invalid_choice ;;
     esac
@@ -10755,11 +10078,6 @@ show_node_uninstall_menu(){
     else
       echo -e "  ${D}5) Shadowsocks-2022 未安装${N}"
     fi
-    if node_installed xhr; then
-      render_menu_item 6 "卸载 Vless-xhttp-reality 节点"
-    else
-      echo -e "  ${D}6) Vless-xhttp-reality 未安装${N}"
-    fi
     render_menu_item 0 "返回上级"
     render_divider
     read -p "  请输入序号: " choice
@@ -10769,7 +10087,6 @@ show_node_uninstall_menu(){
       3) if node_installed anytls;  then uninstall_anytls_node;  return; else notify_invalid_choice; fi ;;
       4) if node_installed tuic;    then uninstall_tuic_node;    return; else notify_invalid_choice; fi ;;
       5) if node_installed ss2022;  then uninstall_ss2022_node;  return; else notify_invalid_choice; fi ;;
-      6) if node_installed xhr;     then uninstall_xhr_node;     return; else notify_invalid_choice; fi ;;
       0) return ;;
       *) notify_invalid_choice ;;
     esac
@@ -10809,46 +10126,8 @@ upgrade_singbox_kernel(){
   fi
 }
 
-upgrade_xray_kernel(){
-  local cur_ver latest_ver confirm
-  cur_ver=$(get_current_xray_version 2>/dev/null || echo "")
-  latest_ver=$(get_latest_xray_version)
-  echo ""
-  echo -e "  当前版本: ${C}${cur_ver:-未安装}${N}"
-  echo -e "  最新版本: ${C}${latest_ver:-获取失败}${N}"
-  if [ -n "$cur_ver" ] && [ -n "$latest_ver" ] && [ "v${cur_ver}" = "$latest_ver" ]; then
-    echo -e "${G}已是最新版本${N}"
-    sleep 1
-    return 0
-  fi
-  read -p "  确认升级 Xray 内核？(y/N): " confirm
-  if [ "$confirm" != "y" ] && [ "$confirm" != "Y" ]; then
-    echo -e "  已取消"
-    sleep 1
-    return 0
-  fi
-  echo -e "${Y}==> 升级内核（不覆盖配置）...${N}"
-  if ! upgrade_xray; then
-    echo ""
-    echo -e "${R}Xray 升级失败，请检查上方输出${N}"
-    pause_screen
-    return 1
-  fi
-  # 只有正在跑的 xray-leyili 才重启；没装节点时静默跳过
-  if systemctl is-active "$XRAY_SERVICE_NAME" >/dev/null 2>&1; then
-    if ! systemctl restart "$XRAY_SERVICE_NAME"; then
-      echo ""
-      echo -e "${R}升级完成，但服务重启失败${N}"
-      pause_screen
-      return 1
-    fi
-  fi
-  echo -e "${G}升级完成${N}"
-  sleep 1
-}
-
 show_update_menu(){
-  local choice cur_ver kernel_label xray_label xray_cur
+  local choice cur_ver kernel_label
   while true; do
     if command -v sing-box >/dev/null 2>&1; then
       cur_ver=$(get_current_singbox_version)
@@ -10861,28 +10140,15 @@ show_update_menu(){
       kernel_label="升级 sing-box 内核  ${D}(未安装)${N}"
     fi
 
-    if is_xray_installed; then
-      xray_cur=$(get_current_xray_version 2>/dev/null || echo "")
-      if [ -n "$xray_cur" ]; then
-        xray_label="升级 Xray 内核  ${D}(当前: v${xray_cur})${N}"
-      else
-        xray_label="升级 Xray 内核  ${D}(版本未知)${N}"
-      fi
-    else
-      xray_label="升级 Xray 内核  ${D}(未安装，仅 xhttp-reality 节点需要)${N}"
-    fi
-
     render_section_header "更新管理"
     render_menu_item 1 "更新脚本"
     render_menu_item 2 "$kernel_label"
-    render_menu_item 3 "$xray_label"
     render_menu_item 0 "返回上级"
     render_divider
     read -p "  请输入序号: " choice
     case $choice in
       1) update_self_script ;;
       2) upgrade_singbox_kernel ;;
-      3) upgrade_xray_kernel ;;
       0) return ;;
       *) notify_invalid_choice ;;
     esac
@@ -11124,7 +10390,7 @@ EOF
 show_node_manage_menu(){
   while true; do
     render_section_header "节点管理"
-    render_menu_item 1 "创建节点 (Reality / Hysteria2 / AnyTLS / TUIC / SS-2022 / Vless-xhttp-reality)"
+    render_menu_item 1 "创建节点 (Reality / Hysteria2 / AnyTLS / TUIC / SS-2022)"
     render_menu_item 2 "卸载单个节点"
     render_menu_item 3 "Reality 域名检测工具"
     render_menu_item 4 "WARP 谷歌解锁分流"
@@ -11836,768 +11102,6 @@ show_warp_menu(){
   done
 }
 
-# ═══════════════════════════════════════════════════════════════════════
-# Realm 中转管理模块
-# ─────────────────────────────────────────────────────────────────────
-# 用途   : 在中转机上跑纯端口转发（透传，不解密），把流量原样送到落地机
-# 二进制 : zhboner/realm（Rust 实现，支持 TCP+UDP）
-# 配置   : /etc/realm/config.toml ，TOML 格式，[[endpoints]] 数组
-# 服务   : realm.service（独立 systemd unit，与 sing-box 互不干扰）
-# 边界   : 不做加密隧道 / 负载均衡 / 端口段转发；这些进阶功能请用 realm-xwPF
-# 适用   : 客户端 → 中转机(realm) → 落地机(sing-box) → 互联网
-#          客户端 SNI/UUID/pbk 全部用落地机的，realm 不参与加密握手
-# ═══════════════════════════════════════════════════════════════════════
-
-# ─── 底层探测 ─────────────────────────────────────────
-# ═══ source: 91-realm.sh ═══
-realm_is_installed(){
-  [ -x "$REALM_BIN_PATH" ] && [ -f "$REALM_SERVICE_PATH" ]
-}
-
-realm_detect_arch(){
-  local m
-  m=$(uname -m 2>/dev/null || echo unknown)
-  case "$m" in
-    x86_64|amd64)   printf 'x86_64' ;;
-    aarch64|arm64)  printf 'aarch64' ;;
-    *)              return 1 ;;
-  esac
-}
-
-realm_get_version(){
-  if [ -x "$REALM_BIN_PATH" ]; then
-    "$REALM_BIN_PATH" -v 2>/dev/null | head -1 | awk '{print $2}'
-  fi
-}
-
-# 主菜单卡用：返回一行简短状态字符串（已含 ANSI 颜色）
-realm_status_str(){
-  local ver status status_str count
-  if ! realm_is_installed; then
-    return 1
-  fi
-  ver=$(realm_get_version 2>/dev/null)
-  [ -z "$ver" ] && ver="?"
-  status=$(systemctl is-active realm 2>/dev/null || echo unknown)
-  if [ "$status" = "active" ]; then
-    status_str="${G}运行中${N}"
-  else
-    status_str="${R}${status}${N}"
-  fi
-  count=$(realm_count_rules 2>/dev/null || echo 0)
-  printf 'Realm 中转  · v%s · %s · %s 条规则' "$ver" "$status_str" "$count"
-}
-
-require_realm_installed(){
-  if realm_is_installed; then
-    return 0
-  fi
-  echo ""
-  echo -e "${Y}realm 尚未安装，请先在本菜单选择「安装 Realm」${N}"
-  pause_screen
-  return 1
-}
-
-# ─── TOML 操作（纯 awk，不引入新依赖） ─────────────────
-# config.toml 结构：
-#   [network]          ← 全局，恒在
-#   no_tcp = false
-#   use_udp = true
-#
-#   [[endpoints]]      ← 第 1 条规则
-#   listen = "[::]:6666"
-#   remote = "1.2.3.4:443"
-#
-#   [[endpoints]]      ← 第 2 条规则
-#   ...
-
-realm_count_rules(){
-  local n=0
-  if [ -f "$REALM_CONFIG_PATH" ]; then
-    n=$(grep -c '^\[\[endpoints\]\]' "$REALM_CONFIG_PATH" 2>/dev/null)
-  fi
-  printf '%s\n' "${n:-0}"
-}
-
-# 列出所有规则，输出: "INDEX|LISTEN|REMOTE"，从 1 开始
-realm_list_rules(){
-  [ -f "$REALM_CONFIG_PATH" ] || return 0
-  awk '
-    BEGIN { idx = 0; listen = ""; remote = "" }
-    /^\[\[endpoints\]\]/ {
-      if (idx > 0) printf "%d|%s|%s\n", idx, listen, remote
-      idx++
-      listen = ""; remote = ""
-      next
-    }
-    /^[[:space:]]*listen[[:space:]]*=/ {
-      sub(/^[^=]*=[[:space:]]*/, ""); gsub(/"/, ""); listen = $0
-    }
-    /^[[:space:]]*remote[[:space:]]*=/ {
-      sub(/^[^=]*=[[:space:]]*/, ""); gsub(/"/, ""); remote = $0
-    }
-    END {
-      if (idx > 0) printf "%d|%s|%s\n", idx, listen, remote
-    }
-  ' "$REALM_CONFIG_PATH"
-}
-
-# 写 [network] 骨架（首次安装时调用）
-realm_config_skeleton(){
-  mkdir -p "$REALM_CONFIG_DIR"
-  if [ ! -f "$REALM_CONFIG_PATH" ]; then
-    cat > "$REALM_CONFIG_PATH" <<'EOF'
-[network]
-no_tcp = false
-use_udp = true
-EOF
-  fi
-}
-
-# realm_add_rule <listen_str> <remote_ip> <remote_port>
-# listen_str: "[::]:6666" 或 "0.0.0.0:6666"
-realm_add_rule(){
-  local listen="$1" remote_ip="$2" remote_port="$3"
-  realm_config_skeleton
-  cat >> "$REALM_CONFIG_PATH" <<EOF
-
-[[endpoints]]
-listen = "${listen}"
-remote = "${remote_ip}:${remote_port}"
-EOF
-}
-
-# realm_delete_rule <index>  (1-based)
-realm_delete_rule(){
-  local target="$1"
-  case "$target" in
-    ''|*[!0-9]*) return 1 ;;
-  esac
-  [ -f "$REALM_CONFIG_PATH" ] || return 1
-
-  local backup_path tmp
-  backup_path="${REALM_CONFIG_PATH}.bak.$(date +%Y%m%d%H%M%S)"
-  cp "$REALM_CONFIG_PATH" "$backup_path" 2>/dev/null || true
-  tmp=$(mktemp)
-
-  if ! awk -v target="$target" '
-    BEGIN { idx = 0; skip = 0 }
-    /^\[\[endpoints\]\]/ {
-      idx++
-      if (idx == target) { skip = 1; next }
-      skip = 0
-      print
-      next
-    }
-    /^\[/ {                # 进入新顶级表 → 退出 skip 状态
-      skip = 0
-      print
-      next
-    }
-    {
-      if (skip) next
-      print
-    }
-  ' "$REALM_CONFIG_PATH" > "$tmp"; then
-    rm -f "$tmp"
-    cp "$backup_path" "$REALM_CONFIG_PATH" 2>/dev/null || true
-    return 1
-  fi
-
-  mv "$tmp" "$REALM_CONFIG_PATH"
-  cleanup_old_backups "${REALM_CONFIG_PATH}.bak.*" 5 2>/dev/null || true
-  return 0
-}
-
-# 清空所有规则，保留 [network]
-realm_clear_rules(){
-  local backup_path
-  backup_path="${REALM_CONFIG_PATH}.bak.$(date +%Y%m%d%H%M%S)"
-  cp "$REALM_CONFIG_PATH" "$backup_path" 2>/dev/null || true
-  cat > "$REALM_CONFIG_PATH" <<'EOF'
-[network]
-no_tcp = false
-use_udp = true
-EOF
-  cleanup_old_backups "${REALM_CONFIG_PATH}.bak.*" 5 2>/dev/null || true
-}
-
-# ─── 安装 / 卸载 ──────────────────────────────────────
-realm_install(){
-  if ! require_root; then return 1; fi
-
-  if realm_is_installed; then
-    echo -e "${Y}realm 已经安装。如需升级请先卸载再装${N}"
-    return 0
-  fi
-
-  local arch download_url tmpdir tarball
-  arch=$(realm_detect_arch) || {
-    echo -e "${R}不支持的 CPU 架构: $(uname -m)${N}"
-    return 1
-  }
-  download_url="${REALM_DOWNLOAD_BASE}/realm-${arch}-unknown-linux-gnu.tar.gz"
-
-  echo -e "${Y}==> 准备依赖（curl / tar）...${N}"
-  if ! command -v curl >/dev/null 2>&1 || ! command -v tar >/dev/null 2>&1; then
-    DEBIAN_FRONTEND=noninteractive apt-get update -qq >/dev/null 2>&1 || true
-    DEBIAN_FRONTEND=noninteractive apt-get install -y curl tar >/dev/null 2>&1 || {
-      echo -e "${R}curl / tar 安装失败，请手动安装后重试${N}"
-      return 1
-    }
-  fi
-
-  tmpdir=$(mktemp -d)
-  tarball="${tmpdir}/realm.tar.gz"
-
-  echo -e "${Y}==> 下载 realm (${arch})...${N}"
-  echo -e "  ${D}${download_url}${N}"
-  if ! curl -fsSL --max-time 60 "$download_url" -o "$tarball"; then
-    echo -e "${R}下载失败，请检查网络（GitHub 访问是否正常）${N}"
-    rm -rf "$tmpdir"
-    return 1
-  fi
-
-  echo -e "${Y}==> 解压并安装到 ${REALM_BIN_PATH}...${N}"
-  if ! tar -xzf "$tarball" -C "$tmpdir"; then
-    echo -e "${R}解压失败，文件可能损坏${N}"
-    rm -rf "$tmpdir"
-    return 1
-  fi
-  if [ ! -f "${tmpdir}/realm" ]; then
-    echo -e "${R}解压后未找到 realm 二进制${N}"
-    rm -rf "$tmpdir"
-    return 1
-  fi
-  install -m 0755 "${tmpdir}/realm" "$REALM_BIN_PATH"
-  rm -rf "$tmpdir"
-
-  if ! "$REALM_BIN_PATH" -h >/dev/null 2>&1; then
-    echo -e "${R}realm 二进制无法执行（可能是 glibc 版本不匹配）${N}"
-    rm -f "$REALM_BIN_PATH"
-    return 1
-  fi
-
-  echo -e "${Y}==> 写入配置骨架 ${REALM_CONFIG_PATH}...${N}"
-  realm_config_skeleton
-
-  echo -e "${Y}==> 写入 systemd 服务 ${REALM_SERVICE_PATH}...${N}"
-  cat > "$REALM_SERVICE_PATH" <<EOF
-[Unit]
-Description=Realm port forwarding service
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-User=root
-Restart=on-failure
-RestartSec=5s
-ExecStart=${REALM_BIN_PATH} -c ${REALM_CONFIG_PATH}
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-  systemctl daemon-reload
-  systemctl enable realm >/dev/null 2>&1 || true
-  # realm 2.9.x 强制要求至少一条 [[endpoints]]，没规则就启动会 panic 并触发 systemd
-  # 重启风暴。这里只 enable 不 start，等用户加第一条规则时由 realm_menu_add
-  # 里的 systemctl restart 拉起。
-  echo -e "${G}realm 二进制 + systemd 单元已就位${N}"
-  echo -e "  ${D}（realm 服务暂未启动：等待你添加第一条转发规则后自动拉起）${N}"
-
-  echo ""
-  echo -e "  ${G}已就绪。${N}下一步在本菜单\"添加转发规则\"中加第一条规则。"
-  return 0
-}
-
-realm_uninstall(){
-  if ! require_root; then return 1; fi
-  if ! realm_is_installed; then
-    echo -e "${Y}realm 未安装${N}"
-    return 0
-  fi
-
-  echo -e "${Y}==> 撤销所有规则的防火墙端口...${N}"
-  local rule listen_str port
-  while IFS='|' read -r _ listen_str _; do
-    port=$(printf '%s' "$listen_str" | awk -F: '{print $NF}')
-    if [ -n "$port" ] && [ "$port" -ge 1 ] 2>/dev/null && [ "$port" -le 65535 ] 2>/dev/null; then
-      node_revoke_firewall_for_mode "$port" tcp dualstack >/dev/null 2>&1 || true
-      node_revoke_firewall_for_mode "$port" udp dualstack >/dev/null 2>&1 || true
-    fi
-  done < <(realm_list_rules)
-
-  echo -e "${Y}==> 停止并禁用 realm 服务...${N}"
-  systemctl stop realm >/dev/null 2>&1 || true
-  systemctl disable realm >/dev/null 2>&1 || true
-
-  echo -e "${Y}==> 清理文件...${N}"
-  rm -f "$REALM_SERVICE_PATH"
-  rm -f "$REALM_BIN_PATH"
-  rm -rf "$REALM_CONFIG_DIR"
-  systemctl daemon-reload
-
-  echo -e "${G}realm 已彻底卸载${N}"
-  return 0
-}
-
-# ─── 子菜单交互 ───────────────────────────────────────
-realm_menu_add(){
-  if ! require_realm_installed; then return 1; fi
-
-  local listen_port remote_ip remote_port listen_mode listen_str
-  local my_v4 my_v6 remote_is_v6
-  echo ""
-  echo -e "  ${B}添加转发规则${N}"
-  echo -e "  ${D}（中转机本地监听 → 落地机 IP:端口）${N}"
-  echo ""
-  echo -e "  ${B}${C}小白须知${N}"
-  echo -e "  ${D}• 监听端口 = 客户端最终连本机的端口（A 对外暴露的）${N}"
-  echo -e "  ${D}• 落地 IP / 端口 = B 落地机自己的 IP 和节点端口${N}"
-  echo -e "  ${D}• 落地是 v4 还是 v6 都行，realm 自动转换${N}"
-  echo -e "  ${D}• realm 不参与加密，客户端的 SNI/UUID/pbk 全部用落地机的${N}"
-  echo ""
-
-  read -p "  本机监听端口 (1-65535): " listen_port
-  if ! validate_port "$listen_port"; then
-    echo -e "${R}端口非法${N}"
-    return 1
-  fi
-
-  # 端口占用检测（事前拦截）
-  if command -v ss >/dev/null 2>&1; then
-    if ss -tlnH "( sport = :$listen_port )" 2>/dev/null | grep -q . \
-       || ss -ulnH "( sport = :$listen_port )" 2>/dev/null | grep -q .; then
-      echo -e "${R}端口 ${listen_port} 已被本机其它进程占用，请换一个${N}"
-      return 1
-    fi
-  fi
-
-  echo ""
-  echo -e "  ${D}落地机 IP 输入示例：${N}"
-  echo -e "  ${D}  IPv4 : 1.2.3.4${N}"
-  echo -e "  ${D}  IPv6 : 2001:db8::1   ${L}（不用加方括号，脚本会自动加）${N}"
-  read -p "  落地机 IP: " remote_ip
-  remote_ip=$(printf '%s' "$remote_ip" | tr -d '[:space:]' | tr -d '[]')
-  if [ -z "$remote_ip" ]; then
-    echo -e "${R}落地机 IP 不能为空${N}"
-    return 1
-  fi
-  # 仅允许 IPv4 / IPv6 字符集，挡掉 TOML 写入注入（"、=、; 等）
-  if printf '%s' "$remote_ip" | grep -q '[^0-9a-fA-F:.]'; then
-    echo -e "${R}IP 含非法字符（仅支持数字 / a-f / : / .）${N}"
-    return 1
-  fi
-  # 判定 IPv6（含冒号且非纯数字端口形式）
-  remote_is_v6=0
-  if [ "${remote_ip#*:}" != "$remote_ip" ]; then
-    remote_is_v6=1
-  fi
-
-  # 自连环检查（落地 IP 不能等于本机的 v4 / v6）
-  my_v4=$(detect_primary_ipv4 2>/dev/null || true)
-  my_v6=$(detect_primary_ipv6 2>/dev/null || true)
-  if [ -n "$my_v4" ] && [ "$remote_ip" = "$my_v4" ]; then
-    echo -e "${R}落地 IP ${remote_ip} 与本机 IPv4 相同，会形成自连环${N}"
-    echo -e "${Y}realm 会把流量转给本机自己，CPU 跑满${N}"
-    return 1
-  fi
-  if [ -n "$my_v6" ] && [ "$remote_ip" = "$my_v6" ]; then
-    echo -e "${R}落地 IP ${remote_ip} 与本机 IPv6 相同，会形成自连环${N}"
-    return 1
-  fi
-
-  # IPv6 加方括号
-  if [ "$remote_is_v6" = "1" ]; then
-    remote_ip="[${remote_ip}]"
-  fi
-
-  read -p "  落地机端口 (1-65535): " remote_port
-  if ! validate_port "$remote_port"; then
-    echo -e "${R}端口非法${N}"
-    return 1
-  fi
-
-  echo ""
-  echo -e "  ${B}本机监听地址${N}  ${D}（决定客户端能用什么 IP 连进来）${N}"
-  echo -e "  ${L}1)${N} ${C}[::]:${listen_port}${N}      ${D}双栈，v4 和 v6 客户端都能进（推荐）${N}"
-  echo -e "  ${L}2)${N} ${C}0.0.0.0:${listen_port}${N}   ${D}仅 v4，IPv6 客户端连不上${N}"
-  if [ "$remote_is_v6" = "1" ]; then
-    echo -e "  ${D}提示：落地是 IPv6 不影响监听类型，本机有 v4 公网选 1 即可${N}"
-  fi
-  read -p "  选择 (默认 1): " listen_mode
-  case "${listen_mode:-1}" in
-    1) listen_str="[::]:${listen_port}" ;;
-    2) listen_str="0.0.0.0:${listen_port}" ;;
-    *) echo -e "${R}选择无效${N}"; return 1 ;;
-  esac
-
-  echo ""
-  echo -e "${Y}==> 写入规则...${N}"
-  if ! realm_add_rule "$listen_str" "$remote_ip" "$remote_port"; then
-    echo -e "${R}写入失败${N}"
-    return 1
-  fi
-
-  echo -e "${Y}==> 放行防火墙端口 ${listen_port} (TCP+UDP, v4+v6)...${N}"
-  node_apply_firewall_for_mode "$listen_port" tcp dualstack
-  node_apply_firewall_for_mode "$listen_port" udp dualstack
-
-  echo -e "${Y}==> 重启 realm 服务...${N}"
-  if systemctl restart realm; then
-    echo -e "${G}规则已生效${N}"
-  else
-    echo -e "${R}realm 重启失败，请用 journalctl -u realm 查看${N}"
-    return 1
-  fi
-
-  echo ""
-  echo -e "  ${G}✓${N} 客户端连接 ${C}本机IP:${listen_port}${N} 会被转发到 ${C}${remote_ip}:${remote_port}${N}"
-  if [ "$remote_is_v6" = "1" ]; then
-    echo -e "  ${D}（落地是 IPv6，确认本机能 ping 通 ${remote_ip}：${C}ping6 ${remote_ip#[}${N}${D} 去掉方括号试一下）${N}"
-  fi
-  echo -e "  ${D}提示：客户端的 SNI / UUID / pbk / 密码等加密参数请按${B}落地机${N}${D}配置填${N}"
-  return 0
-}
-
-realm_menu_view(){
-  if ! require_realm_installed; then return 1; fi
-
-  echo ""
-  echo -e "  ${B}当前转发规则${N}"
-  local count
-  count=$(realm_count_rules)
-  if [ "$count" -eq 0 ]; then
-    echo -e "  ${D}（暂无规则，请先「添加转发规则」）${N}"
-  else
-    printf "  ${L}│${N}  %-4s %-26s  %s\n" "ID" "本机监听" "落地"
-    local idx listen_str remote_str
-    while IFS='|' read -r idx listen_str remote_str; do
-      printf "  ${L}│${N}  ${Y}%-4s${N} ${C}%-26s${N}  ${C}%s${N}\n" "$idx" "$listen_str" "$remote_str"
-    done < <(realm_list_rules)
-  fi
-
-  echo ""
-  echo -e "  ${B}服务状态${N}"
-  local status
-  status=$(systemctl is-active realm 2>/dev/null || echo unknown)
-  if [ "$status" = "active" ]; then
-    echo -e "  ${L}│${N}  ${G}● realm 运行中${N}"
-  else
-    echo -e "  ${L}│${N}  ${R}● realm ${status}${N}  ${D}（用 journalctl -u realm 看日志）${N}"
-  fi
-
-  echo ""
-  echo -e "  ${D}配置文件: ${REALM_CONFIG_PATH}${N}"
-  return 0
-}
-
-realm_menu_delete(){
-  if ! require_realm_installed; then return 1; fi
-
-  local count target listen_str port
-  count=$(realm_count_rules)
-  if [ "$count" -eq 0 ]; then
-    echo -e "${Y}当前没有规则${N}"
-    return 0
-  fi
-
-  echo ""
-  echo -e "  ${B}选择要删除的规则${N}"
-  local idx ls rs
-  while IFS='|' read -r idx ls rs; do
-    printf "    ${Y}%s)${N} %s → %s\n" "$idx" "$ls" "$rs"
-  done < <(realm_list_rules)
-  echo ""
-  read -p "  请输入编号 (1-${count}, 回车取消): " target
-  [ -z "$target" ] && { echo -e "  已取消"; return 0; }
-  case "$target" in
-    ''|*[!0-9]*) echo -e "${R}编号非法${N}"; return 1 ;;
-  esac
-  if [ "$target" -lt 1 ] || [ "$target" -gt "$count" ]; then
-    echo -e "${R}编号超出范围${N}"
-    return 1
-  fi
-
-  # 提前抓出该规则的端口，便于撤防火墙
-  listen_str=$(realm_list_rules | awk -F'|' -v t="$target" '$1==t{print $2}')
-  port=$(printf '%s' "$listen_str" | awk -F: '{print $NF}')
-
-  echo -e "${Y}==> 从配置移除规则 ${target}...${N}"
-  if ! realm_delete_rule "$target"; then
-    echo -e "${R}删除失败${N}"
-    return 1
-  fi
-
-  if [ -n "$port" ] && [ "$port" -ge 1 ] 2>/dev/null && [ "$port" -le 65535 ] 2>/dev/null; then
-    echo -e "${Y}==> 撤销防火墙端口 ${port}...${N}"
-    node_revoke_firewall_for_mode "$port" tcp dualstack
-    node_revoke_firewall_for_mode "$port" udp dualstack
-  fi
-
-  echo -e "${Y}==> 重启 realm 服务...${N}"
-  systemctl restart realm >/dev/null 2>&1 || true
-  echo -e "${G}规则 ${target} 已删除${N}"
-  return 0
-}
-
-realm_menu_clear(){
-  if ! require_realm_installed; then return 1; fi
-  local count
-  count=$(realm_count_rules)
-  if [ "$count" -eq 0 ]; then
-    echo -e "${Y}当前没有规则${N}"
-    return 0
-  fi
-
-  echo ""
-  echo -e "  ${R}${B}此操作将清空所有 ${count} 条规则${N}"
-  read -p "  确认？(y/N): " confirm
-  if [ "$confirm" != "y" ] && [ "$confirm" != "Y" ]; then
-    echo -e "  已取消"
-    return 0
-  fi
-
-  # 收集所有端口先撤防火墙
-  echo -e "${Y}==> 撤销所有规则的防火墙端口...${N}"
-  local listen_str port
-  while IFS='|' read -r _ listen_str _; do
-    port=$(printf '%s' "$listen_str" | awk -F: '{print $NF}')
-    if [ -n "$port" ] && [ "$port" -ge 1 ] 2>/dev/null && [ "$port" -le 65535 ] 2>/dev/null; then
-      node_revoke_firewall_for_mode "$port" tcp dualstack >/dev/null 2>&1 || true
-      node_revoke_firewall_for_mode "$port" udp dualstack >/dev/null 2>&1 || true
-    fi
-  done < <(realm_list_rules)
-
-  echo -e "${Y}==> 清空配置...${N}"
-  realm_clear_rules
-
-  echo -e "${Y}==> 重启 realm 服务...${N}"
-  systemctl restart realm >/dev/null 2>&1 || true
-  echo -e "${G}已清空全部规则${N}"
-  return 0
-}
-
-# ─── 自检诊断 ─────────────────────────────────────────
-# 一次性把 7 类常见故障点的实际状态打印出来，快速定位"链路不通"
-realm_menu_diagnose(){
-  if ! require_realm_installed; then return 1; fi
-
-  local count
-  count=$(realm_count_rules)
-
-  echo ""
-  echo -e "  ${B}${C}Realm 一键自检诊断${N}"
-  render_divider
-
-  # ── [1] 服务状态
-  echo -e "  ${B}[1/7] 服务状态${N}"
-  local status
-  status=$(systemctl is-active realm 2>/dev/null || echo unknown)
-  if [ "$status" = "active" ]; then
-    echo -e "    ${G}● realm: active${N}"
-  else
-    echo -e "    ${R}● realm: ${status}${N}  ${D}(以下是 systemctl status 摘要)${N}"
-    systemctl status realm --no-pager -l 2>&1 | head -12 | sed 's/^/      /'
-  fi
-  echo ""
-
-  # ── [2] 配置文件
-  echo -e "  ${B}[2/7] 配置文件 ${C}${REALM_CONFIG_PATH}${N}"
-  if [ -f "$REALM_CONFIG_PATH" ]; then
-    sed 's/^/      /' "$REALM_CONFIG_PATH"
-  else
-    echo -e "      ${R}配置文件不存在${N}"
-  fi
-  echo ""
-
-  if [ "$count" -eq 0 ]; then
-    echo -e "  ${Y}[3-6] 无转发规则，跳过端口/防火墙/出站连通性检查${N}"
-    echo ""
-  fi
-
-  # ── [3-6] 逐条规则
-  local idx listen_str remote_str listen_port r_host r_port
-  while IFS='|' read -r idx listen_str remote_str; do
-    listen_port=$(printf '%s' "$listen_str" | awk -F: '{print $NF}')
-    # remote 格式：IPv4 = 1.2.3.4:443，IPv6 = [2001:db8::1]:443
-    if [[ "$remote_str" =~ ^\[(.+)\]:([0-9]+)$ ]]; then
-      r_host="${BASH_REMATCH[1]}"
-      r_port="${BASH_REMATCH[2]}"
-    else
-      r_host="${remote_str%:*}"
-      r_port="${remote_str##*:}"
-    fi
-
-    echo -e "  ${B}━━━ 规则 ${Y}${idx}${B}: ${C}${listen_str}${N} ${B}→${N} ${C}${remote_str}${N} ${B}━━━${N}"
-
-    # [3] 监听端口
-    echo -e "  ${B}[3/7] 端口监听情况${N}"
-    local tcp_listen udp_listen
-    tcp_listen=$(ss -tlnH 2>/dev/null | awk -v p=":${listen_port}\$" '$4 ~ p { print "      " $0 }')
-    udp_listen=$(ss -ulnH 2>/dev/null | awk -v p=":${listen_port}\$" '$4 ~ p { print "      " $0 }')
-    if [ -n "$tcp_listen" ]; then
-      echo -e "    ${G}TCP ✓ 已监听${N}"
-      echo "$tcp_listen"
-    else
-      echo -e "    ${R}TCP ✗ 未监听 ${listen_port}${N}  ${D}(realm 未起来 / 配置没生效)${N}"
-    fi
-    if [ -n "$udp_listen" ]; then
-      echo -e "    ${G}UDP ✓ 已监听${N}"
-      echo "$udp_listen"
-    else
-      echo -e "    ${Y}UDP ✗ 未监听 ${listen_port}${N}  ${D}(Hy2/QUIC 必需; Reality/AnyTLS 不需要)${N}"
-    fi
-
-    # [4] v4 防火墙
-    echo -e "  ${B}[4/7] IPv4 INPUT 防火墙${N}"
-    local v4_pol v4_match
-    v4_pol=$(ip4_get_input_policy)
-    if [ "$v4_pol" = "ACCEPT" ]; then
-      echo -e "    ${G}默认策略 ACCEPT，无需显式放行${N}"
-    elif [ "$v4_pol" = "DROP" ]; then
-      v4_match=$(iptables -nL INPUT 2>/dev/null | awk -v p="dpt:${listen_port}\$" '$0 ~ p { print "      " $0 }')
-      if [ -n "$v4_match" ]; then
-        echo -e "    ${G}默认 DROP, 已显式放行 ${listen_port}${N}"
-        echo "$v4_match"
-      else
-        echo -e "    ${R}默认 DROP 但未放行 ${listen_port}/tcp${N}"
-      fi
-    else
-      echo -e "    ${Y}默认策略未知: ${v4_pol:-?}${N}"
-    fi
-
-    # [5] v6 防火墙
-    echo -e "  ${B}[5/7] IPv6 INPUT 防火墙${N}"
-    local v6_pol v6_match
-    v6_pol=$(ip6_get_input_policy)
-    if [ "$v6_pol" = "ACCEPT" ]; then
-      echo -e "    ${G}默认策略 ACCEPT，无需显式放行${N}"
-    elif [ "$v6_pol" = "DROP" ]; then
-      v6_match=$(ip6tables -nL INPUT 2>/dev/null | awk -v p="dpt:${listen_port}\$" '$0 ~ p { print "      " $0 }')
-      if [ -n "$v6_match" ]; then
-        echo -e "    ${G}默认 DROP, 已显式放行 ${listen_port}${N}"
-        echo "$v6_match"
-      else
-        echo -e "    ${R}默认 DROP 但未放行 ${listen_port}/tcp${N}  ${D}(v6 客户端进不来)${N}"
-      fi
-    else
-      echo -e "    ${Y}默认策略未知: ${v6_pol:-?}${N}"
-    fi
-
-    # [6] 出站连通性
-    echo -e "  ${B}[6/7] 中转机 → 落地机 ${C}${r_host}:${r_port}${N} ${B}TCP 出站${N}"
-    if command -v nc >/dev/null 2>&1; then
-      if timeout 6 nc -z -w 5 "$r_host" "$r_port" >/dev/null 2>&1; then
-        echo -e "    ${G}✓ TCP 出站可达 (落地机端口能接受)${N}"
-      else
-        echo -e "    ${R}✗ TCP 出站不通${N}  ${D}(落地机 sing-box 没起 / 落地防火墙 / 路由 / 安全组)${N}"
-      fi
-    else
-      echo -e "    ${Y}nc 命令不可用，跳过出站连通性检查${N}"
-    fi
-    echo ""
-
-  done < <(realm_list_rules)
-
-  # ── [7] 日志
-  echo -e "  ${B}[7/7] realm 最近 30 行日志${N}"
-  if journalctl -u realm --no-pager -n 30 2>/dev/null | sed 's/^/      /'; then
-    :
-  else
-    echo -e "      ${Y}journalctl 读取失败${N}"
-  fi
-  echo ""
-
-  echo -e "  ${D}诊断完成。把以上输出全部贴给开发者即可定位问题。${N}"
-  return 0
-}
-
-# ─── 顶级菜单 ─────────────────────────────────────────
-show_realm_menu(){
-  while true; do
-    render_section_header "Realm 中转管理"
-
-    echo -e "  ${B}${C}什么是 Realm 中转？${N}"
-    echo -e "  ${D}客户端 → ${C}中转机(realm 透传)${D} → ${C}落地机(sing-box)${D} → 互联网${N}"
-    echo -e "  ${D}realm 只搬运字节，不解密；加密握手在客户端 ↔ 落地机之间端到端完成。${N}"
-    echo ""
-    echo -e "  ${B}${C}使用流程${N}"
-    echo -e "  ${Y}①${N} 落地机 B：装 sing-box 节点 → 复制客户端链接"
-    echo -e "  ${Y}②${N} 中转机 A（本机）：本菜单 ${C}1)${N} 安装 → ${C}2)${N} 加规则（监听端口 → B 的 IP:端口）"
-    echo -e "  ${Y}③${N} 客户端配置：把 IP 改成 A 的，${R}${B}SNI/UUID/pbk 全部用 B 的${N}"
-    echo -e "  ${Y}④${N} 连上访问 ipify.org 应看到 B 的 IP，搞定"
-    echo ""
-    echo -e "  ${B}${C}IPv6 / 双栈场景（不用懵，看一眼就懂）${N}"
-    echo -e "  ${D}落地机 IP 是 ${C}IPv4${D} 还是 ${C}IPv6${D} 都行，加规则时直接填进去即可。${N}"
-    echo -e "  ${D}监听类型决定客户端能用什么 IP 进来：${C}[::]${D} 双栈通吃，${C}0.0.0.0${D} 仅 v4。${N}"
-    echo -e "  ${D}两件事独立——比如本机选 ${C}[::]${D}（v4+v6 客户端都进）落地写 IPv6，OK。${N}"
-    echo ""
-    echo -e "  ${D}详细教程见 realm-中转落地指南.md（含 IPv6 场景表）${N}"
-    render_divider
-
-    if realm_is_installed; then
-      local ver count status
-      ver=$(realm_get_version 2>/dev/null)
-      [ -z "$ver" ] && ver="?"
-      count=$(realm_count_rules)
-      status=$(systemctl is-active realm 2>/dev/null || echo unknown)
-      echo -e "  状态     : ${G}已安装${N}  ${D}v${ver}${N}"
-      if [ "$status" = "active" ]; then
-        echo -e "  服务     : ${G}运行中${N}"
-      else
-        echo -e "  服务     : ${R}${status}${N}"
-      fi
-      echo -e "  规则数量 : ${C}${count}${N} 条"
-    else
-      echo -e "  状态     : ${Y}未安装${N}  ${D}（请先选 1 安装）${N}"
-    fi
-    render_divider
-
-    render_menu_item 1 "安装 Realm"
-    render_menu_item 2 "添加转发规则"
-    render_menu_item 3 "查看规则 / 服务状态"
-    render_menu_item 4 "删除单条规则"
-    render_menu_item 5 "清空全部规则"
-    render_menu_item 6 "重启 realm 服务"
-    render_menu_item 7 "查看实时日志"
-    render_menu_item 8 "一键自检诊断"
-    render_menu_item 9 "卸载 Realm"
-    render_menu_item 0 "返回上级"
-    render_divider
-    read -p "  请输入序号: " choice
-    case "$choice" in
-      1) realm_install; pause_screen ;;
-      2) realm_menu_add; pause_screen ;;
-      3) realm_menu_view; pause_screen ;;
-      4) realm_menu_delete; pause_screen ;;
-      5) realm_menu_clear; pause_screen ;;
-      6)
-        if require_realm_installed; then
-          if systemctl restart realm; then
-            echo -e "${G}realm 已重启${N}"
-          else
-            echo -e "${R}重启失败，请用 journalctl -u realm 查看${N}"
-          fi
-        fi
-        pause_screen
-        ;;
-      7)
-        if require_realm_installed; then
-          echo -e "${D}（按 Ctrl+C 退出日志）${N}"
-          journalctl -u realm -f --no-pager 2>/dev/null || true
-        fi
-        ;;
-      8) realm_menu_diagnose; pause_screen ;;
-      9) realm_uninstall; pause_screen ;;
-      0) return ;;
-      *) notify_invalid_choice ;;
-    esac
-  done
-}
-
 # ─── 服务器状态面板 ───────────────────────────────────
 # ═══ source: 92-status.sh ═══
 status_format_bytes(){
@@ -12803,452 +11307,10 @@ show_server_status(){
 
   echo -e "  ${B}${C}›  服务${N}"
   printf "  ${L}●${N} %-10s : %s\n" "sing-box" "$(status_service_state sing-box sing-box)"
-  printf "  ${L}●${N} %-10s : %s\n" "realm"    "$(status_service_state realm    "$REALM_BIN_PATH")"
 
   pause_screen
 }
 
-# ═══ source: 93-traffic.sh ═══
-# ═══════════════════════════════════════════════════════
-#  流量统计：/proc/net/dev 计数器累计 + systemd 定时器落盘
-#  - 状态文件跨重启累计（重启后内核计数器归零，采样器自动续算）
-#  - 采样器是写死路径的独立小脚本，不依赖脚本本体：
-#    本体升级 / 回退 / 被删都不影响每分钟的计数落盘
-# ═══════════════════════════════════════════════════════
-
-# 从状态文件读取单个字段（awk 提取，不 source，防止执行任意内容）
-_traffic_state_get(){
-  awk -F'=' -v k="$1" '$1==k {print $2; exit}' "$TRAFFIC_STATE_PATH" 2>/dev/null
-}
-
-# 非法 / 空值一律回落为 0，保证后续算术安全
-_traffic_num(){
-  case "${1:-}" in ''|*[!0-9]*) printf '0' ;; *) printf '%s' "$1" ;; esac
-}
-
-# 载入状态到全局变量；未启用（无状态文件 / 网卡名非法）返回 1
-traffic_load_state(){
-  TRAFFIC_IFACE_V=""
-  TRAFFIC_ACC_RX_V=0; TRAFFIC_ACC_TX_V=0
-  TRAFFIC_LAST_RX_V=0; TRAFFIC_LAST_TX_V=0
-  TRAFFIC_RESET_AT_V=0
-  [ -f "$TRAFFIC_STATE_PATH" ] || return 1
-  local v
-  v=$(_traffic_state_get IFACE)
-  case "$v" in ''|*[!A-Za-z0-9._-]*) return 1 ;; *) TRAFFIC_IFACE_V="$v" ;; esac
-  TRAFFIC_ACC_RX_V=$(_traffic_num "$(_traffic_state_get ACC_RX)")
-  TRAFFIC_ACC_TX_V=$(_traffic_num "$(_traffic_state_get ACC_TX)")
-  TRAFFIC_LAST_RX_V=$(_traffic_num "$(_traffic_state_get LAST_RX)")
-  TRAFFIC_LAST_TX_V=$(_traffic_num "$(_traffic_state_get LAST_TX)")
-  TRAFFIC_RESET_AT_V=$(_traffic_num "$(_traffic_state_get RESET_AT)")
-  return 0
-}
-
-# 原子落盘（tmp + mv）；写失败静默返回 1（非 root 只读浏览时容错）
-traffic_save_state(){
-  local tmp="${TRAFFIC_STATE_PATH}.tmp.$$"
-  mkdir -p "$TRAFFIC_DIR" 2>/dev/null || return 1
-  {
-    echo "IFACE=$TRAFFIC_IFACE_V"
-    echo "ACC_RX=$TRAFFIC_ACC_RX_V"
-    echo "ACC_TX=$TRAFFIC_ACC_TX_V"
-    echo "LAST_RX=$TRAFFIC_LAST_RX_V"
-    echo "LAST_TX=$TRAFFIC_LAST_TX_V"
-    echo "RESET_AT=$TRAFFIC_RESET_AT_V"
-  } 2>/dev/null > "$tmp" || { rm -f "$tmp" 2>/dev/null; return 1; }
-  mv -f "$tmp" "$TRAFFIC_STATE_PATH" 2>/dev/null || { rm -f "$tmp" 2>/dev/null; return 1; }
-}
-
-# 手动跑一次采样器（root 打开页面时把未落盘增量先结算掉）；任何失败静默
-traffic_run_sampler(){
-  [ -x "$TRAFFIC_SAMPLER_PATH" ] && "$TRAFFIC_SAMPLER_PATH" >/dev/null 2>&1
-  return 0
-}
-
-# 实时总量（只读不落盘）：已累计值 + 当前计数与上次快照的差
-# 输出 "rx tx total"（bytes）；调用前需先 traffic_load_state
-traffic_live_totals(){
-  local v cur_rx cur_tx rx tx
-  rx=$TRAFFIC_ACC_RX_V; tx=$TRAFFIC_ACC_TX_V
-  v=$(status_read_iface "$TRAFFIC_IFACE_V")
-  if [ -n "$v" ]; then
-    cur_rx=$(_traffic_num "${v% *}")
-    cur_tx=$(_traffic_num "${v#* }")
-    if [ "$cur_rx" -ge "$TRAFFIC_LAST_RX_V" ] && [ "$cur_tx" -ge "$TRAFFIC_LAST_TX_V" ]; then
-      rx=$(( rx + cur_rx - TRAFFIC_LAST_RX_V ))
-      tx=$(( tx + cur_tx - TRAFFIC_LAST_TX_V ))
-    else
-      # 计数器已归零（重启后定时器还没跑过）：按新计数整段并入
-      rx=$(( rx + cur_rx ))
-      tx=$(( tx + cur_tx ))
-    fi
-  fi
-  printf '%s %s %s' "$rx" "$tx" "$(( rx + tx ))"
-}
-
-# 紧凑字节格式（主页卡片用，最长 5 可见列：1023G / 99.9G / 9.99G / 999B）
-traffic_format_compact(){
-  local b
-  b=$(_traffic_num "${1:-0}")
-  awk -v n="$b" 'BEGIN{
-    split("B K M G T P", u, " ")
-    i = 1
-    while (n >= 1024 && i < 6) { n /= 1024; i++ }
-    if (i == 1)        printf "%d%s",   n, u[i]
-    else if (n >= 100) printf "%.0f%s", n, u[i]
-    else if (n >= 10)  printf "%.1f%s", n, u[i]
-    else               printf "%.2f%s", n, u[i]
-  }'
-}
-
-# 候选网卡列表（/proc/net/dev 里除 lo 外的所有接口）
-traffic_list_ifaces(){
-  awk -F':' 'NR > 2 {gsub(/[[:space:]]/, "", $1); if ($1 != "" && $1 != "lo") print $1}' /proc/net/dev 2>/dev/null
-}
-
-traffic_timer_is_active(){
-  systemctl is-active "$(basename "$TRAFFIC_TIMER_PATH")" >/dev/null 2>&1
-}
-
-# 写独立采样器脚本（与本体解耦；STATE 路径在安装时展开写死）
-traffic_write_sampler(){
-  mkdir -p "$TRAFFIC_DIR" 2>/dev/null || return 1
-  {
-    printf '#!/bin/bash\n'
-    printf '# %s 流量采样器：由 %s 每分钟调用，勿手动编辑\n' "$APP_NAME" "$(basename "$TRAFFIC_TIMER_PATH")"
-    printf 'STATE=%s\n' "$TRAFFIC_STATE_PATH"
-    cat << 'SAMPLER_EOF'
-[ -r "$STATE" ] || exit 0
-
-num(){ case "${1:-}" in ''|*[!0-9]*) printf '0' ;; *) printf '%s' "$1" ;; esac }
-get(){ awk -F'=' -v k="$1" '$1==k {print $2; exit}' "$STATE" 2>/dev/null; }
-
-iface=$(get IFACE)
-case "$iface" in ''|*[!A-Za-z0-9._-]*) exit 0 ;; esac
-acc_rx=$(num "$(get ACC_RX)");   acc_tx=$(num "$(get ACC_TX)")
-last_rx=$(num "$(get LAST_RX)"); last_tx=$(num "$(get LAST_TX)")
-reset_at=$(num "$(get RESET_AT)")
-
-v=$(awk -v key="${iface}:" '$1==key {print $2" "$10; exit}' /proc/net/dev 2>/dev/null)
-[ -n "$v" ] || exit 0
-cur_rx=$(num "${v% *}"); cur_tx=$(num "${v#* }")
-
-if [ "$cur_rx" -ge "$last_rx" ] && [ "$cur_tx" -ge "$last_tx" ]; then
-  acc_rx=$(( acc_rx + cur_rx - last_rx ))
-  acc_tx=$(( acc_tx + cur_tx - last_tx ))
-else
-  # 计数器已归零（重启 / 回绕）：按新计数整段累计
-  acc_rx=$(( acc_rx + cur_rx ))
-  acc_tx=$(( acc_tx + cur_tx ))
-fi
-
-tmp="${STATE}.tmp.$$"
-{
-  echo "IFACE=$iface"
-  echo "ACC_RX=$acc_rx"
-  echo "ACC_TX=$acc_tx"
-  echo "LAST_RX=$cur_rx"
-  echo "LAST_TX=$cur_tx"
-  echo "RESET_AT=$reset_at"
-} 2>/dev/null > "$tmp" && mv -f "$tmp" "$STATE"
-exit 0
-SAMPLER_EOF
-  } > "$TRAFFIC_SAMPLER_PATH" || return 1
-  chmod +x "$TRAFFIC_SAMPLER_PATH"
-}
-
-# 写 systemd service + timer 并启用（开机 50s 后首采，此后每分钟一次）
-traffic_install_units(){
-  cat > "$TRAFFIC_SERVICE_PATH" << EOF
-[Unit]
-Description=${APP_NAME} traffic accounting sample
-ConditionPathExists=${TRAFFIC_STATE_PATH}
-
-[Service]
-Type=oneshot
-ExecStart=${TRAFFIC_SAMPLER_PATH}
-EOF
-
-  cat > "$TRAFFIC_TIMER_PATH" << EOF
-[Unit]
-Description=${APP_NAME} traffic accounting timer
-
-[Timer]
-OnBootSec=50s
-OnUnitActiveSec=60s
-AccuracySec=15s
-
-[Install]
-WantedBy=timers.target
-EOF
-
-  systemctl daemon-reload >/dev/null 2>&1 || true
-  systemctl enable --now "$(basename "$TRAFFIC_TIMER_PATH")" >/dev/null 2>&1
-}
-
-traffic_remove_units(){
-  systemctl disable --now "$(basename "$TRAFFIC_TIMER_PATH")" >/dev/null 2>&1 || true
-  rm -f "$TRAFFIC_TIMER_PATH" "$TRAFFIC_SERVICE_PATH"
-  systemctl daemon-reload >/dev/null 2>&1 || true
-}
-
-enable_traffic_monitor(){
-  if ! require_root; then return 1; fi
-
-  local iface v cur_rx cur_tx
-  iface=$(status_default_iface)
-  if [ -z "$iface" ] || [ -z "$(status_read_iface "$iface")" ]; then
-    echo ""
-    echo -e "  ${Y}未能从默认路由识别网卡，请手动选择：${N}"
-    traffic_list_ifaces | sed 's/^/    · /'
-    echo ""
-    read -p "  请输入网卡名: " iface
-    iface=$(printf '%s' "$iface" | tr -d '[:space:]')
-    if [ -z "$iface" ] || [ -z "$(status_read_iface "$iface")" ]; then
-      echo -e "  ${R}网卡不存在或无计数数据，已取消${N}"
-      sleep 1
-      return 1
-    fi
-  fi
-
-  v=$(status_read_iface "$iface")
-  cur_rx=$(_traffic_num "${v% *}")
-  cur_tx=$(_traffic_num "${v#* }")
-
-  TRAFFIC_IFACE_V="$iface"
-  TRAFFIC_ACC_RX_V=0; TRAFFIC_ACC_TX_V=0
-  TRAFFIC_LAST_RX_V=$cur_rx; TRAFFIC_LAST_TX_V=$cur_tx
-  TRAFFIC_RESET_AT_V=$(date +%s)
-
-  if ! traffic_save_state; then
-    echo -e "  ${R}状态文件写入失败：${TRAFFIC_STATE_PATH}${N}"
-    pause_screen
-    return 1
-  fi
-  if ! traffic_write_sampler; then
-    echo -e "  ${R}采样器写入失败：${TRAFFIC_SAMPLER_PATH}${N}"
-    pause_screen
-    return 1
-  fi
-  if ! traffic_install_units; then
-    echo -e "  ${R}systemd 定时器启用失败，可稍后在本菜单选「修复采样定时器」重试${N}"
-    pause_screen
-    return 1
-  fi
-
-  echo ""
-  echo -e "  ${G}流量统计已启用${N}  监控网卡: ${C}${iface}${N} ${D}·${N} 每分钟自动落盘"
-  sleep 1
-}
-
-# 重置：累计清零，基线对齐当前计数，重新从零开始
-reset_traffic_stats(){
-  if ! require_root; then return 1; fi
-  echo ""
-  read -p "  确认清零已累计的入站 / 出站流量？(y/N): " confirm
-  if [ "$confirm" != "y" ] && [ "$confirm" != "Y" ]; then
-    echo -e "  已取消"
-    sleep 1
-    return 0
-  fi
-  local v
-  v=$(status_read_iface "$TRAFFIC_IFACE_V")
-  if [ -n "$v" ]; then
-    TRAFFIC_LAST_RX_V=$(_traffic_num "${v% *}")
-    TRAFFIC_LAST_TX_V=$(_traffic_num "${v#* }")
-  fi
-  TRAFFIC_ACC_RX_V=0
-  TRAFFIC_ACC_TX_V=0
-  TRAFFIC_RESET_AT_V=$(date +%s)
-  if traffic_save_state; then
-    echo -e "  ${G}已重置，重新从零开始累计${N}"
-  else
-    echo -e "  ${R}状态写入失败${N}"
-  fi
-  sleep 1
-}
-
-change_traffic_iface(){
-  if ! require_root; then return 1; fi
-  local iface v
-  echo ""
-  echo -e "  当前监控网卡: ${C}${TRAFFIC_IFACE_V}${N}，可选网卡："
-  traffic_list_ifaces | sed 's/^/    · /'
-  echo ""
-  read -p "  请输入新网卡名 (留空取消): " iface
-  iface=$(printf '%s' "$iface" | tr -d '[:space:]')
-  if [ -z "$iface" ]; then
-    echo -e "  已取消"
-    sleep 1
-    return 0
-  fi
-  case "$iface" in *[!A-Za-z0-9._-]*)
-    echo -e "  ${R}网卡名不合法${N}"
-    sleep 1
-    return 1 ;;
-  esac
-  if [ -z "$(status_read_iface "$iface")" ]; then
-    echo -e "  ${R}网卡不存在或无计数数据${N}"
-    sleep 1
-    return 1
-  fi
-  # 先把旧网卡未落盘的增量结算掉，历史累计保留，再切基线到新网卡
-  traffic_run_sampler
-  traffic_load_state || return 1
-  v=$(status_read_iface "$iface")
-  TRAFFIC_IFACE_V="$iface"
-  TRAFFIC_LAST_RX_V=$(_traffic_num "${v% *}")
-  TRAFFIC_LAST_TX_V=$(_traffic_num "${v#* }")
-  if traffic_save_state; then
-    echo -e "  ${G}已切换到 ${iface}，历史累计保留${N}"
-  else
-    echo -e "  ${R}状态写入失败${N}"
-  fi
-  sleep 1
-}
-
-disable_traffic_monitor(){
-  if ! require_root; then return 1; fi
-  echo ""
-  read -p "  确认停用流量统计并删除累计数据？(y/N): " confirm
-  if [ "$confirm" != "y" ] && [ "$confirm" != "Y" ]; then
-    echo -e "  已取消"
-    sleep 1
-    return 0
-  fi
-  traffic_remove_units
-  rm -rf "$TRAFFIC_DIR"
-  [ -d /etc/leyili ] && rmdir --ignore-fail-on-non-empty /etc/leyili 2>/dev/null
-  echo -e "  ${Y}流量统计已停用，数据已清除${N}"
-  sleep 1
-  return 0
-}
-
-show_traffic_menu(){
-  local choice confirm
-  while true; do
-    render_section_header "流量统计"
-
-    if ! traffic_load_state; then
-      echo ""
-      echo -e "  ${D}统计指定网卡的入站 / 出站累计流量，重启不清零，可随时重置。${N}"
-      echo -e "  ${D}启用后由 systemd 定时器每分钟采样落盘，主页卡片同步展示。${N}"
-      echo ""
-      render_menu_item 1 "启用流量统计"
-      render_menu_item 0 "返回上级"
-      render_divider
-      read -p "  请输入序号: " choice
-      case $choice in
-        1) enable_traffic_monitor ;;
-        0) return ;;
-        *) notify_invalid_choice ;;
-      esac
-      continue
-    fi
-
-    # 已启用：root 时先结算一次未落盘增量，再展示
-    traffic_run_sampler
-    traffic_load_state
-
-    local totals rx tx sum iface_disp have_iface reset_str elapsed_str
-    totals=$(traffic_live_totals)
-    read -r rx tx sum <<< "$totals"
-
-    have_iface=0
-    if [ -n "$(status_read_iface "$TRAFFIC_IFACE_V")" ]; then
-      have_iface=1
-      iface_disp="${C}${TRAFFIC_IFACE_V}${N}"
-    else
-      iface_disp="${R}${TRAFFIC_IFACE_V} (未找到，请更换网卡)${N}"
-    fi
-
-    reset_str=$(date -d "@${TRAFFIC_RESET_AT_V}" '+%Y-%m-%d %H:%M' 2>/dev/null || echo "未知")
-    local now diff
-    now=$(date +%s)
-    diff=$(( now - TRAFFIC_RESET_AT_V ))
-    [ "$diff" -lt 0 ] && diff=0
-    if [ "$diff" -ge 86400 ]; then
-      elapsed_str="已统计 $(( diff / 86400 )) 天"
-    elif [ "$diff" -ge 3600 ]; then
-      elapsed_str="已统计 $(( diff / 3600 )) 小时"
-    else
-      elapsed_str="已统计 $(( diff / 60 )) 分钟"
-    fi
-
-    local timer_active=0 timer_line saved_str
-    traffic_timer_is_active && timer_active=1
-    if [ "$timer_active" -eq 1 ]; then
-      saved_str=$(date -r "$TRAFFIC_STATE_PATH" '+%H:%M:%S' 2>/dev/null || echo "?")
-      timer_line="${G}运行中${N} ${D}· 每分钟落盘 · 上次 ${saved_str}${N}"
-    else
-      timer_line="${R}未运行${N} ${D}· 重启会丢数据，请选 4 修复${N}"
-    fi
-
-    echo ""
-    printf "  ${L}●${N} %s : %b\n" "监控网卡" "$iface_disp"
-    printf "  ${L}●${N} %s : %b\n" "统计起始" "${reset_str} ${D}(${elapsed_str})${N}"
-    printf "  ${L}●${N} %s : %b\n" "入站流量" "${G}↓${N} ${C}$(status_format_bytes "$rx")${N}"
-    printf "  ${L}●${N} %s : %b\n" "出站流量" "${C}↑${N} ${C}$(status_format_bytes "$tx")${N}"
-    printf "  ${L}●${N} %s : %b\n" "流量总计" "${B}${C}$(status_format_bytes "$sum")${N}"
-    printf "  ${L}●${N} %s : %b\n" "采样服务" "$timer_line"
-
-    if [ "$have_iface" -eq 1 ]; then
-      echo ""
-      echo -e "  ${C}正在采样实时速率（约 1 秒）...${N}"
-      local speeds spd_rx spd_tx
-      speeds=$(status_sample_speed "$TRAFFIC_IFACE_V")
-      spd_rx=$(_traffic_num "${speeds% *}")
-      spd_tx=$(_traffic_num "${speeds#* }")
-      printf "\033[1A\033[2K"
-      printf "  ${L}●${N} %s : ${G}↓${N} %s   ${C}↑${N} %s\n" "实时速率" \
-        "$(status_format_speed "$spd_rx")" "$(status_format_speed "$spd_tx")"
-    fi
-
-    echo ""
-    render_menu_item 1 "重置流量统计"
-    render_menu_item 2 "更换监控网卡"
-    render_menu_item 3 "停用流量统计"
-    [ "$timer_active" -eq 0 ] && render_menu_item 4 "修复采样定时器"
-    render_menu_item 0 "返回上级"
-    render_divider
-    read -p "  请输入序号 (回车刷新): " choice
-
-    case $choice in
-      "")
-        continue
-        ;;
-      1)
-        reset_traffic_stats
-        ;;
-      2)
-        change_traffic_iface
-        ;;
-      3)
-        disable_traffic_monitor
-        ;;
-      4)
-        if [ "$timer_active" -eq 0 ]; then
-          if require_root; then
-            if traffic_write_sampler && traffic_install_units; then
-              echo -e "  ${G}采样定时器已修复${N}"
-            else
-              echo -e "  ${R}修复失败，请检查 systemd 状态${N}"
-            fi
-            sleep 1
-          fi
-        else
-          notify_invalid_choice
-        fi
-        ;;
-      0)
-        return
-        ;;
-      *)
-        notify_invalid_choice
-        ;;
-    esac
-  done
-}
 # ═══ source: 99-menu-main.sh ═══
 show_menu(){
   local main_action_label=""
@@ -13268,15 +11330,13 @@ show_menu(){
     render_menu_item 1 "管理员设置"
     render_menu_item 2 "系统基础设置"
     render_menu_item 3 "${main_action_label}"
-    render_menu_item 4 "Realm 中转管理"
-    render_menu_item 5 "查看状态"
-    render_menu_item 6 "IPv4 防火墙管理"
-    render_menu_item 7 "IPv6 防火墙管理"
-    render_menu_item 8 "卸载脚本"
-    render_menu_item 9 "更新管理"
-    render_menu_item 10 "服务器状态"
-    render_menu_item 11 "流量统计"
-    render_menu_item 12 "本地链路测评"
+    render_menu_item 4 "查看状态"
+    render_menu_item 5 "IPv4 防火墙管理"
+    render_menu_item 6 "IPv6 防火墙管理"
+    render_menu_item 7 "卸载脚本"
+    render_menu_item 8 "更新管理"
+    render_menu_item 9 "服务器状态"
+    render_menu_item 10 "本地链路测评"
     render_menu_item 0 "退出"
     render_divider
     read -p "  请输入序号: " choice
@@ -13296,30 +11356,24 @@ show_menu(){
         fi
         ;;
       4)
-        show_realm_menu
-        ;;
-      5)
         show_status_menu
         ;;
-      6)
+      5)
         show_ipv4_firewall_menu
         ;;
-      7)
+      6)
         show_ipv6_firewall_menu
         ;;
-      8)
+      7)
         uninstall_script_completely
         ;;
-      9)
+      8)
         show_update_menu
         ;;
-      10)
+      9)
         show_server_status
         ;;
-      11)
-        show_traffic_menu
-        ;;
-      12)
+      10)
         show_netbench_menu
         ;;
       0)

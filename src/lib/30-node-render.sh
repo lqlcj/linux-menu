@@ -78,22 +78,6 @@ render_node_detail(){
       echo -e "  端口      : ${C}${port:-未知}${N} ${D}(TCP)${N}"
       echo -e "  ${R}⚠ 谨慎：抗主动探测较弱，避免在高 GFW 风险链路单独使用${N}"
       ;;
-    xhr)
-      local uuid_v pubk_v sid_v path_v
-      uuid_v=$(get_node_value "$type" UUID 2>/dev/null || true)
-      pubk_v=$(get_node_value "$type" PublicKey 2>/dev/null || true)
-      sid_v=$(get_node_value "$type" ShortID 2>/dev/null || true)
-      path_v=$(get_node_value "$type" Path 2>/dev/null || true)
-      echo -e "  类型      : ${C}Vless-xhttp-reality${N}  Tag : ${C}${tag}${N}"
-      echo -e "  UUID      : ${C}${uuid_v:-未知}${N}"
-      echo -e "  PublicKey : ${C}${pubk_v:-未知}${N}"
-      echo -e "  ShortID   : ${C}${sid_v:-未知}${N}"
-      echo -e "  模式      : ${C}${mode_label}${N}"
-      echo -e "  IP        : ${C}${ip:-未知}${N}"
-      echo -e "  端口      : ${C}${port:-未知}${N} ${D}(TCP)${N}"
-      echo -e "  SNI       : ${C}${sni:-未知}${N}"
-      echo -e "  网络层    : ${C}xhttp${N}  ${D}path=${path_v}${N}"
-      ;;
   esac
 }
 

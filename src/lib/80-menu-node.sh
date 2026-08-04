@@ -10,7 +10,6 @@ show_node_install_menu(){
     fi
     render_menu_item 4 "创建 TUIC v5 节点$(node_installed tuic && echo "  ${D}(已安装，将覆盖)${N}")"
     render_menu_item 5 "创建 Shadowsocks-2022 节点  ${R}[谨慎]${N}$(node_installed ss2022 && echo "  ${D}(已安装，将覆盖)${N}")"
-    render_menu_item 6 "创建 Vless-xhttp-reality 节点  ${C}[Xray]${N}$(node_installed xhr && echo "  ${D}(已安装，将覆盖)${N}")"
     render_menu_item 0 "返回上级"
     render_divider
     read -p "  请输入序号: " choice
@@ -26,7 +25,6 @@ show_node_install_menu(){
         ;;
       4) install_tuic_node; return ;;
       5) install_ss2022_node; return ;;
-      6) install_xhr_node; return ;;
       0) return ;;
       *) notify_invalid_choice ;;
     esac
@@ -61,11 +59,6 @@ show_node_uninstall_menu(){
     else
       echo -e "  ${D}5) Shadowsocks-2022 未安装${N}"
     fi
-    if node_installed xhr; then
-      render_menu_item 6 "卸载 Vless-xhttp-reality 节点"
-    else
-      echo -e "  ${D}6) Vless-xhttp-reality 未安装${N}"
-    fi
     render_menu_item 0 "返回上级"
     render_divider
     read -p "  请输入序号: " choice
@@ -75,7 +68,6 @@ show_node_uninstall_menu(){
       3) if node_installed anytls;  then uninstall_anytls_node;  return; else notify_invalid_choice; fi ;;
       4) if node_installed tuic;    then uninstall_tuic_node;    return; else notify_invalid_choice; fi ;;
       5) if node_installed ss2022;  then uninstall_ss2022_node;  return; else notify_invalid_choice; fi ;;
-      6) if node_installed xhr;     then uninstall_xhr_node;     return; else notify_invalid_choice; fi ;;
       0) return ;;
       *) notify_invalid_choice ;;
     esac
@@ -115,46 +107,8 @@ upgrade_singbox_kernel(){
   fi
 }
 
-upgrade_xray_kernel(){
-  local cur_ver latest_ver confirm
-  cur_ver=$(get_current_xray_version 2>/dev/null || echo "")
-  latest_ver=$(get_latest_xray_version)
-  echo ""
-  echo -e "  当前版本: ${C}${cur_ver:-未安装}${N}"
-  echo -e "  最新版本: ${C}${latest_ver:-获取失败}${N}"
-  if [ -n "$cur_ver" ] && [ -n "$latest_ver" ] && [ "v${cur_ver}" = "$latest_ver" ]; then
-    echo -e "${G}已是最新版本${N}"
-    sleep 1
-    return 0
-  fi
-  read -p "  确认升级 Xray 内核？(y/N): " confirm
-  if [ "$confirm" != "y" ] && [ "$confirm" != "Y" ]; then
-    echo -e "  已取消"
-    sleep 1
-    return 0
-  fi
-  echo -e "${Y}==> 升级内核（不覆盖配置）...${N}"
-  if ! upgrade_xray; then
-    echo ""
-    echo -e "${R}Xray 升级失败，请检查上方输出${N}"
-    pause_screen
-    return 1
-  fi
-  # 只有正在跑的 xray-leyili 才重启；没装节点时静默跳过
-  if systemctl is-active "$XRAY_SERVICE_NAME" >/dev/null 2>&1; then
-    if ! systemctl restart "$XRAY_SERVICE_NAME"; then
-      echo ""
-      echo -e "${R}升级完成，但服务重启失败${N}"
-      pause_screen
-      return 1
-    fi
-  fi
-  echo -e "${G}升级完成${N}"
-  sleep 1
-}
-
 show_update_menu(){
-  local choice cur_ver kernel_label xray_label xray_cur
+  local choice cur_ver kernel_label
   while true; do
     if command -v sing-box >/dev/null 2>&1; then
       cur_ver=$(get_current_singbox_version)
@@ -167,28 +121,15 @@ show_update_menu(){
       kernel_label="升级 sing-box 内核  ${D}(未安装)${N}"
     fi
 
-    if is_xray_installed; then
-      xray_cur=$(get_current_xray_version 2>/dev/null || echo "")
-      if [ -n "$xray_cur" ]; then
-        xray_label="升级 Xray 内核  ${D}(当前: v${xray_cur})${N}"
-      else
-        xray_label="升级 Xray 内核  ${D}(版本未知)${N}"
-      fi
-    else
-      xray_label="升级 Xray 内核  ${D}(未安装，仅 xhttp-reality 节点需要)${N}"
-    fi
-
     render_section_header "更新管理"
     render_menu_item 1 "更新脚本"
     render_menu_item 2 "$kernel_label"
-    render_menu_item 3 "$xray_label"
     render_menu_item 0 "返回上级"
     render_divider
     read -p "  请输入序号: " choice
     case $choice in
       1) update_self_script ;;
       2) upgrade_singbox_kernel ;;
-      3) upgrade_xray_kernel ;;
       0) return ;;
       *) notify_invalid_choice ;;
     esac
@@ -430,7 +371,7 @@ EOF
 show_node_manage_menu(){
   while true; do
     render_section_header "节点管理"
-    render_menu_item 1 "创建节点 (Reality / Hysteria2 / AnyTLS / TUIC / SS-2022 / Vless-xhttp-reality)"
+    render_menu_item 1 "创建节点 (Reality / Hysteria2 / AnyTLS / TUIC / SS-2022)"
     render_menu_item 2 "卸载单个节点"
     render_menu_item 3 "Reality 域名检测工具"
     render_menu_item 4 "WARP 谷歌解锁分流"

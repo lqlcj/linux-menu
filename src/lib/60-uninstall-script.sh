@@ -6,15 +6,7 @@ uninstall_script_completely(){
   echo -e "  ${R}此操作将清除以下内容（不可恢复）：${N}"
   echo -e "    ${L}·${N} 所有 sing-box 节点（Reality / Hysteria2 / AnyTLS）及其防火墙端口"
   echo -e "    ${L}·${N} sing-box 服务、软件包与 ${C}/etc/sing-box${N} 整个目录"
-  if is_xray_installed || [ -d "$XRAY_DIR" ] || [ -f "$XRAY_SERVICE_PATH" ]; then
-    echo -e "    ${L}·${N} Xray 内核（vless-xhttp-reality）服务、二进制与 ${C}${XRAY_DIR}${N} 目录"
-  fi
-  if realm_is_installed; then
-    echo -e "    ${L}·${N} Realm 中转服务、所有转发规则与 ${C}${REALM_CONFIG_DIR}${N} 目录"
-  fi
-  if [ -f "$TRAFFIC_STATE_PATH" ] || [ -f "$TRAFFIC_TIMER_PATH" ]; then
-    echo -e "    ${L}·${N} 流量统计定时器与累计数据"
-  fi
+  echo -e "    ${L}·${N} 旧版遗留组件（Realm 中转 / Xray 内核 / 流量统计），如存在"
   echo -e "    ${L}·${N} ${C}${INFO_PATH}${N} 与 ${C}${SCRIPT_PATH}${N}"
   echo ""
   echo -e "  ${D}保留：SSH 配置 / 用户账户 / sudoers / 自动更新 / IPv6 防火墙规则 / 1Panel${N}"
@@ -44,9 +36,6 @@ uninstall_script_completely(){
           [ -n "$port" ] && deny_port_in_firewall "$port" tcp
           ;;
         ss2022)
-          [ -n "$port" ] && deny_port_in_firewall "$port" tcp
-          ;;
-        xhr)
           [ -n "$port" ] && deny_port_in_firewall "$port" tcp
           ;;
         hy2)
@@ -101,36 +90,23 @@ uninstall_script_completely(){
   rm -f "$SAGERNET_SOURCES" "$SAGERNET_KEYRING"
   DEBIAN_FRONTEND=noninteractive apt-get update -qq >/dev/null 2>&1 || true
 
-  # 2.5 Xray 内核（vless-xhttp-reality 节点用，独立于 sing-box）
-  if is_xray_installed || [ -f "$XRAY_SERVICE_PATH" ]; then
-    echo -e "${Y}==> 停止并禁用 ${XRAY_SERVICE_NAME} 服务...${N}"
-    systemctl stop "$XRAY_SERVICE_NAME" >/dev/null 2>&1 || true
-    systemctl disable "$XRAY_SERVICE_NAME" >/dev/null 2>&1 || true
-    rm -f "$XRAY_SERVICE_PATH"
-    systemctl daemon-reload >/dev/null 2>&1 || true
+  # 2.5 历史遗留组件清理（Realm 中转 / Xray 内核 / 流量统计已从本脚本移除，
+  #     这里兜底清掉旧版本装过的服务与数据，避免留下孤儿 unit）
+  echo -e "${Y}==> 清理旧版遗留组件（Realm / Xray / 流量统计）...${N}"
+  local legacy_u
+  for legacy_u in realm xray-leyili leyili-traffic.timer leyili-traffic; do
+    systemctl stop    "$legacy_u" >/dev/null 2>&1 || true
+    systemctl disable "$legacy_u" >/dev/null 2>&1 || true
+  done
+  rm -f /usr/local/bin/realm-bin /usr/local/bin/xray-leyili
+  rm -f /etc/systemd/system/realm.service \
+        /etc/systemd/system/xray-leyili.service \
+        /etc/systemd/system/leyili-traffic.service \
+        /etc/systemd/system/leyili-traffic.timer
+  rm -rf /etc/realm /etc/leyili/xray /etc/leyili/traffic
+  systemctl daemon-reload >/dev/null 2>&1 || true
 
-    echo -e "${Y}==> 清理 Xray 二进制与配置目录...${N}"
-    rm -f "$XRAY_BIN_PATH"
-    rm -rf "$XRAY_DIR"
-    # /etc/leyili 在为空时一并清掉（其它子模块如 warp 已自行卸载）
-    [ -d /etc/leyili ] && rmdir --ignore-fail-on-non-empty /etc/leyili 2>/dev/null || true
-  fi
-
-  # 3. Realm 中转（如已装）
-  if realm_is_installed; then
-    echo -e "${Y}==> 卸载 Realm 中转服务...${N}"
-    realm_uninstall >/dev/null 2>&1 || true
-  fi
-
-  # 3.5 流量统计（定时器 + 采样器 + 累计数据）
-  if [ -f "$TRAFFIC_STATE_PATH" ] || [ -f "$TRAFFIC_TIMER_PATH" ] || [ -f "$TRAFFIC_SERVICE_PATH" ]; then
-    echo -e "${Y}==> 清理流量统计定时器与数据...${N}"
-    traffic_remove_units
-    rm -rf "$TRAFFIC_DIR"
-    [ -d /etc/leyili ] && rmdir --ignore-fail-on-non-empty /etc/leyili 2>/dev/null || true
-  fi
-
-  # 3.6 链路测评（目标 IP 记录 + 历史报告 + 脚本自装的 nexttrace）
+  # 3. 链路测评（目标 IP 记录 + 历史报告 + 脚本自装的 nexttrace）
   # NETBENCH_NEXTTRACE_BIN 是独立文件名，不会误删用户自装的 /usr/local/bin/nexttrace
   if [ -f "$NETBENCH_ENV_PATH" ] || [ -f "$NETBENCH_NEXTTRACE_BIN" ] || [ -n "$(_nb_latest_report)" ]; then
     echo -e "${Y}==> 清理链路测评数据与 nexttrace...${N}"
