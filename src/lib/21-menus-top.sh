@@ -87,7 +87,11 @@ show_system_menu(){
     render_menu_item 5 "网络优化"
     render_menu_item 6 "查看网络优化状态"
     render_menu_item 7 "添加 SWAP"
-    render_menu_item 8 "安装 fail2ban (SSH 防爆破)"
+    render_menu_item 8 "安装 / 配置 fail2ban (SSH 多端口防爆破)"
+    render_menu_item 9 "Reality 域名检测工具"
+    render_menu_item 10 "WARP 谷歌解锁分流"
+    render_menu_item 11 "服务器状态"
+    render_menu_item 12 "本地链路测评"
     render_menu_item 0 "返回上级"
     render_divider
     read -p "  请输入序号: " choice
@@ -116,6 +120,18 @@ show_system_menu(){
         ;;
       8)
         setup_fail2ban
+        ;;
+      9)
+        check_reality_dest_domain
+        ;;
+      10)
+        show_warp_menu
+        ;;
+      11)
+        show_server_status
+        ;;
+      12)
+        show_netbench_menu
         ;;
       0)
         return
@@ -168,4 +184,3 @@ show_admin_menu(){
     esac
   done
 }
-

@@ -207,7 +207,7 @@ print_firewall_hint(){
       ;;
   esac
   if command -v ip6tables >/dev/null 2>&1; then
-    echo -e "    ${L}·${N} IPv6 防火墙菜单 : 主菜单 ${C}6) IPv6 防火墙管理 → 4) 开放端口${N}"
+    echo -e "    ${L}·${N} IPv6 防火墙菜单 : 主菜单 ${C}5) 防火墙管理 → 2) IPv6 防火墙管理 → 4) 开放端口${N}"
   fi
   echo -e "    ${L}·${N} 云厂商安全组    : ${D}阿里云 / 腾讯云 / AWS / Vultr 等控制台需自行加 ${port}/${proto} 入站规则${N}"
   echo ""
@@ -452,4 +452,3 @@ cancel_rollback_pid(){
   [ -n "$pid" ] || return 0
   kill "$pid" 2>/dev/null || true
 }
-

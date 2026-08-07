@@ -373,16 +373,12 @@ show_node_manage_menu(){
     render_section_header "节点管理"
     render_menu_item 1 "创建节点 (Reality / Hysteria2 / AnyTLS / TUIC / SS-2022)"
     render_menu_item 2 "卸载单个节点"
-    render_menu_item 3 "Reality 域名检测工具"
-    render_menu_item 4 "WARP 谷歌解锁分流"
     render_menu_item 0 "返回上级"
     render_divider
     read -p "  请输入序号: " choice
     case $choice in
       1) show_node_install_menu ;;
       2) show_node_uninstall_menu ;;
-      3) check_reality_dest_domain ;;
-      4) show_warp_menu ;;
       0) return ;;
       *) notify_invalid_choice ;;
     esac
@@ -399,4 +395,3 @@ show_node_manage_menu(){
 #          内核 WireGuard / ip route，不影响现有 Reality/Hy2/AnyTLS/TUIC 节点
 # 边界   : 只对通过 sing-box 入站节点转发的流量生效，不影响 VPS 本机直连
 # ═══════════════════════════════════════════════════════════════════════
-

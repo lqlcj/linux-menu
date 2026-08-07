@@ -74,6 +74,13 @@ render_card_top(){
   echo -e "  ${L}╭─${N}${C}★${N} ${title} ${L}${fill}${N} ${right} ${C}★${N}${L}─╮${N}"
 }
 
+# 无标题卡片顶部
+render_card_plain_top(){
+  local fill
+  fill=$(_card_dash_fill "$CARD_INNER_WIDTH")
+  echo -e "  ${L}╭${fill}╮${N}"
+}
+
 # 卡片底部
 render_card_bottom(){
   local fill
@@ -258,43 +265,16 @@ render_singbox_version_card_line(){
   render_card_blank
 }
 
-# 主菜单卡片：标题栏 + 协议块 + 系统调优行
+# 主菜单卡片：精简节点概览
 render_main_menu_card(){
-  local ver status status_str title
-  if is_singbox_installed; then
-    ver=$(sing-box version 2>/dev/null | head -1 | awk '{print $3}')
-    [ -z "$ver" ] && ver="未知"
-    status=$(systemctl is-active sing-box 2>/dev/null || echo "未知")
-    if [ "$status" = "active" ]; then
-      status_str="${G}运行中${N}"
-    else
-      status_str="${R}${status}${N}"
-    fi
-  else
-    ver="未安装"
-    status_str="${Y}未安装${N}"
-  fi
-
-  title="${B}${C}管理菜单${N} ${D}·${N} ${C}v${ver}${N}"
-  render_card_top "$title" "$status_str"
+  render_card_plain_top
   render_card_blank
   render_singbox_version_card_line
   render_node_card_block reality
-  render_card_blank
-  render_node_card_block hy2
-  render_card_blank
-  render_node_card_block anytls
-  render_card_blank
-  render_node_card_block tuic
   if node_installed ss2022; then
     render_card_blank
     render_node_card_block ss2022
   fi
   render_card_blank
-  render_tcp_card_line
-  render_quic_card_line
-  render_initcwnd_card_line
-  render_card_blank
   render_card_bottom
 }
-
