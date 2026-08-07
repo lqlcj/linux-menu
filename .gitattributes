@@ -1,5 +1,8 @@
 # Force LF line endings for all shell scripts — Linux/Unix standard.
 # Without this, Git on Windows would silently convert .sh files to CRLF
 # on checkout, causing subtle bash heredoc / case-match bugs on VPS.
+.gitattributes text eol=lf
 *.sh text eol=lf
 *.md text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf

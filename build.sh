@@ -6,6 +6,7 @@ cd "$(dirname "$0")"
 
 OUT="leyili.sh"
 TMP="${OUT}.tmp.$$"
+trap 'rm -f -- "$TMP"' EXIT HUP INT TERM
 
 {
   cat src/_header.sh
@@ -20,14 +21,15 @@ TMP="${OUT}.tmp.$$"
 # 强制 LF 换行（防 Windows Git autocrlf 把 src/*.sh 当 text 转 CRLF 后混入）
 sed -i 's/\r$//' "$TMP"
 
-mv "$TMP" "$OUT"
-chmod +x "$OUT"
-
-# 静态语法检查（兜底）
-if ! bash -n "$OUT"; then
+# 先检查临时产物，绝不让语法错误覆盖正式脚本。
+if ! bash -n "$TMP"; then
   echo "[!] bash -n 失败，build 产物有语法错误" >&2
   exit 1
 fi
+
+mv "$TMP" "$OUT"
+chmod +x "$OUT"
+trap - EXIT HUP INT TERM
 
 lines=$(wc -l < "$OUT")
 bytes=$(wc -c < "$OUT")

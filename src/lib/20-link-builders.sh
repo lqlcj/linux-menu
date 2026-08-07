@@ -8,6 +8,16 @@ url_encode_host(){
   esac
 }
 
+url_encode_component(){
+  local value="${1:-}"
+  if command -v jq >/dev/null 2>&1; then
+    printf '%s' "$value" | jq -sRr @uri
+    return
+  fi
+  # 节点创建流程本身依赖 jq；这里只在手工调用链接函数时给出明确失败。
+  return 1
+}
+
 build_reality_link(){
   local uuid="$1"
   local ip="$2"
@@ -21,10 +31,14 @@ build_reality_link(){
     return 1
   fi
 
-  local host
+  local host enc_sni enc_pub enc_sid enc_tag
   host=$(url_encode_host "$ip")
+  enc_sni=$(url_encode_component "$sni") || return 1
+  enc_pub=$(url_encode_component "$public_key") || return 1
+  enc_sid=$(url_encode_component "$short_id") || return 1
+  enc_tag=$(url_encode_component "$tag") || return 1
   printf 'vless://%s@%s:%s?encryption=none&flow=xtls-rprx-vision&security=reality&sni=%s&fp=chrome&pbk=%s&sid=%s&type=tcp#%s\n' \
-    "$uuid" "$host" "$port" "$sni" "$public_key" "$short_id" "$tag"
+    "$uuid" "$host" "$port" "$enc_sni" "$enc_pub" "$enc_sid" "$enc_tag"
 }
 
 build_anytls_link(){
@@ -43,11 +57,15 @@ build_anytls_link(){
     return 1
   fi
 
-  local host enc_pw
+  local host enc_pw enc_sni enc_pub enc_sid enc_tag
   host=$(url_encode_host "$ip")
-  enc_pw=$(printf '%s' "$password" | jq -sRr @uri)
+  enc_pw=$(url_encode_component "$password") || return 1
+  enc_sni=$(url_encode_component "$sni") || return 1
+  enc_pub=$(url_encode_component "$public_key") || return 1
+  enc_sid=$(url_encode_component "$short_id") || return 1
+  enc_tag=$(url_encode_component "$tag") || return 1
   printf 'anytls://%s@%s:%s/?security=reality&sni=%s&fp=chrome&pbk=%s&sid=%s&insecure=0#%s\n' \
-    "$enc_pw" "$host" "$port" "$sni" "$public_key" "$short_id" "$tag"
+    "$enc_pw" "$host" "$port" "$enc_sni" "$enc_pub" "$enc_sid" "$enc_tag"
 }
 
 build_hy2_link(){
@@ -67,11 +85,16 @@ build_hy2_link(){
     return 1
   fi
 
-  local host
+  local host enc_password enc_sni enc_obfs_type enc_obfs_password enc_tag
   host=$(url_encode_host "$ip")
-  local query="sni=${sni:-}&insecure=${insecure}"
+  enc_password=$(url_encode_component "$password") || return 1
+  enc_sni=$(url_encode_component "${sni:-}") || return 1
+  enc_tag=$(url_encode_component "$tag") || return 1
+  local query="sni=${enc_sni}&insecure=${insecure}"
   if [ -n "$obfs_type" ]; then
-    query="${query}&obfs=${obfs_type}&obfs-password=${obfs_password}"
+    enc_obfs_type=$(url_encode_component "$obfs_type") || return 1
+    enc_obfs_password=$(url_encode_component "$obfs_password") || return 1
+    query="${query}&obfs=${enc_obfs_type}&obfs-password=${enc_obfs_password}"
   fi
 
   local server_part
@@ -81,7 +104,7 @@ build_hy2_link(){
     server_part="${host}:${port}"
   fi
   printf 'hysteria2://%s@%s?%s#%s\n' \
-    "$password" "$server_part" "$query" "$tag"
+    "$enc_password" "$server_part" "$query" "$enc_tag"
 }
 
 build_tuic_link(){
@@ -99,10 +122,14 @@ build_tuic_link(){
     return 1
   fi
 
-  local host
+  local host enc_password enc_sni enc_cc enc_tag
   host=$(url_encode_host "$ip")
+  enc_password=$(url_encode_component "$password") || return 1
+  enc_sni=$(url_encode_component "${sni:-}") || return 1
+  enc_cc=$(url_encode_component "$cc") || return 1
+  enc_tag=$(url_encode_component "$tag") || return 1
   printf 'tuic://%s:%s@%s:%s?sni=%s&alpn=h3&congestion_control=%s&allow_insecure=%s#%s\n' \
-    "$uuid" "$password" "$host" "$port" "${sni:-}" "$cc" "$insecure" "$tag"
+    "$uuid" "$enc_password" "$host" "$port" "$enc_sni" "$enc_cc" "$insecure" "$enc_tag"
 }
 
 build_ss2022_link(){
@@ -118,11 +145,12 @@ build_ss2022_link(){
     return 1
   fi
 
-  local host userinfo
+  local host userinfo enc_tag
   host=$(url_encode_host "$ip")
   userinfo=$(printf '%s:%s' "$method" "$password" | base64 -w0 2>/dev/null | tr '+/' '-_' | tr -d '=')
+  enc_tag=$(url_encode_component "$tag") || return 1
   printf 'ss://%s@%s:%s#%s\n' \
-    "$userinfo" "$host" "$port" "$tag"
+    "$userinfo" "$host" "$port" "$enc_tag"
 }
 
 # 由节点 info 文件构造链接（dispatcher）
@@ -231,4 +259,3 @@ build_dualstack_ipv6_link(){
 
   build_reality_link "$uuid" "$ipv6" "$port" "$sni" "$public_key" "$short_id" "${tag}-ipv6"
 }
-

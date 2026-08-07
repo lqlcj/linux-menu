@@ -127,7 +127,7 @@ show_client_link(){
 modify_reality_params(){
   local new_port="" new_sni="" new_uuid="" regen_keypair="n"
   local new_pri="" new_pub="" keypair="" new_short_id=""
-  local cur_port cur_sni cur_uuid backup_path="" confirm
+  local cur_port cur_sni cur_uuid backup_path="" confirm txn=""
 
   if ! require_root; then return 1; fi
   if ! require_singbox_installed; then return 1; fi
@@ -155,7 +155,18 @@ modify_reality_params(){
   while true; do
     read -p "  端口 (${cur_port:-当前未知}): " new_port
     new_port="${new_port:-$cur_port}"
-    if validate_port "$new_port"; then break; fi
+    if validate_port "$new_port"; then
+      new_port=$((10#$new_port))
+      if [ "$new_port" != "$cur_port" ] && check_port_in_use "$new_port" tcp; then
+        local force_port=""
+        echo -e "${R}端口 ${new_port} 已被其他 TCP 服务占用${N}"
+        read -p "  仍然使用此端口？(y/N): " force_port
+        if [ "$force_port" != "y" ] && [ "$force_port" != "Y" ]; then
+          continue
+        fi
+      fi
+      break
+    fi
     echo -e "${R}端口必须是 1-65535 的数字${N}"
   done
 
@@ -214,14 +225,16 @@ modify_reality_params(){
     return 0
   fi
 
+  ensure_jq || { pause_screen; return 1; }
+  txn=$(node_transaction_begin reality) || { echo -e "${R}节点事务快照失败${N}"; pause_screen; return 1; }
+
   backup_path="${CONFIG_PATH}.bak.$(date +%Y%m%d%H%M%S)"
   if ! cp "$CONFIG_PATH" "$backup_path"; then
+    node_transaction_rollback "$txn"
     echo -e "${R}配置备份失败${N}"
     pause_screen
     return 1
   fi
-
-  ensure_jq || { pause_screen; return 1; }
 
   local jq_filter='(.inbounds[] | select(.tag == "reality-in"))
     |= ( .listen_port = ($port | tonumber)
@@ -239,35 +252,61 @@ modify_reality_params(){
        --arg pri "${new_pri:-}" --arg sid "${new_short_id:-}" \
        "$jq_filter" "$CONFIG_PATH" > "$tmp_file"; then
     rm -f "$tmp_file"
-    cp "$backup_path" "$CONFIG_PATH" 2>/dev/null || true
-    echo -e "${R}配置写入失败，已恢复备份${N}"
+    node_transaction_rollback "$txn"
+    echo -e "${R}配置写入失败，已完整回滚${N}"
     pause_screen
     return 1
   fi
-  mv "$tmp_file" "$CONFIG_PATH"
-
-  if ! sing-box check -c "$CONFIG_PATH"; then
-    cp "$backup_path" "$CONFIG_PATH" 2>/dev/null || true
-    echo ""
-    echo -e "${R}配置校验失败，已恢复备份${N}"
-    pause_screen
-    return 1
-  fi
-  if ! systemctl restart sing-box; then
-    cp "$backup_path" "$CONFIG_PATH" 2>/dev/null || true
-    echo ""
-    echo -e "${R}服务重启失败，已恢复备份${N}"
+  if ! mv "$tmp_file" "$CONFIG_PATH"; then
+    node_transaction_rollback "$txn"
+    echo -e "${R}配置替换失败，已完整回滚${N}"
     pause_screen
     return 1
   fi
 
-  set_node_value reality Port "$new_port"
-  set_node_value reality SNI "$new_sni"
-  set_node_value reality UUID "$new_uuid"
+  if ! config_check_and_restart "$new_port" tcp; then
+    node_transaction_rollback "$txn"
+    echo ""
+    echo -e "${R}配置校验或服务健康检查失败，已完整回滚${N}"
+    pause_screen
+    return 1
+  fi
+
+  if [ -n "$new_port" ] && [ "$new_port" != "$cur_port" ]; then
+    local rt_mode_now
+    rt_mode_now=$(get_node_value reality Mode 2>/dev/null || echo ipv4)
+    if [ -n "$cur_port" ] && ! node_revoke_firewall_for_mode "$cur_port" tcp "$rt_mode_now"; then
+      node_transaction_rollback "$txn"
+      echo -e "${R}旧防火墙端口清理失败，已完整回滚${N}"
+      pause_screen
+      return 1
+    fi
+    if ! node_apply_firewall_for_mode "$new_port" tcp "$rt_mode_now"; then
+      node_transaction_rollback "$txn"
+      echo -e "${R}防火墙端口切换失败，已完整回滚${N}"
+      pause_screen
+      return 1
+    fi
+    print_firewall_hint "$new_port" tcp "Reality 节点新端口"
+  fi
+
+  if ! set_node_value reality Port "$new_port" \
+     || ! set_node_value reality SNI "$new_sni" \
+     || ! set_node_value reality UUID "$new_uuid"; then
+    node_transaction_rollback "$txn"
+    echo -e "${R}节点信息保存失败，已完整回滚${N}"
+    pause_screen
+    return 1
+  fi
   if [ -n "$new_pub" ]; then
-    set_node_value reality PublicKey "$new_pub"
-    set_node_value reality PrivateKey "$new_pri"
-    set_node_value reality ShortID "$new_short_id"
+    if ! set_node_value reality PublicKey "$new_pub" \
+       || ! set_node_value reality PrivateKey "$new_pri" \
+       || ! set_node_value reality ShortID "$new_short_id"; then
+      node_transaction_rollback "$txn"
+      echo -e "${R}Reality 密钥信息保存失败，已完整回滚${N}"
+      pause_screen
+      return 1
+    fi
   fi
 
   local cur_ip cur_tag final_pub final_sid new_link ipv6_new_link
@@ -277,15 +316,13 @@ modify_reality_params(){
   final_sid="${new_short_id:-$(get_node_value reality ShortID 2>/dev/null || true)}"
   new_link=$(build_reality_link "$new_uuid" "$cur_ip" "$new_port" "$new_sni" "$final_pub" "$final_sid" "${cur_tag:-reality}" 2>/dev/null || true)
   ipv6_new_link=$(build_dualstack_ipv6_link_for_node reality 2>/dev/null || true)
-  [ -n "$new_link" ] && set_node_value reality Link "$new_link"
-  if [ -n "$new_port" ] && [ "$new_port" != "$cur_port" ]; then
-    local rt_mode_now
-    rt_mode_now=$(get_node_value reality Mode 2>/dev/null || echo ipv4)
-    # 旧端口先撤、新端口再开（双栈/v6 模式同时处理 v4/v6）
-    [ -n "$cur_port" ] && node_revoke_firewall_for_mode "$cur_port" tcp "$rt_mode_now"
-    node_apply_firewall_for_mode "$new_port" tcp "$rt_mode_now"
-    print_firewall_hint "$new_port" tcp "Reality 节点新端口"
+  if [ -n "$new_link" ] && ! set_node_value reality Link "$new_link"; then
+    node_transaction_rollback "$txn"
+    echo -e "${R}客户端链接保存失败，已完整回滚${N}"
+    pause_screen
+    return 1
   fi
+  node_transaction_commit "$txn"
   cleanup_old_backups "${CONFIG_PATH}.bak.*" 5
 
   echo ""
@@ -363,4 +400,3 @@ print_qrcode(){
   echo ""
   qrencode -t ANSIUTF8 "$link"
 }
-

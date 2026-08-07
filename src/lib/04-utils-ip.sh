@@ -8,6 +8,25 @@ is_private_ipv4(){
   return 1
 }
 
+is_valid_ipv4(){
+  local ip="$1" a b c d
+  IFS=. read -r a b c d <<EOF
+$ip
+EOF
+  [ -n "$a" ] && [ -n "$b" ] && [ -n "$c" ] && [ -n "$d" ] || return 1
+  case "$a$b$c$d" in *[!0-9]*) return 1 ;; esac
+  [ "$a" -le 255 ] && [ "$b" -le 255 ] && [ "$c" -le 255 ] && [ "$d" -le 255 ]
+}
+
+is_valid_ipv6_text(){
+  local ip="$1"
+  [ "${#ip}" -ge 2 ] && [ "${#ip}" -le 45 ] || return 1
+  case "$ip" in
+    *:*) printf '%s' "$ip" | grep -Eq '^[0-9A-Fa-f:.]+$' ;;
+    *) return 1 ;;
+  esac
+}
+
 # 判断 IPv6 是否属于 ULA / link-local / loopback / unspecified
 is_private_ipv6(){
   local ip
@@ -50,7 +69,9 @@ detect_primary_ipv4(){
   fi
 
   if [ -z "$detected" ]; then
-    detected=$(curl -s4 --max-time 3 ip.sb 2>/dev/null || true)
+    detected=$(curl --proto '=https' --tlsv1.2 -fsS4 --max-time 5 \
+      https://api.ipify.org 2>/dev/null || true)
+    is_valid_ipv4 "$detected" || detected=""
   fi
 
   # curl 也失败时，宁可返回先前探到的内网 IP 也别返回空——
@@ -93,7 +114,9 @@ detect_primary_ipv6(){
   fi
 
   if [ -z "$detected" ]; then
-    detected=$(curl -s6 --max-time 3 ip.sb 2>/dev/null || true)
+    detected=$(curl --proto '=https' --tlsv1.2 -fsS6 --max-time 5 \
+      https://api64.ipify.org 2>/dev/null || true)
+    is_valid_ipv6_text "$detected" || detected=""
   fi
 
   if [ -z "$detected" ]; then
@@ -116,4 +139,3 @@ describe_install_mode(){
       ;;
   esac
 }
-

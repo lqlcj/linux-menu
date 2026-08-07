@@ -2,13 +2,64 @@
 # 计算后传入。固定地区档（hk/jp/us-west/us-west-100m/eu × 内存档查表）已随
 # 菜单一并移除；各内存档封顶值保留在 _tcp_autotune_ceiling（= 历史档位最大值），
 # 老机器上 region=hk 等存量 marker 仅在状态页 / 首页卡片保留展示映射。
+capture_live_qdisc(){
+  local state_file="$1" iface qdisc
+  [ -e "$state_file" ] && return 0
+  command -v tc >/dev/null 2>&1 || return 0
+  iface=$(ip route show default 2>/dev/null | awk '/^default/ {print $5; exit}')
+  [ -n "$iface" ] || return 0
+  qdisc=$(tc qdisc show dev "$iface" 2>/dev/null | awk 'NR==1 {print $2; exit}')
+  [ -n "$qdisc" ] || return 0
+  ensure_leyili_state_dir || return 1
+  printf 'iface=%s\nqdisc=%s\n' "$iface" "$qdisc" > "$state_file" || return 1
+  chmod 600 "$state_file" 2>/dev/null || { rm -f -- "$state_file"; return 1; }
+}
+
+restore_live_qdisc(){
+  local state_file="$1" remove_after="${2:-0}" iface qdisc rc=0
+  [ -r "$state_file" ] || return 0
+  iface=$(awk -F= '$1 == "iface" {print $2; exit}' "$state_file")
+  qdisc=$(awk -F= '$1 == "qdisc" {print $2; exit}' "$state_file")
+  if [ -n "$iface" ] && [ -n "$qdisc" ] && command -v tc >/dev/null 2>&1; then
+    tc qdisc replace dev "$iface" root "$qdisc" >/dev/null 2>&1 || rc=1
+  elif [ -n "$iface" ] && [ -n "$qdisc" ]; then
+    rc=1
+  fi
+  if [ "$remove_after" = "1" ] && [ "$rc" -eq 0 ]; then
+    rm -f -- "$state_file" || rc=1
+  fi
+  [ "$rc" -eq 0 ] || echo -e "${R}qdisc 恢复失败，状态快照已保留：${state_file}${N}" >&2
+  return "$rc"
+}
+
+tcp_tuning_abort(){
+  local file_txn="$1" runtime_state="$2" runtime_qdisc="$3"
+  local tcp_state_created="${4:-0}" qdisc_state_created="${5:-0}" rc=0
+
+  [ -n "$runtime_state" ] && sysctl_state_restore "$runtime_state" || {
+    [ -z "$runtime_state" ] || rc=1
+  }
+  [ -n "$runtime_qdisc" ] && restore_live_qdisc "$runtime_qdisc" 1 || {
+    [ -z "$runtime_qdisc" ] || rc=1
+  }
+  managed_file_transaction_rollback "$TCP_TUNING_PATH" "$file_txn" || rc=1
+  if [ "$rc" -eq 0 ]; then
+    [ "$tcp_state_created" -eq 0 ] || rm -f -- "$TCP_TUNING_STATE" || rc=1
+    [ "$qdisc_state_created" -eq 0 ] || rm -f -- "$TCP_QDISC_STATE" || rc=1
+    rm -f -- "$runtime_state" "$runtime_qdisc" 2>/dev/null || rc=1
+  fi
+  [ "$rc" -eq 0 ] || echo -e "${R}TCP 调优回滚未完全成功，运行时/事务快照已尽量保留${N}" >&2
+  return "$rc"
+}
+
 apply_tcp_tuning(){
   local mem_tier="${1:-2g}"
   local buffer_max="${2:-}"   # 按实测 BDP 算出的 buffer_max（字节）
   local rtt_ms="${3:-}"       # 实测 RTT（ms，决定 fin_timeout 分档并写入 marker）
   local bw_mbps="${4:-}"      # 有效带宽（Mbps，写入 marker 供状态页展示）
   local notsent_lowat fin_timeout mem_label
-  local cc_algo qdisc_algo iface _q
+  local cc_algo qdisc_algo iface _q file_txn tmp_tuning runtime_state="" runtime_qdisc=""
+  local tcp_state_created=0 qdisc_state_created=0
 
   if ! require_root; then return 1; fi
 
@@ -58,6 +109,66 @@ apply_tcp_tuning(){
     *)   mem_label="$mem_tier" ;;
   esac
 
+  file_txn=$(managed_file_transaction_begin "$TCP_TUNING_PATH" 'Managed by Leyili|leyili-profile') || {
+    echo -e "${R}无法安全接管 ${TCP_TUNING_PATH}${N}"
+    return 1
+  }
+  runtime_state=$(mktemp "${TMPDIR:-/tmp}/leyili-tcp-runtime.XXXXXX") || {
+    managed_file_transaction_rollback "$TCP_TUNING_PATH" "$file_txn" || :
+    return 1
+  }
+  rm -f -- "$runtime_state"
+  runtime_qdisc=$(mktemp "${TMPDIR:-/tmp}/leyili-qdisc-runtime.XXXXXX") || {
+    tcp_tuning_abort "$file_txn" "$runtime_state" "" 0 0 || :
+    return 1
+  }
+  rm -f -- "$runtime_qdisc"
+  sysctl_state_capture "$runtime_state" \
+    net.core.default_qdisc net.ipv4.tcp_congestion_control net.ipv4.tcp_fastopen \
+    net.core.rmem_max net.core.wmem_max net.core.rmem_default net.core.wmem_default \
+    net.ipv4.tcp_rmem net.ipv4.tcp_wmem net.ipv4.tcp_adv_win_scale \
+    net.ipv4.tcp_notsent_lowat net.ipv4.tcp_slow_start_after_idle \
+    net.ipv4.tcp_window_scaling net.ipv4.tcp_timestamps net.ipv4.tcp_sack \
+    net.ipv4.tcp_mtu_probing net.ipv4.ip_no_pmtu_disc net.ipv4.tcp_tw_reuse \
+    net.ipv4.tcp_fin_timeout net.ipv4.tcp_max_tw_buckets net.core.somaxconn \
+    net.core.netdev_max_backlog net.ipv4.tcp_max_syn_backlog net.ipv4.tcp_syncookies \
+    net.ipv4.tcp_max_orphans net.ipv4.tcp_keepalive_time net.ipv4.tcp_keepalive_intvl \
+    net.ipv4.tcp_keepalive_probes net.ipv4.tcp_no_metrics_save net.ipv4.tcp_ecn \
+    net.ipv4.tcp_rfc1337 net.ipv4.tcp_retries2 net.ipv4.tcp_synack_retries \
+    net.ipv4.tcp_orphan_retries net.ipv4.ip_local_port_range || {
+      tcp_tuning_abort "$file_txn" "$runtime_state" "$runtime_qdisc" 0 0 || :
+      return 1
+    }
+  if [ ! -f "$TCP_TUNING_STATE" ]; then
+    cp -a -- "$runtime_state" "$TCP_TUNING_STATE" || {
+      managed_file_transaction_rollback "$TCP_TUNING_PATH" "$file_txn"
+      rm -f -- "$runtime_state" "$runtime_qdisc"
+      return 1
+    }
+    tcp_state_created=1
+  fi
+  if ! capture_live_qdisc "$runtime_qdisc"; then
+    tcp_tuning_abort "$file_txn" "$runtime_state" "$runtime_qdisc" \
+      "$tcp_state_created" 0 || :
+    echo -e "${R}qdisc 运行时快照失败，已中止 TCP 调优${N}" >&2
+    return 1
+  fi
+  if [ ! -f "$TCP_QDISC_STATE" ]; then
+    if ! capture_live_qdisc "$TCP_QDISC_STATE"; then
+      tcp_tuning_abort "$file_txn" "$runtime_state" "$runtime_qdisc" \
+        "$tcp_state_created" 0 || :
+      echo -e "${R}qdisc 持久快照失败，已中止 TCP 调优${N}" >&2
+      return 1
+    fi
+    [ -f "$TCP_QDISC_STATE" ] && qdisc_state_created=1
+  fi
+  if [ ! -r "$runtime_state" ]; then
+    tcp_tuning_abort "$file_txn" "$runtime_state" "$runtime_qdisc" \
+      "$tcp_state_created" "$qdisc_state_created" || :
+    echo -e "${R}qdisc 状态快照失败，已中止 TCP 调优${N}" >&2
+    return 1
+  fi
+
   # --- 拥塞控制探测：BBR 不是所有内核都编译进去（精简内核 / 老 OpenVZ）---
   # 写死 bbr 会让 sysctl -p 在那一行静默报错后回落 cubic，用户以为开了 BBR。
   # 先尝试加载模块，再查 tcp_available_congestion_control，不可用时明确降级并告警。
@@ -85,7 +196,13 @@ apply_tcp_tuning(){
   echo ""
   echo -e "${Y}==> 写入 智能调参/${mem_label} TCP 参数优化配置 (上限 $((buffer_max/1024/1024))M)...${N}"
 
-  cat > "$TCP_TUNING_PATH" <<EOF
+  tmp_tuning=$(mktemp "${TCP_TUNING_PATH}.tmp.XXXXXX") || {
+    tcp_tuning_abort "$file_txn" "$runtime_state" "$runtime_qdisc" \
+      "$tcp_state_created" "$qdisc_state_created" || :
+    return 1
+  }
+  if ! cat > "$tmp_tuning" <<EOF
+# Managed by Leyili
 # leyili-profile: region=custom mem_tier=${mem_tier}${rtt_ms:+ rtt=${rtt_ms}}${bw_mbps:+ bw=${bw_mbps}}
 # 由 leyili.sh 智能 TCP 调参生成 (自动实测 / ${mem_label})
 # 偏好：交互流（网页 / 社交 / 流媒体），非吞吐党
@@ -158,10 +275,26 @@ net.ipv4.tcp_orphan_retries = 3
 # --- 临时端口范围 (避开常用服务端口) ---
 net.ipv4.ip_local_port_range = 10000 65535
 EOF
+  then
+    rm -f -- "$tmp_tuning"
+    tcp_tuning_abort "$file_txn" "$runtime_state" "$runtime_qdisc" \
+      "$tcp_state_created" "$qdisc_state_created" || :
+    return 1
+  fi
+
+  if ! chmod 600 "$tmp_tuning" 2>/dev/null \
+     || ! mv -f -- "$tmp_tuning" "$TCP_TUNING_PATH"; then
+    rm -f -- "$tmp_tuning"
+    tcp_tuning_abort "$file_txn" "$runtime_state" "$runtime_qdisc" \
+      "$tcp_state_created" "$qdisc_state_created" || :
+    return 1
+  fi
 
   echo -e "${Y}==> 应用 sysctl 配置...${N}"
   if ! sysctl -p "$TCP_TUNING_PATH"; then
     echo -e "${R}TCP 参数应用失败，请检查内核兼容性或 sysctl 输出${N}"
+    tcp_tuning_abort "$file_txn" "$runtime_state" "$runtime_qdisc" \
+      "$tcp_state_created" "$qdisc_state_created" || :
     return 1
   fi
 
@@ -180,12 +313,14 @@ EOF
     fi
   fi
 
+  rm -f -- "$runtime_state" "$runtime_qdisc"
+  managed_file_transaction_commit "$file_txn"
+
   return 0
 }
 
 remove_tcp_tuning(){
-  local confirm=""
-  local service_name route_line route_spec iface
+  local confirm="" rc=0
 
   if ! require_root; then
     return 1
@@ -196,6 +331,13 @@ remove_tcp_tuning(){
     echo -e "${Y}未检测到 TCP 优化配置，无需移除${N}"
     pause_screen
     return 0
+  fi
+  if ! grep -Eq 'Managed by Leyili|leyili-profile' "$TCP_TUNING_PATH" 2>/dev/null \
+     && [ ! -e "${TCP_TUNING_PATH}.leyili-original" ] \
+     && [ ! -f "$TCP_TUNING_STATE" ]; then
+    echo -e "${R}${TCP_TUNING_PATH} 不是脚本托管文件，拒绝删除。${N}"
+    pause_screen
+    return 1
   fi
 
   echo ""
@@ -208,52 +350,41 @@ remove_tcp_tuning(){
     return 0
   fi
 
-  rm -f "$TCP_TUNING_PATH"
-
-  sysctl -w net.core.default_qdisc=pfifo_fast >/dev/null 2>&1 || true
-  sysctl -w net.ipv4.tcp_congestion_control=cubic >/dev/null 2>&1 || true
-  sysctl --system >/dev/null 2>&1 || true
-
-  # 与 apply 对称：default_qdisc 改回默认值不会动现有网卡，需对 live 网卡显式复位。
-  # 回退到 pfifo_fast（内核传统默认），失败仅忽略（可能内核无此 qdisc 或无 tc）
-  if command -v tc >/dev/null 2>&1; then
-    iface=$(ip route show default 2>/dev/null | awk '/^default/ {print $5; exit}')
-    [ -n "$iface" ] && tc qdisc replace dev "$iface" root pfifo_fast >/dev/null 2>&1 || true
-  fi
-
-  # 配套撤销 initcwnd（apply_network_optimization 是把 TCP+initcwnd 当一组应用的，对称地撤）
-  service_name=$(basename "$INITCWND_SERVICE_PATH")
-  if [ -f "$INITCWND_SERVICE_PATH" ] || systemctl cat "$service_name" >/dev/null 2>&1; then
-    systemctl disable --now "$service_name" >/dev/null 2>&1 || true
-    rm -f "$INITCWND_SERVICE_PATH"
-    systemctl daemon-reload >/dev/null 2>&1 || true
-    if command -v ip >/dev/null 2>&1; then
-      route_line=$(ip route show default 2>/dev/null | head -1)
-      if [ -n "$route_line" ]; then
-        route_spec=$(printf '%s\n' "$route_line" | awk '{
-          sep=""
-          for (i = 1; i <= NF; i++) {
-            if ($i == "initcwnd" || $i == "initrwnd") { i++; next }
-            printf "%s%s", sep, $i
-            sep=" "
-          }
-        }')
-        # shellcheck disable=SC2086
-        ip route replace $route_spec >/dev/null 2>&1 || true
-      fi
-    fi
-    echo -e "  ${D}initcwnd 持久化服务已移除${N}"
-  fi
+  managed_file_restore "$TCP_TUNING_PATH" || rc=1
+  sysctl --system >/dev/null 2>&1 || rc=1
+  sysctl_state_restore "$TCP_TUNING_STATE" || rc=1
+  restore_live_qdisc "$TCP_QDISC_STATE" 1 || rc=1
+  remove_initcwnd_managed 1 || rc=1
 
   echo ""
-  echo -e "${G}TCP 优化已移除（部分参数重启后完全复位）${N}"
+  if [ "$rc" -eq 0 ]; then
+    echo -e "${G}TCP 优化已移除（部分参数重启后完全复位）${N}"
+  else
+    echo -e "${R}TCP 优化移除未完全成功，相关状态快照已尽量保留，请检查上方警告${N}"
+  fi
   pause_screen
+  return "$rc"
+}
+
+quic_tuning_abort(){
+  local file_txn="$1" runtime_state="$2" state_created="${3:-0}" rc=0
+  [ -n "$runtime_state" ] && sysctl_state_restore "$runtime_state" || {
+    [ -z "$runtime_state" ] || rc=1
+  }
+  managed_file_transaction_rollback "$QUIC_TUNING_PATH" "$file_txn" || rc=1
+  if [ "$rc" -eq 0 ]; then
+    [ "$state_created" -eq 0 ] || rm -f -- "$QUIC_TUNING_STATE" || rc=1
+    [ -z "$runtime_state" ] || rm -f -- "$runtime_state" 2>/dev/null || rc=1
+  fi
+  [ "$rc" -eq 0 ] || echo -e "${R}QUIC 调优回滚未完全成功，运行时/事务快照已尽量保留${N}" >&2
+  return "$rc"
 }
 
 apply_quic_tuning(){
   local region="${1:-us-west}"
   local mem_tier="${2:-2g}"
-  local region_label mem_label
+  local region_label mem_label conntrack_max file_txn tmp_quic runtime_state=""
+  local quic_state_created=0
 
   if ! require_root; then return 1; fi
 
@@ -269,18 +400,45 @@ apply_quic_tuning(){
   esac
 
   case "$mem_tier" in
-    512m) mem_label="512MB" ;;
-    1g)  mem_label="1GB"  ;;
-    2g)  mem_label="2GB"  ;;
-    4g)  mem_label="4GB"  ;;
-    8g)  mem_label="8GB+" ;;
-    *)   mem_label="$mem_tier" ;;
+    512m) mem_label="512MB"; conntrack_max=65536 ;;
+    1g)  mem_label="1GB";   conntrack_max=65536 ;;
+    2g)  mem_label="2GB";   conntrack_max=131072 ;;
+    4g)  mem_label="4GB";   conntrack_max=262144 ;;
+    8g)  mem_label="8GB+";  conntrack_max=524288 ;;
+    *)   mem_label="$mem_tier"; conntrack_max=131072 ;;
   esac
+
+  file_txn=$(managed_file_transaction_begin "$QUIC_TUNING_PATH" 'Managed by Leyili|leyili-quic-profile') || return 1
+  runtime_state=$(mktemp "${TMPDIR:-/tmp}/leyili-quic-runtime.XXXXXX") || {
+    managed_file_transaction_rollback "$QUIC_TUNING_PATH" "$file_txn" || :
+    return 1
+  }
+  rm -f -- "$runtime_state"
+  sysctl_state_capture "$runtime_state" \
+    net.netfilter.nf_conntrack_max \
+    net.netfilter.nf_conntrack_udp_timeout \
+    net.netfilter.nf_conntrack_udp_timeout_stream || {
+      quic_tuning_abort "$file_txn" "$runtime_state" 0 || :
+      return 1
+    }
+  if [ ! -f "$QUIC_TUNING_STATE" ]; then
+    cp -a -- "$runtime_state" "$QUIC_TUNING_STATE" || {
+      managed_file_transaction_rollback "$QUIC_TUNING_PATH" "$file_txn"
+      rm -f -- "$runtime_state"
+      return 1
+    }
+    quic_state_created=1
+  fi
 
   echo ""
   echo -e "${Y}==> 写入 ${region_label}/${mem_label} QUIC/UDP 参数优化配置 (仅 conntrack)...${N}"
 
-  cat > "$QUIC_TUNING_PATH" <<EOF
+  tmp_quic=$(mktemp "${QUIC_TUNING_PATH}.tmp.XXXXXX") || {
+    quic_tuning_abort "$file_txn" "$runtime_state" "$quic_state_created" || :
+    return 1
+  }
+  if ! cat > "$tmp_quic" <<EOF
+# Managed by Leyili
 # leyili-quic-profile: region=${region} mem_tier=${mem_tier}
 # 由 leyili.sh QUIC/UDP 协议优化生成 (${region_label} / ${mem_label})
 # 用户偏好：Reality TCP 主用、UDP 仅备用 → 本文件不写 net.core.* 通用键，
@@ -289,26 +447,40 @@ apply_quic_tuning(){
 # increase receive buffer size" 警告，再考虑单独提升 TCP 那份的 rmem_max。
 # 不跑 TUIC / Hysteria2 时无需此文件，可在菜单 "移除 QUIC 调优" 删除
 
-# --- conntrack (NAT 环境下 UDP 流易爆表，1M 条目 ≈ 200MB 内存) ---
+# --- conntrack（按内存档限制，避免小内存机器被固定 1M 条目拖垮）---
 # 容器/LXC 内可能写不进去，sysctl -p 失败时由上层提示
-net.netfilter.nf_conntrack_max = 1048576
+net.netfilter.nf_conntrack_max = ${conntrack_max}
 net.netfilter.nf_conntrack_udp_timeout = 60
 net.netfilter.nf_conntrack_udp_timeout_stream = 180
 EOF
+  then
+    rm -f -- "$tmp_quic"
+    quic_tuning_abort "$file_txn" "$runtime_state" "$quic_state_created" || :
+    return 1
+  fi
+
+  if ! chmod 600 "$tmp_quic" 2>/dev/null \
+     || ! mv -f -- "$tmp_quic" "$QUIC_TUNING_PATH"; then
+    rm -f -- "$tmp_quic"
+    quic_tuning_abort "$file_txn" "$runtime_state" "$quic_state_created" || :
+    return 1
+  fi
 
   echo -e "${Y}==> 应用 sysctl 配置...${N}"
-  # conntrack 写不进去多为「nf_conntrack 模块未加载」或容器受限；配置文件已落地，
-  # 加载 NAT 规则（如装节点开端口跳跃）或重启后即生效。只警告，不报整体失败。
   if ! sysctl -p "$QUIC_TUNING_PATH" 2>/dev/null; then
-    echo -e "${Y}部分 conntrack 参数当前未能应用（容器/LXC 或 nf_conntrack 模块未加载）${N}"
-    echo -e "${D}配置已写入 ${QUIC_TUNING_PATH}，加载 NAT 规则或重启后生效，不影响节点使用${N}"
+    echo -e "${R}conntrack 参数未能完整应用，已恢复应用前状态${N}"
+    quic_tuning_abort "$file_txn" "$runtime_state" "$quic_state_created" || :
+    return 1
   fi
+
+  rm -f -- "$runtime_state"
+  managed_file_transaction_commit "$file_txn"
 
   return 0
 }
 
 remove_quic_tuning(){
-  local confirm=""
+  local confirm="" rc=0
 
   if ! require_root; then
     return 1
@@ -320,6 +492,13 @@ remove_quic_tuning(){
     pause_screen
     return 0
   fi
+  if ! grep -Eq 'Managed by Leyili|leyili-quic-profile' "$QUIC_TUNING_PATH" 2>/dev/null \
+     && [ ! -e "${QUIC_TUNING_PATH}.leyili-original" ] \
+     && [ ! -f "$QUIC_TUNING_STATE" ]; then
+    echo -e "${R}${QUIC_TUNING_PATH} 不是脚本托管文件，拒绝删除。${N}"
+    pause_screen
+    return 1
+  fi
 
   echo ""
   echo -e "${Y}==> 即将移除 ${C}$QUIC_TUNING_PATH${N}${Y}，并通过 sysctl --system 复位参数${N}"
@@ -330,13 +509,18 @@ remove_quic_tuning(){
     return 0
   fi
 
-  rm -f "$QUIC_TUNING_PATH"
-
-  sysctl --system >/dev/null 2>&1 || true
+  managed_file_restore "$QUIC_TUNING_PATH" || rc=1
+  sysctl --system >/dev/null 2>&1 || rc=1
+  sysctl_state_restore "$QUIC_TUNING_STATE" || rc=1
 
   echo ""
-  echo -e "${G}QUIC 优化已移除（UDP 缓冲区将回落至 99-proxy-optimized.conf 或内核默认值）${N}"
+  if [ "$rc" -eq 0 ]; then
+    echo -e "${G}QUIC 优化已移除（UDP 缓冲区将回落至 99-proxy-optimized.conf 或内核默认值）${N}"
+  else
+    echo -e "${R}QUIC 优化移除未完全成功，状态快照已尽量保留，请检查上方警告${N}"
+  fi
   pause_screen
+  return "$rc"
 }
 
 apply_quic_optimization(){
@@ -389,11 +573,40 @@ apply_quic_optimization(){
   pause_screen
 }
 
+initcwnd_apply_rollback(){
+  local route_line="$1" service_name="$2" helper_txn="$3" service_txn="$4"
+  local was_enabled="$5" was_active="$6" state_created="$7" stop_service="${8:-0}"
+  local rc=0
+
+  if [ "$stop_service" = "1" ] \
+     && { systemctl is-active --quiet "$service_name" 2>/dev/null \
+          || systemctl is-enabled --quiet "$service_name" 2>/dev/null; }; then
+    systemctl disable --now "$service_name" >/dev/null 2>&1 || rc=1
+  fi
+  if [ -n "$route_line" ]; then
+    # shellcheck disable=SC2086
+    ip route replace $route_line >/dev/null 2>&1 || rc=1
+  fi
+  managed_file_transaction_rollback "$INITCWND_HELPER_PATH" "$helper_txn" || rc=1
+  managed_file_transaction_rollback "$INITCWND_SERVICE_PATH" "$service_txn" || rc=1
+  if [ "$stop_service" = "1" ]; then
+    systemctl daemon-reload >/dev/null 2>&1 || rc=1
+    if [ "$was_enabled" -eq 1 ]; then systemctl enable "$service_name" >/dev/null 2>&1 || rc=1; fi
+    if [ "$was_active" -eq 1 ]; then systemctl start "$service_name" >/dev/null 2>&1 || rc=1; fi
+  fi
+  if [ "$state_created" -eq 1 ] && [ "$rc" -eq 0 ]; then
+    rm -f -- "$INITCWND_STATE_PATH" || rc=1
+  fi
+  [ "$rc" -eq 0 ] || echo -e "${R}initcwnd 回滚未完全成功，状态文件/事务快照已保留，请立即检查路由与服务${N}" >&2
+  return "$rc"
+}
+
 apply_initcwnd_optimization(){
-  local route_line route_spec ip_bin current_route
+  local route_line route_spec current_route service_name
   local initcwnd_value="${1:-$INITCWND_VALUE}"
   local quiet="${2:-0}"
-
+  local service_txn helper_txn tmp_service tmp_helper
+  local was_active=0 was_enabled=0 state_created=0
 
   if ! require_root; then return 1; fi
 
@@ -412,6 +625,12 @@ apply_initcwnd_optimization(){
     return 1
   fi
 
+  case "$initcwnd_value" in ''|*[!0-9]*) return 1 ;; esac
+  if [ "$initcwnd_value" -lt 2 ] || [ "$initcwnd_value" -gt 128 ]; then
+    echo -e "${R}initcwnd 必须在 2-128 之间${N}"
+    return 1
+  fi
+
   route_spec=$(printf '%s\n' "$route_line" | awk '{
     sep=""
     for (i = 1; i <= NF; i++) {
@@ -424,18 +643,90 @@ apply_initcwnd_optimization(){
     }
     printf "\n"
   }')
-  ip_bin=$(command -v ip 2>/dev/null || echo /sbin/ip)
+  service_name=$(basename "$INITCWND_SERVICE_PATH")
+  systemctl is-active --quiet "$service_name" 2>/dev/null && was_active=1
+  systemctl is-enabled --quiet "$service_name" 2>/dev/null && was_enabled=1
+
+  ensure_leyili_state_dir || return 1
+  if [ ! -f "$INITCWND_STATE_PATH" ]; then
+    {
+      printf 'original_active=%s\n' "$was_active"
+      printf 'original_enabled=%s\n' "$was_enabled"
+    } > "$INITCWND_STATE_PATH" || return 1
+    chmod 600 "$INITCWND_STATE_PATH" 2>/dev/null \
+      || { rm -f -- "$INITCWND_STATE_PATH"; return 1; }
+    state_created=1
+  fi
+
+  service_txn=$(managed_file_transaction_begin "$INITCWND_SERVICE_PATH" 'Managed by Leyili|Description=Set TCP initcwnd/initrwnd') || return 1
+  helper_txn=$(managed_file_transaction_begin "$INITCWND_HELPER_PATH" 'Managed by Leyili') || {
+    if managed_file_transaction_rollback "$INITCWND_SERVICE_PATH" "$service_txn"; then
+      [ "$state_created" -eq 1 ] && rm -f -- "$INITCWND_STATE_PATH"
+    fi
+    return 1
+  }
 
   echo -e "${Y}==> 当前默认路由:${N} ${C}$route_line${N}"
   echo -e "${Y}==> 应用 initcwnd/initrwnd ${initcwnd_value}...${N}"
   if ! ip route replace $route_spec initcwnd $initcwnd_value initrwnd $initcwnd_value; then
     echo -e "${R}默认路由优化失败，请检查路由权限或当前网络环境${N}"
     [ "$quiet" != "1" ] && pause_screen
+    initcwnd_apply_rollback "$route_line" "$service_name" "$helper_txn" "$service_txn" \
+      "$was_enabled" "$was_active" "$state_created" 0 || :
     return 1
   fi
 
-  echo -e "${Y}==> 写入 systemd 持久化服务...${N}"
-  cat > "$INITCWND_SERVICE_PATH" << EOF
+  echo -e "${Y}==> 写入动态路由 helper 与 systemd 持久化服务...${N}"
+  if ! mkdir -p "$(dirname -- "$INITCWND_HELPER_PATH")"; then
+    initcwnd_apply_rollback "$route_line" "$service_name" "$helper_txn" "$service_txn" \
+      "$was_enabled" "$was_active" "$state_created" 0 || :
+    return 1
+  fi
+  tmp_helper=$(mktemp "${INITCWND_HELPER_PATH}.tmp.XXXXXX") || {
+    initcwnd_apply_rollback "$route_line" "$service_name" "$helper_txn" "$service_txn" \
+      "$was_enabled" "$was_active" "$state_created" 0 || :
+    return 1
+  }
+  if ! cat > "$tmp_helper" <<'EOF'
+#!/bin/bash
+# Managed by Leyili. 每次启动读取当前默认路由，避免固化旧网关/网卡。
+set -euo pipefail
+value="${1:?missing initcwnd value}"
+ip_bin=$(command -v ip)
+route_line=$($ip_bin route show default | head -n 1)
+[ -n "$route_line" ]
+route_spec=$(printf '%s\n' "$route_line" | awk '{
+  sep=""
+  for (i = 1; i <= NF; i++) {
+    if ($i == "initcwnd" || $i == "initrwnd") { i++; next }
+    printf "%s%s", sep, $i
+    sep=" "
+  }
+}')
+# shellcheck disable=SC2086
+$ip_bin route replace $route_spec initcwnd "$value" initrwnd "$value"
+EOF
+  then
+    rm -f -- "$tmp_helper"
+    initcwnd_apply_rollback "$route_line" "$service_name" "$helper_txn" "$service_txn" \
+      "$was_enabled" "$was_active" "$state_created" 0 || :
+    return 1
+  fi
+  if ! chmod 755 "$tmp_helper" \
+     || ! mv -f -- "$tmp_helper" "$INITCWND_HELPER_PATH"; then
+    rm -f -- "$tmp_helper"
+    initcwnd_apply_rollback "$route_line" "$service_name" "$helper_txn" "$service_txn" \
+      "$was_enabled" "$was_active" "$state_created" 0 || :
+    return 1
+  fi
+
+  tmp_service=$(mktemp "${INITCWND_SERVICE_PATH}.tmp.XXXXXX") || {
+    initcwnd_apply_rollback "$route_line" "$service_name" "$helper_txn" "$service_txn" \
+      "$was_enabled" "$was_active" "$state_created" 0 || :
+    return 1
+  }
+  if ! cat > "$tmp_service" << EOF
+# Managed by Leyili
 [Unit]
 Description=Set TCP initcwnd/initrwnd
 After=network-online.target
@@ -443,30 +734,56 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
-ExecStart=$ip_bin route replace $route_spec initcwnd $initcwnd_value initrwnd $initcwnd_value
+ExecStart=$INITCWND_HELPER_PATH $initcwnd_value
 RemainAfterExit=yes
 
 [Install]
 WantedBy=multi-user.target
 EOF
+  then
+    rm -f -- "$tmp_service"
+    initcwnd_apply_rollback "$route_line" "$service_name" "$helper_txn" "$service_txn" \
+      "$was_enabled" "$was_active" "$state_created" 0 || :
+    return 1
+  fi
+  if ! chmod 644 "$tmp_service" 2>/dev/null \
+     || ! mv -f -- "$tmp_service" "$INITCWND_SERVICE_PATH"; then
+    rm -f -- "$tmp_service"
+    initcwnd_apply_rollback "$route_line" "$service_name" "$helper_txn" "$service_txn" \
+      "$was_enabled" "$was_active" "$state_created" 0 || :
+    return 1
+  fi
 
-  if ! systemctl daemon-reload; then
-    echo -e "${R}systemd 重新加载失败${N}"
+  if ! systemctl daemon-reload \
+     || ! systemctl enable --now "$service_name"; then
+    if initcwnd_apply_rollback "$route_line" "$service_name" "$helper_txn" "$service_txn" \
+         "$was_enabled" "$was_active" "$state_created" 1; then
+      echo -e "${R}initcwnd 持久化服务启用失败，已恢复原文件、路由与服务状态${N}"
+    else
+      echo -e "${R}initcwnd 持久化服务启用失败，且回滚未完全成功${N}"
+    fi
     [ "$quiet" != "1" ] && pause_screen
     return 1
   fi
 
-  if ! systemctl enable --now "$(basename "$INITCWND_SERVICE_PATH")"; then
-    echo -e "${R}initcwnd 持久化服务启用失败${N}"
-    [ "$quiet" != "1" ] && pause_screen
+  current_route=$(ip route show default 2>/dev/null | head -1)
+  if ! printf '%s\n' "$current_route" | grep -Eq "(^| )initcwnd ${initcwnd_value}( |$)"; then
+    if initcwnd_apply_rollback "$route_line" "$service_name" "$helper_txn" "$service_txn" \
+         "$was_enabled" "$was_active" "$state_created" 1; then
+      echo -e "${R}initcwnd 健康检查失败，已恢复原状态${N}"
+    else
+      echo -e "${R}initcwnd 健康检查失败，且回滚未完全成功${N}"
+    fi
     return 1
   fi
+
+  managed_file_transaction_commit "$helper_txn"
+  managed_file_transaction_commit "$service_txn"
 
   if [ "$quiet" = "1" ]; then
     return 0
   fi
 
-  current_route=$(ip route show default 2>/dev/null | head -1)
   echo ""
   echo -e "${G}initcwnd 优化已生效${N}"
   echo -e "  当前默认路由: ${C}$current_route${N}"
@@ -480,34 +797,31 @@ EOF
   pause_screen
 }
 
-remove_initcwnd_optimization(){
-  local confirm=""
-  local service_name
+remove_initcwnd_managed(){
+  local quiet="${1:-0}" service_name
   local route_line route_spec
-
-  if ! require_root; then
-    return 1
-  fi
+  local original_active=0 original_enabled=0 managed=0 rc=0
 
   service_name=$(basename "$INITCWND_SERVICE_PATH")
-  if [ ! -f "$INITCWND_SERVICE_PATH" ] && ! systemctl cat "$service_name" >/dev/null 2>&1; then
-    echo ""
-    echo -e "${Y}未检测到 initcwnd 持久化服务，无需移除${N}"
-    pause_screen
-    return 0
+  if grep -Fq 'Managed by Leyili' "$INITCWND_SERVICE_PATH" 2>/dev/null \
+     || [ -e "${INITCWND_SERVICE_PATH}.leyili-original" ] \
+     || [ -f "$INITCWND_STATE_PATH" ]; then
+    managed=1
   fi
+  [ "$managed" -eq 1 ] || return 0
 
-  echo ""
-  read -p "  确认移除 initcwnd 持久化服务并恢复默认路由？(y/N): " confirm
-  if [ "$confirm" != "y" ] && [ "$confirm" != "Y" ]; then
-    echo -e "  已取消"
-    sleep 1
-    return 0
+  original_active=$(awk -F= '$1 == "original_active" {print $2; exit}' "$INITCWND_STATE_PATH" 2>/dev/null)
+  original_enabled=$(awk -F= '$1 == "original_enabled" {print $2; exit}' "$INITCWND_STATE_PATH" 2>/dev/null)
+  if systemctl is-active --quiet "$service_name" 2>/dev/null \
+     || systemctl is-enabled --quiet "$service_name" 2>/dev/null; then
+    systemctl disable --now "$service_name" >/dev/null 2>&1 || rc=1
   fi
+  managed_file_restore "$INITCWND_SERVICE_PATH" || rc=1
+  managed_file_restore "$INITCWND_HELPER_PATH" || rc=1
+  systemctl daemon-reload >/dev/null 2>&1 || rc=1
 
-  systemctl disable --now "$service_name" >/dev/null 2>&1 || true
-  rm -f "$INITCWND_SERVICE_PATH"
-  systemctl daemon-reload >/dev/null 2>&1 || true
+  if [ "$original_enabled" = "1" ]; then systemctl enable "$service_name" >/dev/null 2>&1 || rc=1; fi
+  if [ "$original_active" = "1" ]; then systemctl start "$service_name" >/dev/null 2>&1 || rc=1; fi
 
   if command -v ip >/dev/null 2>&1; then
     route_line=$(ip route show default 2>/dev/null | head -1)
@@ -524,12 +838,48 @@ remove_initcwnd_optimization(){
         }
       }')
       # shellcheck disable=SC2086
-      ip route replace $route_spec >/dev/null 2>&1 || true
+      ip route replace $route_spec >/dev/null 2>&1 || rc=1
     fi
   fi
 
+  if [ "$rc" -eq 0 ]; then
+    rm -f -- "$INITCWND_STATE_PATH" || rc=1
+  fi
+  if [ "$rc" -eq 0 ]; then
+    [ "$quiet" = "1" ] || echo -e "  ${G}initcwnd 优化已移除${N}"
+  else
+    echo -e "${R}initcwnd 移除/恢复未完全成功，状态文件已保留：${INITCWND_STATE_PATH}${N}" >&2
+  fi
+  return "$rc"
+}
+
+remove_initcwnd_optimization(){
+  local confirm=""
+
+  if ! require_root; then return 1; fi
+  if ! grep -Fq 'Managed by Leyili' "$INITCWND_SERVICE_PATH" 2>/dev/null \
+     && [ ! -e "${INITCWND_SERVICE_PATH}.leyili-original" ] \
+     && [ ! -f "$INITCWND_STATE_PATH" ]; then
+    echo ""
+    echo -e "${Y}未检测到脚本管理的 initcwnd 服务，无需移除${N}"
+    pause_screen
+    return 0
+  fi
+
   echo ""
-  echo -e "${G}initcwnd 优化已移除${N}"
+  read -p "  确认移除 initcwnd 持久化服务并恢复原文件/当前路由？(y/N): " confirm
+  if [ "$confirm" != "y" ] && [ "$confirm" != "Y" ]; then
+    echo -e "  已取消"
+    sleep 1
+    return 0
+  fi
+
+  if ! remove_initcwnd_managed 0; then
+    pause_screen
+    return 1
+  fi
+
+  echo ""
   pause_screen
 }
 
@@ -542,6 +892,7 @@ apply_network_optimization(){
   local mem_label
   local notsent_lowat fin_timeout
   local live_cc live_iface live_qdisc
+  local rollback_rc=0
 
   if ! require_root; then return 1; fi
 
@@ -565,7 +916,15 @@ apply_network_optimization(){
   fi
 
   if ! apply_initcwnd_optimization "$initcwnd_value" 1; then
-    echo -e "${R}initcwnd 优化失败（TCP 调优已生效，但 initcwnd 未应用）${N}"
+    managed_file_restore "$TCP_TUNING_PATH" || rollback_rc=1
+    sysctl --system >/dev/null 2>&1 || rollback_rc=1
+    sysctl_state_restore "$TCP_TUNING_STATE" || rollback_rc=1
+    restore_live_qdisc "$TCP_QDISC_STATE" 1 || rollback_rc=1
+    if [ "$rollback_rc" -eq 0 ]; then
+      echo -e "${R}initcwnd 优化失败，TCP 调优也已回滚，避免留下半套配置${N}"
+    else
+      echo -e "${R}initcwnd 优化失败，且 TCP 调优回滚未完全成功，请检查上方快照提示${N}"
+    fi
     pause_screen
     return 1
   fi
@@ -1146,10 +1505,43 @@ show_network_optimization_status(){
   pause_screen
 }
 
+swap_transaction_rollback(){
+  local created_this_run="${1:-0}"
+  local fstab_backup="${2:-}"
+  local sysctl_txn="${3:-}"
+  local rc=0
+
+  if [ -n "$sysctl_txn" ] && [ -d "$sysctl_txn" ]; then
+    managed_file_transaction_rollback "$SWAP_SYSCTL_PATH" "$sysctl_txn" || rc=1
+  fi
+  if [ -n "$fstab_backup" ] && [ -f "$fstab_backup" ]; then
+    restore_file_snapshot "$fstab_backup" /etc/fstab || rc=1
+  fi
+  if [ "$created_this_run" = "1" ]; then
+    if awk -v p="$SWAPFILE_PATH" 'NR > 1 && $1 == p {found=1} END {exit !found}' /proc/swaps 2>/dev/null; then
+      swapoff "$SWAPFILE_PATH" >/dev/null 2>&1 || rc=1
+    fi
+    if ! awk -v p="$SWAPFILE_PATH" 'NR > 1 && $1 == p {found=1} END {exit !found}' /proc/swaps 2>/dev/null; then
+      rm -f -- "$SWAPFILE_PATH" || rc=1
+    else
+      rc=1
+    fi
+  fi
+  sysctl --system >/dev/null 2>&1 || rc=1
+  if [ "$rc" -eq 0 ]; then
+    [ -z "$fstab_backup" ] || rm -f -- "$fstab_backup" || rc=1
+  else
+    echo -e "${R}SWAP 事务回滚未完全成功${fstab_backup:+，fstab 快照保留在 ${fstab_backup}}${N}" >&2
+  fi
+  return "$rc"
+}
+
 configure_swap(){
   local swap_size_mb="${1:-2048}"
   local size_label="${2:-${swap_size_mb} MB}"
   local swap_active="false"
+  local state_created_file=0 adopted=0 fstab_added=0 created_this_run=0
+  local swap_tmp="" fstab_backup="" fstab_tmp="" sysctl_txn="" tmp_sysctl="" tmp_state="" adopt_choice=""
 
   if ! require_root; then return 1; fi
 
@@ -1163,60 +1555,140 @@ configure_swap(){
   fi
 
   if [ "$swap_active" = "true" ]; then
-    echo -e "${Y}==> 检测到 ${SWAPFILE_PATH} 已启用，跳过创建${N}"
-    echo -e "${D}    如需更换大小，请先在 shell 执行：swapoff ${SWAPFILE_PATH} && rm -f ${SWAPFILE_PATH}${N}"
+    if [ ! -f "$SWAP_STATE_PATH" ]; then
+      echo -e "${Y}检测到已启用但无法确认由本脚本创建的 ${SWAPFILE_PATH}${N}"
+      echo -e "${D}默认不会接管、格式化或删除该文件。输入 ADOPT 仅接管 swappiness；文件与既有 fstab 行仍归用户。${N}"
+      read -p "  输入 ADOPT 接管设置，其它输入取消: " adopt_choice
+      if [ "$adopt_choice" != "ADOPT" ]; then
+        echo -e "  已取消，现有 SWAP 未作任何修改"
+        pause_screen
+        return 0
+      fi
+      adopted=1
+    else
+      adopted=$(awk -F= '$1 == "adopted" {print $2; exit}' "$SWAP_STATE_PATH" 2>/dev/null)
+      state_created_file=$(awk -F= '$1 == "created_file" {print $2; exit}' "$SWAP_STATE_PATH" 2>/dev/null)
+      fstab_added=$(awk -F= '$1 == "fstab_added" {print $2; exit}' "$SWAP_STATE_PATH" 2>/dev/null)
+    fi
+    echo -e "${Y}==> ${SWAPFILE_PATH} 已启用，不重新格式化${N}"
   else
     if [ -f "$SWAPFILE_PATH" ]; then
-      echo -e "${Y}==> 检测到已有 ${SWAPFILE_PATH}，继续复用（不重建）${N}"
-      echo -e "${D}    如需更换大小，请先 rm -f ${SWAPFILE_PATH} 后重新运行此项${N}"
-    else
-      echo -e "${Y}==> 创建 ${size_label} SWAP 文件...${N}"
-      if ! fallocate -l "${swap_size_mb}M" "$SWAPFILE_PATH"; then
-        echo -e "${Y}==> fallocate 失败（可能文件系统不支持，如 tmpfs/zfs），改用 dd 创建...${N}"
-        dd if=/dev/zero of="$SWAPFILE_PATH" bs=1M count="$swap_size_mb" status=progress || {
-          echo -e "${R}SWAP 文件创建失败${N}"
-          rm -f "$SWAPFILE_PATH"
-          pause_screen
-          return 1
-        }
+      echo -e "${R}检测到未启用的现有文件 ${SWAPFILE_PATH}，拒绝执行 mkswap（会破坏原内容）。${N}"
+      echo -e "${Y}请先人工确认并移动/删除该文件，再重新运行。${N}"
+      pause_screen
+      return 1
+    fi
+
+    echo -e "${Y}==> 创建 ${size_label} SWAP 文件...${N}"
+    swap_tmp=$(mktemp "${SWAPFILE_PATH}.leyili.XXXXXX") || return 1
+    if ! fallocate -l "${swap_size_mb}M" "$swap_tmp"; then
+      echo -e "${Y}==> fallocate 失败，改用 dd 创建...${N}"
+      if ! dd if=/dev/zero of="$swap_tmp" bs=1M count="$swap_size_mb" status=progress; then
+        rm -f -- "$swap_tmp"
+        echo -e "${R}SWAP 文件创建失败${N}"
+        pause_screen
+        return 1
       fi
     fi
-
-    echo -e "${Y}==> 设置 SWAP 文件权限...${N}"
-    chmod 600 "$SWAPFILE_PATH"
-
-    echo -e "${Y}==> 格式化 SWAP...${N}"
-    if ! mkswap "$SWAPFILE_PATH"; then
-      echo -e "${R}mkswap 失败${N}"
-      rm -f "$SWAPFILE_PATH"
+    chmod 600 "$swap_tmp" || { rm -f -- "$swap_tmp"; return 1; }
+    if ! mkswap "$swap_tmp" >/dev/null \
+       || ! mv -f -- "$swap_tmp" "$SWAPFILE_PATH" \
+       || ! swapon "$SWAPFILE_PATH"; then
+      rm -f -- "$swap_tmp" "$SWAPFILE_PATH"
+      echo -e "${R}SWAP 格式化或启用失败，已删除本次新建文件${N}"
       pause_screen
       return 1
     fi
-
-    echo -e "${Y}==> 启用 SWAP...${N}"
-    if ! swapon "$SWAPFILE_PATH"; then
-      echo -e "${R}swapon 失败${N}"
-      rm -f "$SWAPFILE_PATH"
-      pause_screen
-      return 1
-    fi
+    created_this_run=1
+    state_created_file=1
   fi
 
-  echo -e "${Y}==> 写入开机自动挂载...${N}"
-  if ! grep -Eq '^[[:space:]]*/swapfile[[:space:]]+none[[:space:]]+swap[[:space:]]+sw[[:space:]]+0[[:space:]]+0([[:space:]]|$)' /etc/fstab; then
-    echo "$SWAPFILE_PATH none swap sw 0 0" >> /etc/fstab
+  fstab_backup=$(mktemp "${TMPDIR:-/tmp}/leyili-fstab.XXXXXX") || {
+    swap_transaction_rollback "$created_this_run" "" ""
+    return 1
+  }
+  cp -a -- /etc/fstab "$fstab_backup" || {
+    swap_transaction_rollback "$created_this_run" "$fstab_backup" ""
+    return 1
+  }
+  if ! awk -v p="$SWAPFILE_PATH" '$1 == p && $3 == "swap" {found=1} END {exit !found}' /etc/fstab; then
+    fstab_tmp=$(mktemp /etc/fstab.tmp.XXXXXX) || {
+      swap_transaction_rollback "$created_this_run" "$fstab_backup" ""
+      return 1
+    }
+    if ! { cat /etc/fstab; printf '\n# Managed by Leyili SWAP\n%s none swap sw 0 0\n' "$SWAPFILE_PATH"; } > "$fstab_tmp"; then
+      rm -f -- "$fstab_tmp"
+      swap_transaction_rollback "$created_this_run" "$fstab_backup" ""
+      return 1
+    fi
+    if ! chmod --reference=/etc/fstab "$fstab_tmp" 2>/dev/null \
+       || ! chown --reference=/etc/fstab "$fstab_tmp" 2>/dev/null \
+       || ! mv -f -- "$fstab_tmp" /etc/fstab; then
+      rm -f -- "$fstab_tmp"
+      swap_transaction_rollback "$created_this_run" "$fstab_backup" ""
+      return 1
+    fi
+    fstab_added=1
   fi
 
   echo -e "${Y}==> 设置 swappiness = ${SWAPPINESS_VALUE}...${N}"
-  cat > "$SWAP_SYSCTL_PATH" << EOF
+  sysctl_txn=$(managed_file_transaction_begin "$SWAP_SYSCTL_PATH" 'Managed by Leyili') || {
+    swap_transaction_rollback "$created_this_run" "$fstab_backup" ""
+    return 1
+  }
+  tmp_sysctl=$(mktemp "${SWAP_SYSCTL_PATH}.tmp.XXXXXX") || {
+    swap_transaction_rollback "$created_this_run" "$fstab_backup" "$sysctl_txn"
+    return 1
+  }
+  if ! cat > "$tmp_sysctl" << EOF
+# Managed by Leyili
 vm.swappiness = $SWAPPINESS_VALUE
 EOF
-
-  # swappiness 只是可选优化；SWAP 主体（swapon + fstab）此前已成功。
-  # 容器/精简内核 vm.swappiness 不可写时只警告，不报整体失败（否则误导用户去删正在用的 swapfile）
-  if ! sysctl -p "$SWAP_SYSCTL_PATH" 2>/dev/null; then
-    echo -e "${Y}swappiness 当前未能应用（容器/精简内核可能不可写）；SWAP 已启用，配置已写入，重启后生效${N}"
+  then
+    rm -f -- "$tmp_sysctl"
+    swap_transaction_rollback "$created_this_run" "$fstab_backup" "$sysctl_txn"
+    return 1
   fi
+  if ! chmod 600 "$tmp_sysctl" 2>/dev/null \
+     || ! mv -f -- "$tmp_sysctl" "$SWAP_SYSCTL_PATH"; then
+    rm -f -- "$tmp_sysctl"
+    swap_transaction_rollback "$created_this_run" "$fstab_backup" "$sysctl_txn"
+    return 1
+  fi
+
+  if ! sysctl -p "$SWAP_SYSCTL_PATH" 2>/dev/null; then
+    swap_transaction_rollback "$created_this_run" "$fstab_backup" "$sysctl_txn"
+    echo -e "${R}swappiness 应用失败，已恢复 fstab、sysctl 与本次新建 SWAP${N}"
+    pause_screen
+    return 1
+  fi
+
+  if ! ensure_leyili_state_dir; then
+    swap_transaction_rollback "$created_this_run" "$fstab_backup" "$sysctl_txn"
+    return 1
+  fi
+  tmp_state=$(mktemp "${SWAP_STATE_PATH}.tmp.XXXXXX") || {
+    swap_transaction_rollback "$created_this_run" "$fstab_backup" "$sysctl_txn"
+    return 1
+  }
+  {
+    printf 'path=%s\n' "$SWAPFILE_PATH"
+    printf 'created_file=%s\n' "${state_created_file:-0}"
+    printf 'adopted=%s\n' "${adopted:-0}"
+    printf 'fstab_added=%s\n' "${fstab_added:-0}"
+  } > "$tmp_state" || {
+    rm -f -- "$tmp_state"
+    swap_transaction_rollback "$created_this_run" "$fstab_backup" "$sysctl_txn"
+    return 1
+  }
+  if ! chmod 600 "$tmp_state" 2>/dev/null \
+     || ! mv -f -- "$tmp_state" "$SWAP_STATE_PATH"; then
+    rm -f -- "$tmp_state"
+    swap_transaction_rollback "$created_this_run" "$fstab_backup" "$sysctl_txn"
+    return 1
+  fi
+  managed_file_transaction_commit "$sysctl_txn"
+  rm -f -- "$fstab_backup"
 
   echo ""
   echo -e "${G}SWAP 配置完成${N}"
@@ -1255,8 +1727,12 @@ show_swap_picker(){
     existing_size_mb=$(stat -c%s "$SWAPFILE_PATH" 2>/dev/null)
     if [ -n "$existing_size_mb" ] && [ "$existing_size_mb" -gt 0 ] 2>/dev/null; then
       existing_size_mb=$((existing_size_mb / 1024 / 1024))
-      echo -e "  ${Y}⚠ 检测到已存在 ${SWAPFILE_PATH}（约 ${existing_size_mb} MB），后续步骤会复用、不重建${N}"
-      echo -e "  ${D}  如需更换大小：先 ${C}swapoff ${SWAPFILE_PATH} && rm -f ${SWAPFILE_PATH}${D}，再回此菜单${N}"
+      if swapon --show=NAME --noheadings 2>/dev/null | grep -Fxq "$SWAPFILE_PATH"; then
+        echo -e "  ${Y}⚠ 检测到已启用 ${SWAPFILE_PATH}（约 ${existing_size_mb} MB），不会重新格式化${N}"
+        [ -f "$SWAP_STATE_PATH" ] || echo -e "  ${D}  因缺少所有权记录，后续仅在输入 ADOPT 后接管 swappiness，不会接管或删除文件${N}"
+      else
+        echo -e "  ${R}⚠ 检测到未启用的现有 ${SWAPFILE_PATH}（约 ${existing_size_mb} MB），脚本会拒绝 mkswap 以保护原内容${N}"
+      fi
       echo ""
     fi
   fi
@@ -1305,22 +1781,32 @@ show_swap_picker(){
 
 remove_swap(){
   local confirm=""
-  local tmp_file=""
+  local tmp_file="" fstab_backup="" sysctl_txn=""
+  local created_file=0 adopted=0 fstab_added=0
+  local was_active=0 rollback_ok=1 rc=0
 
   if ! require_root; then
     return 1
   fi
 
-  if [ ! -f "$SWAPFILE_PATH" ] && [ ! -f "$SWAP_SYSCTL_PATH" ] \
-     && ! grep -Eq "^[[:space:]]*${SWAPFILE_PATH}[[:space:]]" /etc/fstab 2>/dev/null; then
+  if [ ! -f "$SWAP_STATE_PATH" ]; then
     echo ""
-    echo -e "${Y}未检测到脚本创建的 SWAP，无需移除${N}"
+    echo -e "${Y}没有找到 ${SWAP_STATE_PATH}，无法证明 ${SWAPFILE_PATH} 归脚本所有。${N}"
+    echo -e "${D}为避免删除用户文件，本菜单不会关闭、删除或改写现有 SWAP/fstab。${N}"
     pause_screen
     return 0
   fi
 
+  created_file=$(awk -F= '$1 == "created_file" {print $2; exit}' "$SWAP_STATE_PATH" 2>/dev/null)
+  adopted=$(awk -F= '$1 == "adopted" {print $2; exit}' "$SWAP_STATE_PATH" 2>/dev/null)
+  fstab_added=$(awk -F= '$1 == "fstab_added" {print $2; exit}' "$SWAP_STATE_PATH" 2>/dev/null)
+
   echo ""
-  echo -e "${Y}==> 即将关闭并删除 ${C}$SWAPFILE_PATH${N}${Y}，并移除 swappiness 配置${N}"
+  if [ "$created_file" = "1" ]; then
+    echo -e "${Y}==> 即将关闭并删除脚本创建的 ${C}$SWAPFILE_PATH${N}${Y}，并恢复原 swappiness 文件${N}"
+  else
+    echo -e "${Y}==> 此 SWAP 为显式接管项：仅恢复脚本设置，保留文件、启用状态和既有 fstab 行${N}"
+  fi
   read -p "  确认继续？(y/N): " confirm
   if [ "$confirm" != "y" ] && [ "$confirm" != "Y" ]; then
     echo -e "  已取消"
@@ -1328,33 +1814,88 @@ remove_swap(){
     return 0
   fi
 
-  if swapon --show=NAME --noheadings 2>/dev/null | grep -Fxq "$SWAPFILE_PATH"; then
+  fstab_backup=$(mktemp "${TMPDIR:-/tmp}/leyili-fstab-remove.XXXXXX") || return 1
+  cp -a -- /etc/fstab "$fstab_backup" || { rm -f -- "$fstab_backup"; return 1; }
+  if [ "$fstab_added" = "1" ]; then
+    tmp_file=$(mktemp /etc/fstab.tmp.XXXXXX) || { rm -f -- "$fstab_backup"; return 1; }
+    if ! awk -v p="$SWAPFILE_PATH" '
+      /^# Managed by Leyili SWAP$/ {pending=1; next}
+      pending && $1 == p && $3 == "swap" {pending=0; next}
+      {if (pending) {print "# Managed by Leyili SWAP"; pending=0} print}
+      END {if (pending) print "# Managed by Leyili SWAP"}
+    ' /etc/fstab > "$tmp_file"; then
+      rm -f -- "$tmp_file" "$fstab_backup"
+      return 1
+    fi
+    if ! chmod --reference=/etc/fstab "$tmp_file" 2>/dev/null \
+       || ! chown --reference=/etc/fstab "$tmp_file" 2>/dev/null \
+       || ! mv -f -- "$tmp_file" /etc/fstab; then
+      rm -f -- "$tmp_file" "$fstab_backup"
+      return 1
+    fi
+  fi
+
+  sysctl_txn=$(managed_file_transaction_begin "$SWAP_SYSCTL_PATH" 'Managed by Leyili') || {
+    if restore_file_snapshot "$fstab_backup" /etc/fstab; then
+      rm -f -- "$fstab_backup"
+    else
+      echo -e "${R}SWAP sysctl 快照失败，且 fstab 恢复失败；快照保留在 ${fstab_backup}${N}" >&2
+    fi
+    return 1
+  }
+  if ! managed_file_restore "$SWAP_SYSCTL_PATH" \
+     || ! sysctl --system >/dev/null 2>&1; then
+    managed_file_transaction_rollback "$SWAP_SYSCTL_PATH" "$sysctl_txn" || rollback_ok=0
+    restore_file_snapshot "$fstab_backup" /etc/fstab || rollback_ok=0
+    [ "$rollback_ok" -eq 1 ] && rm -f -- "$fstab_backup"
+    echo -e "${R}恢复原 swappiness 失败，已尝试回滚，SWAP 文件未删除${N}"
+    pause_screen
+    return 1
+  fi
+
+  if [ "$created_file" = "1" ] \
+     && awk -v p="$SWAPFILE_PATH" 'NR > 1 && $1 == p {found=1} END {exit !found}' /proc/swaps 2>/dev/null; then
+    was_active=1
     echo -e "${Y}==> 关闭 SWAP...${N}"
     if ! swapoff "$SWAPFILE_PATH"; then
-      echo -e "${R}关闭 SWAP 失败，可能存在占用${N}"
+      managed_file_transaction_rollback "$SWAP_SYSCTL_PATH" "$sysctl_txn" || rollback_ok=0
+      restore_file_snapshot "$fstab_backup" /etc/fstab || rollback_ok=0
+      [ "$rollback_ok" -eq 1 ] && rm -f -- "$fstab_backup"
+      echo -e "${R}关闭 SWAP 失败，已尝试恢复 fstab 与 swappiness，文件未删除${N}"
       pause_screen
       return 1
     fi
   fi
 
-  if [ -f "$SWAPFILE_PATH" ]; then
-    rm -f "$SWAPFILE_PATH"
+  if [ "$created_file" = "1" ] && [ -f "$SWAPFILE_PATH" ]; then
+    if ! rm -f -- "$SWAPFILE_PATH"; then
+      [ "$was_active" -eq 1 ] && swapon "$SWAPFILE_PATH" >/dev/null 2>&1 || {
+        [ "$was_active" -eq 0 ] || rollback_ok=0
+      }
+      managed_file_transaction_rollback "$SWAP_SYSCTL_PATH" "$sysctl_txn" || rollback_ok=0
+      restore_file_snapshot "$fstab_backup" /etc/fstab || rollback_ok=0
+      [ "$rollback_ok" -eq 1 ] && rm -f -- "$fstab_backup"
+      echo -e "${R}删除 SWAP 文件失败，已尝试恢复启用状态、fstab 与 swappiness${N}"
+      pause_screen
+      return 1
+    fi
   fi
 
-  if grep -Eq "^[[:space:]]*${SWAPFILE_PATH}[[:space:]]" /etc/fstab 2>/dev/null; then
-    tmp_file=$(mktemp)
-    awk -v p="$SWAPFILE_PATH" '$1 != p {print}' /etc/fstab > "$tmp_file" && mv "$tmp_file" /etc/fstab
-  fi
-
-  if [ -f "$SWAP_SYSCTL_PATH" ]; then
-    rm -f "$SWAP_SYSCTL_PATH"
-    sysctl --system >/dev/null 2>&1 || true
-  fi
+  managed_file_transaction_commit "$sysctl_txn" || rc=1
+  rm -f -- "$SWAP_STATE_PATH" || rc=1
+  rm -f -- "$fstab_backup" || rc=1
 
   echo ""
-  echo -e "${G}SWAP 已移除${N}"
+  if [ "$rc" -ne 0 ]; then
+    echo -e "${R}SWAP 已按确认执行，但状态/临时文件清理不完整，请检查 ${SWAP_STATE_PATH}${N}"
+  elif [ "$created_file" = "1" ]; then
+    echo -e "${G}脚本创建的 SWAP 已删除（不可恢复）；原 swappiness 文件已恢复${N}"
+  else
+    echo -e "${G}脚本的 SWAP 设置已移除；接管前的 SWAP 文件与挂载保持不变${N}"
+  fi
   free -h
   pause_screen
+  return "$rc"
 }
 
 # ─── 脚本自更新 / 配置管理 ────────────────────────────

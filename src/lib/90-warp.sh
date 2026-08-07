@@ -3,6 +3,51 @@ warp_log_info() { echo -e "  ${C}●${N} $*" >&2; }
 warp_log_warn() { echo -e "  ${Y}⚠${N} $*" >&2; }
 warp_log_err()  { echo -e "  ${R}✗${N} $*" >&2; }
 
+warp_transaction_begin(){
+  local txn
+  txn=$(config_transaction_begin warp) || return 1
+  if [ -d "$WARP_DIR" ]; then
+    cp -a -- "$WARP_DIR" "$txn/warp-dir" || { config_transaction_rollback "$txn"; return 1; }
+    : > "$txn/warp-dir.existed"
+  fi
+  if [ -f "$WARP_WGCF_BIN" ]; then
+    cp -a -- "$WARP_WGCF_BIN" "$txn/wgcf-bin" || { config_transaction_rollback "$txn"; return 1; }
+    : > "$txn/wgcf-bin.existed"
+  fi
+  printf '%s' "$txn"
+}
+
+warp_transaction_rollback(){
+  local txn="$1" rc=0
+  [ -d "$txn" ] || return 1
+  config_transaction_restore "$txn" || rc=1
+
+  if ! rm -rf -- "$WARP_DIR"; then
+    rc=1
+  elif [ -f "$txn/warp-dir.existed" ]; then
+    if ! mkdir -p -- "$(dirname -- "$WARP_DIR")" \
+       || ! cp -a -- "$txn/warp-dir" "$WARP_DIR"; then
+      rc=1
+    fi
+  fi
+  if [ -f "$txn/wgcf-bin.existed" ]; then
+    if ! restore_file_snapshot "$txn/wgcf-bin" "$WARP_WGCF_BIN"; then
+      rc=1
+    fi
+  else
+    rm -f -- "$WARP_WGCF_BIN" || rc=1
+  fi
+  if [ "$rc" -eq 0 ]; then
+    rm -rf -- "$txn" || rc=1
+  fi
+  [ "$rc" -eq 0 ] || warp_log_err "WARP 事务回滚有步骤失败，请检查账号与 sing-box 配置；快照保留在 ${txn}"
+  return "$rc"
+}
+
+warp_transaction_commit(){
+  config_transaction_commit "$1"
+}
+
 # ── 账号注册：curl 直连 Cloudflare API（wgcf 方案已废弃）──────────────
 # 旧版用 wgcf 二进制：要从 GitHub API 拿版本再下 release（VPS 上极易被限流/
 # 阻断），且 Cloudflare 收紧注册接口后老版本 wgcf 频繁 403/429 —— 这就是旧版
@@ -34,13 +79,27 @@ warp_gen_keypair(){
   printf '%s %s\n' "$priv" "$pub"
 }
 
+warp_account_valid(){
+  [ -s "$WARP_ACCOUNT_JSON" ] || return 1
+  jq -e '
+    (.private_key | type == "string" and length > 0)
+    and (.config.interface.addresses.v4 | type == "string" and length > 0)
+    and (.config.peers[0].public_key | type == "string" and length > 0)
+  ' "$WARP_ACCOUNT_JSON" >/dev/null 2>&1
+}
+
 warp_register_account(){
-  mkdir -p "$WARP_DIR"
-  chmod 700 "$WARP_DIR" 2>/dev/null || true
-  if [ -s "$WARP_ACCOUNT_JSON" ]; then
+  local force="${1:-0}"
+  mkdir -p "$WARP_DIR" || return 1
+  chmod 700 "$WARP_DIR" || return 1
+  ensure_jq || return 1
+  if [ -s "$WARP_ACCOUNT_JSON" ] && [ "$force" != "1" ]; then
+    if ! warp_account_valid; then
+      warp_log_err "现有 account.json 无效，已拒绝覆盖；请使用“重新注册账号”"
+      return 1
+    fi
     return 0
   fi
-  ensure_jq || return 1
 
   local priv pub
   read -r priv pub <<< "$(warp_gen_keypair)"
@@ -48,7 +107,7 @@ warp_register_account(){
     return 1
   fi
 
-  local install_id fcm_token body resp try
+  local install_id fcm_token body resp try tmp
   install_id=$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 22)
   fcm_token="${install_id}:APA91b$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 134)"
   body=$(jq -nc --arg key "$pub" --arg iid "$install_id" --arg fcm "$fcm_token" \
@@ -59,7 +118,7 @@ warp_register_account(){
   warp_log_info "向 Cloudflare 注册 WARP 账号（直连 API，不下载任何二进制）..."
   resp=""
   for try in 1 2 3 4 5 6; do
-    resp=$(curl -sL --tlsv1.2 --max-time 20 -X POST "${WARP_API_BASE}/reg" \
+    resp=$(curl --proto '=https' --proto-redir '=https' -sL --tlsv1.2 --max-time 20 -X POST "${WARP_API_BASE}/reg" \
       -H "User-Agent: ${WARP_API_UA}" \
       -H "CF-Client-Version: ${WARP_API_CLIENT_VER}" \
       -H 'Content-Type: application/json' \
@@ -82,26 +141,33 @@ warp_register_account(){
   fi
 
   # 兼容有无 .result 包裹两种返回，并把我们自己的私钥合进去一起落盘
+  tmp=$(mktemp "${WARP_ACCOUNT_JSON}.tmp.XXXXXX") || return 1
   if ! printf '%s' "$resp" | jq --arg pk "$priv" '(.result // .) + {private_key: $pk}' \
-       > "$WARP_ACCOUNT_JSON" 2>/dev/null; then
+       > "$tmp" 2>/dev/null \
+     || ! jq -e '
+          (.private_key | type == "string" and length > 0)
+          and (.config.interface.addresses.v4 | type == "string" and length > 0)
+          and (.config.peers[0].public_key | type == "string" and length > 0)
+        ' "$tmp" >/dev/null 2>&1; then
     warp_log_err "写入 ${WARP_ACCOUNT_JSON} 失败"
-    rm -f "$WARP_ACCOUNT_JSON"
+    rm -f -- "$tmp"
     return 1
   fi
-  chmod 600 "$WARP_ACCOUNT_JSON" 2>/dev/null || true
+  chmod 600 "$tmp" || { rm -f -- "$tmp"; return 1; }
+  mv -f -- "$tmp" "$WARP_ACCOUNT_JSON" || { rm -f -- "$tmp"; return 1; }
   warp_log_ok "WARP 账号已注册：${WARP_ACCOUNT_JSON}"
 }
 
 warp_reregister_account(){
-  # 连旧版 wgcf 的残留一起清，保证走新注册链路
-  rm -f "$WARP_ACCOUNT_JSON" "${WARP_DIR}/wgcf-account.toml" "${WARP_DIR}/wgcf-profile.conf"
-  warp_register_account
+  # 新账号先原子落盘；失败时旧 account.json 保持不变。
+  warp_register_account 1 || return 1
+  rm -f -- "${WARP_DIR}/wgcf-account.toml" "${WARP_DIR}/wgcf-profile.conf"
 }
 
-# 解析 account.json，输出 KEY='VALUE' 行供 eval 使用。
+# 解析 account.json，直接写入调用者作用域中的 WARP_* 变量，避免 eval。
 # WARP_RESERVED 为 client_id base64 解码出的 3 字节（逗号分隔），注入
 # endpoint.peers[].reserved；解不出时回退 0,0,0 并靠端点优选兜底
-warp_parse_profile(){
+warp_load_profile(){
   local f="$WARP_ACCOUNT_JSON"
   if [ ! -s "$f" ]; then
     if [ -f "${WARP_DIR}/wgcf-profile.conf" ]; then
@@ -112,13 +178,18 @@ warp_parse_profile(){
     return 1
   fi
   ensure_jq || return 1
-  local pk v4 v6 peerpk cid reserved
+  local pk v4 v6 peerpk cid reserved v4_plain v6_plain
   pk=$(jq -r '.private_key // empty' "$f" 2>/dev/null)
   v4=$(jq -r '.config.interface.addresses.v4 // empty' "$f" 2>/dev/null)
   v6=$(jq -r '.config.interface.addresses.v6 // empty' "$f" 2>/dev/null)
   peerpk=$(jq -r '.config.peers[0].public_key // empty' "$f" 2>/dev/null)
   cid=$(jq -r '.config.client_id // empty' "$f" 2>/dev/null)
-  if [ -z "$pk" ] || [ -z "$v4" ]; then
+  v4_plain="${v4%%/*}"
+  v6_plain="${v6%%/*}"
+  if [ -z "$pk" ] || [ -z "$v4" ] \
+     || ! printf '%s' "$pk" | grep -Eq '^[A-Za-z0-9+/]{43}=$' \
+     || ! is_valid_ipv4 "$v4_plain" \
+     || { [ -n "$v6" ] && ! is_valid_ipv6_text "$v6_plain"; }; then
     warp_log_err "解析 account.json 失败（缺 private_key 或 v4 地址），请「重新注册」"
     return 1
   fi
@@ -131,11 +202,11 @@ warp_parse_profile(){
       | awk 'NF >= 3 {printf "%d,%d,%d", $1, $2, $3; exit}')
   fi
   [ -n "$reserved" ] || reserved="0,0,0"
-  printf "WARP_PRIVATE_KEY='%s'\n" "$pk"
-  printf "WARP_LOCAL_V4='%s'\n"    "$v4"
-  printf "WARP_LOCAL_V6='%s'\n"    "$v6"
-  printf "WARP_PEER_PK='%s'\n"     "${peerpk:-$WARP_PEER_PUBLIC_KEY}"
-  printf "WARP_RESERVED='%s'\n"    "$reserved"
+  WARP_PRIVATE_KEY="$pk"
+  WARP_LOCAL_V4="$v4"
+  WARP_LOCAL_V6="$v6"
+  WARP_PEER_PK="${peerpk:-$WARP_PEER_PUBLIC_KEY}"
+  WARP_RESERVED="$reserved"
 }
 
 # sing-box 版本护栏：endpoints 需 1.11+，本模块骨架用的新版 DNS/route 字段
@@ -161,7 +232,7 @@ warp_jq_apply(){
   local jq_filter="$1"
   shift
   local tmp
-  tmp=$(mktemp) || return 1
+  tmp=$(mktemp "${CONFIG_PATH}.tmp.XXXXXX") || return 1
   if ! jq "$@" "$jq_filter" "$CONFIG_PATH" > "$tmp" 2>/dev/null; then
     rm -f "$tmp"
     return 1
@@ -172,7 +243,8 @@ warp_jq_apply(){
     rm -f "$tmp"
     return 1
   fi
-  mv "$tmp" "$CONFIG_PATH"
+  chmod 600 "$tmp" || { rm -f -- "$tmp"; return 1; }
+  mv -f -- "$tmp" "$CONFIG_PATH"
 }
 
 # 读当前配置里 WARP endpoint 实际使用的 host port（没有则回退默认值）
@@ -190,10 +262,38 @@ warp_current_endpoint(){
   esac
 }
 
+warp_managed_state_get(){
+  local key="$1"
+  [ -f "$WARP_MANAGED_STATE" ] || return 1
+  grep -m1 "^${key}=" "$WARP_MANAGED_STATE" | cut -d= -f2-
+}
+
+warp_capture_managed_state(){
+  local tmp cache_added=0 cache_path=""
+  [ -f "$WARP_MANAGED_STATE" ] && return 0
+  mkdir -p -- "$WARP_DIR" || return 1
+  chmod 700 "$WARP_DIR" || return 1
+
+  if jq -e '.experimental.cache_file != null' "$CONFIG_PATH" >/dev/null 2>&1; then
+    cache_path=$(jq -r '.experimental.cache_file.path // empty' "$CONFIG_PATH" 2>/dev/null)
+  else
+    cache_added=1
+    cache_path="$WARP_CACHE_DEFAULT"
+  fi
+  tmp=$(mktemp "${WARP_MANAGED_STATE}.tmp.XXXXXX") || return 1
+  if ! printf 'CacheFileAdded=%s\nCachePath=%s\n' "$cache_added" "$cache_path" > "$tmp"; then
+    rm -f -- "$tmp"
+    return 1
+  fi
+  chmod 600 "$tmp" || { rm -f -- "$tmp"; return 1; }
+  mv -f -- "$tmp" "$WARP_MANAGED_STATE"
+}
+
 warp_config_inject(){
   local v4="$1" v6="$2" pk="$3" peerpk="${4:-$WARP_PEER_PUBLIC_KEY}" reserved="${5:-0,0,0}"
   ensure_jq || return 1
   [ -f "$CONFIG_PATH" ] || { warp_log_err "config.json 不存在：$CONFIG_PATH"; return 1; }
+  warp_capture_managed_state || return 1
   # 骨架兜底：保证 dns local 解析器 + route.default_domain_resolver 存在
   # （WireGuard endpoint 是用户态网络栈，拨域名必须有内部解析器，否则命中规则的流量全断）
   config_ensure_skeleton || return 1
@@ -210,6 +310,9 @@ warp_config_inject(){
 
   warp_log_info "注入 WARP endpoint / 规则集 / 路由规则..."
   warp_jq_apply '
+      def owned_sniff:
+        ((.action // "") == "sniff")
+        and (((.inbound // []) | sort) == (($sniff_inbounds | fromjson) | sort));
       .endpoints = ((.endpoints // []) | map(select(.tag != $tag)))
         + [{
             "type": "wireguard",
@@ -246,8 +349,8 @@ warp_config_inject(){
             "update_interval": "168h0m0s"
           }]
     | .route.rules = (
-        [{"action": "sniff"}]
-        + ((.route.rules // []) | map(select(((.outbound // "") != $tag) and ((.action // "") != "sniff"))))
+        [{"inbound": ($sniff_inbounds | fromjson), "action": "sniff"}]
+        + ((.route.rules // []) | map(select(((.outbound // "") != $tag) and (owned_sniff | not))))
         + [{"rule_set": [$rs, $rsyt], "outbound": $tag}]
       )
     | .experimental = (.experimental // {})
@@ -264,21 +367,42 @@ warp_config_inject(){
     --arg pk      "$pk" \
     --arg peerpk  "$peerpk" \
     --arg reserved "$reserved" \
+    --arg sniff_inbounds "$WARP_SNIFF_INBOUNDS_JSON" \
     --arg addrs   "$addr_json"
 }
 
 warp_config_remove(){
+  local remove_cache="0" cache_path=""
   ensure_jq || return 1
   [ -f "$CONFIG_PATH" ] || return 0
-  warp_jq_apply '
+  remove_cache=$(warp_managed_state_get CacheFileAdded 2>/dev/null || echo 0)
+  cache_path=$(warp_managed_state_get CachePath 2>/dev/null || true)
+  if ! warp_jq_apply '
+      def owned_sniff:
+        ((.action // "") == "sniff")
+        and (((.inbound // []) | sort) == (($sniff_inbounds | fromjson) | sort));
       .endpoints = ((.endpoints // []) | map(select(.tag != $tag)))
     | .route = (.route // {})
     | .route.rule_set = ((.route.rule_set // []) | map(select(.tag != $rs and .tag != $rsyt)))
-    | .route.rules = ((.route.rules // []) | map(select(((.outbound // "") != $tag) and ((.action // "") != "sniff"))))
+    | .route.rules = ((.route.rules // []) | map(select(((.outbound // "") != $tag) and (owned_sniff | not))))
+    | if $remove_cache == "1" then .experimental |= del(.cache_file) else . end
+    | if .experimental == {} then del(.experimental) else . end
   ' \
     --arg tag  "$WARP_OUTBOUND_TAG" \
     --arg rs   "$WARP_RULESET_TAG" \
-    --arg rsyt "$WARP_RULESET_TAG_YT"
+    --arg rsyt "$WARP_RULESET_TAG_YT" \
+    --arg sniff_inbounds "$WARP_SNIFF_INBOUNDS_JSON" \
+    --arg remove_cache "$remove_cache"; then
+    return 1
+  fi
+  if [ "$remove_cache" = "1" ] && [ -n "$cache_path" ]; then
+    case "$cache_path" in
+      /var/lib/sing-box/*|/var/cache/leyili/*)
+        rm -f -- "$cache_path" || return 1
+        ;;
+    esac
+  fi
+  rm -f -- "$WARP_MANAGED_STATE"
 }
 
 warp_config_has_outbound(){
@@ -309,24 +433,33 @@ warp_do_install(){
   echo ""
 
   warp_require_singbox_112 || { pause_screen; return 1; }
-  warp_register_account    || { pause_screen; return 1; }
 
-  local kv
-  kv=$(warp_parse_profile) || { pause_screen; return 1; }
-  eval "$kv"
+  local txn WARP_PRIVATE_KEY WARP_LOCAL_V4 WARP_LOCAL_V6 WARP_PEER_PK WARP_RESERVED
+  txn=$(warp_transaction_begin) || { warp_log_err "WARP 事务快照失败"; pause_screen; return 1; }
+  if ! warp_register_account || ! warp_load_profile; then
+    warp_transaction_rollback "$txn"
+    pause_screen
+    return 1
+  fi
 
-  warp_config_inject "$WARP_LOCAL_V4" "$WARP_LOCAL_V6" "$WARP_PRIVATE_KEY" "$WARP_PEER_PK" "$WARP_RESERVED" \
-    || { warp_log_err "写入 sing-box 配置失败"; pause_screen; return 1; }
+  if ! warp_config_inject "$WARP_LOCAL_V4" "$WARP_LOCAL_V6" "$WARP_PRIVATE_KEY" "$WARP_PEER_PK" "$WARP_RESERVED"; then
+    warp_transaction_rollback "$txn"
+    warp_log_err "写入 sing-box 配置失败，已恢复原状态"
+    pause_screen
+    return 1
+  fi
   warp_log_ok "sing-box 配置已更新"
 
   warp_log_info "重启 sing-box..."
   if config_check_and_restart; then
     warp_log_ok "sing-box 已重启，WARP 分流生效"
   else
-    warp_log_err "sing-box 重启失败，请用 journalctl -u sing-box 查看"
+    warp_transaction_rollback "$txn"
+    warp_log_err "sing-box 重启失败，已恢复原账号与配置"
     pause_screen
     return 1
   fi
+  warp_transaction_commit "$txn"
 
   echo ""
   warp_do_test
@@ -341,40 +474,56 @@ warp_do_uninstall(){
   read -r -p "  确认卸载？[y/N]: " yn
   case "$yn" in [yY]*) ;; *) return ;; esac
 
-  warp_config_remove || { warp_log_err "移除失败"; pause_screen; return 1; }
-  config_check_and_restart >/dev/null 2>&1 || true
-  warp_log_ok "已从 sing-box 配置中移除 WARP"
-
   read -r -p "  是否同时删除账号目录 ${WARP_DIR}（含 account.json 与旧版 wgcf 残留）？[y/N]: " yn2
+
+  local txn
+  txn=$(warp_transaction_begin) || { warp_log_err "WARP 事务快照失败"; pause_screen; return 1; }
+  if ! warp_config_remove || ! config_check_and_restart; then
+    warp_transaction_rollback "$txn"
+    warp_log_err "移除失败，已恢复原配置"
+    pause_screen
+    return 1
+  fi
   case "$yn2" in
     [yY]*)
-      rm -f "$WARP_WGCF_BIN"
-      rm -rf "$WARP_DIR"
-      warp_log_ok "账号文件与旧版 wgcf 残留已清理"
+      if ! rm -f -- "$WARP_WGCF_BIN" || ! rm -rf -- "$WARP_DIR"; then
+        warp_transaction_rollback "$txn"
+        warp_log_err "账号文件清理失败，已恢复原状态"
+        pause_screen
+        return 1
+      fi
       ;;
   esac
+  warp_transaction_commit "$txn"
+  warp_log_ok "已从 sing-box 配置中移除 WARP"
+  case "$yn2" in [yY]*) warp_log_ok "账号文件与旧版 wgcf 残留已清理" ;; esac
   pause_screen
 }
 
 warp_do_reregister(){
   require_root || return 1
+  require_singbox_installed || return 1
+  ensure_jq || return 1
   render_section_header "${WARP_APP_NAME} - 重新注册账号"
   echo -e "  ${D}用途：当前 WARP IP 仍被识别为中国，或握手异常时使用${N}"
-  echo -e "  ${D}流程：删旧账号 → 重新 register → 重新写 sing-box 配置 → 重启 sing-box${N}"
+  echo -e "  ${D}流程：原子生成新账号 → 重新写配置 → 健康检查；失败自动恢复旧账号${N}"
   echo ""
   read -r -p "  确认重新注册？[y/N]: " yn
   case "$yn" in [yY]*) ;; *) return ;; esac
 
-  warp_reregister_account || { pause_screen; return 1; }
-
-  local kv
-  kv=$(warp_parse_profile) || { pause_screen; return 1; }
-  eval "$kv"
-
-  warp_config_inject "$WARP_LOCAL_V4" "$WARP_LOCAL_V6" "$WARP_PRIVATE_KEY" "$WARP_PEER_PK" "$WARP_RESERVED" \
-    || { pause_screen; return 1; }
-  config_check_and_restart && warp_log_ok "完成，已切到新的 WARP 账号" \
-                          || warp_log_err "sing-box 重启失败"
+  local txn WARP_PRIVATE_KEY WARP_LOCAL_V4 WARP_LOCAL_V6 WARP_PEER_PK WARP_RESERVED
+  txn=$(warp_transaction_begin) || { warp_log_err "WARP 事务快照失败"; pause_screen; return 1; }
+  if ! warp_reregister_account \
+     || ! warp_load_profile \
+     || ! warp_config_inject "$WARP_LOCAL_V4" "$WARP_LOCAL_V6" "$WARP_PRIVATE_KEY" "$WARP_PEER_PK" "$WARP_RESERVED" \
+     || ! config_check_and_restart; then
+    warp_transaction_rollback "$txn"
+    warp_log_err "重新注册失败，已恢复旧账号与配置"
+    pause_screen
+    return 1
+  fi
+  warp_transaction_commit "$txn"
+  warp_log_ok "完成，已切到新的 WARP 账号"
   pause_screen
 }
 
@@ -431,10 +580,8 @@ warp_do_status(){
 # 注意：与主进程共用同一 WARP 账号，并发握手会漂移，测试期间主配置分流可能短暂中断。
 warp_probe_via_tunnel(){
   local host="$1" port="$2"
-  local kv
-  kv=$(warp_parse_profile) || return 1
   local WARP_PRIVATE_KEY WARP_LOCAL_V4 WARP_LOCAL_V6 WARP_PEER_PK WARP_RESERVED
-  eval "$kv"
+  warp_load_profile || return 1
 
   local addr_json
   if [ -n "$WARP_LOCAL_V6" ]; then
@@ -561,27 +708,33 @@ warp_do_endpoint_pick(){
   echo -e "  ${D}测试期间 WARP 分流可能短暂中断，完成后自动恢复${N}"
   echo ""
 
-  local cand host port trace
+  local cand host port trace txn
   for cand in $WARP_ENDPOINT_CANDIDATES; do
     host="${cand%:*}"
     port="${cand##*:}"
     warp_log_info "测试 ${cand} ..."
     if trace=$(warp_probe_via_tunnel "$host" "$port"); then
       warp_log_ok "可用：${cand}"
+      txn=$(warp_transaction_begin) || { warp_log_err "WARP 事务快照失败"; pause_screen; return 1; }
       if ! warp_jq_apply '
           .endpoints = ((.endpoints // []) | map(
             if .tag == $tag
             then (.peers[0].address = $host | .peers[0].port = ($port | tonumber))
             else . end))
         ' --arg tag "$WARP_OUTBOUND_TAG" --arg host "$host" --arg port "$port"; then
-        warp_log_err "写入配置失败"
+        warp_transaction_rollback "$txn"
+        warp_log_err "写入配置失败，已恢复原端点"
         pause_screen
         return 1
       fi
       if config_check_and_restart; then
+        warp_transaction_commit "$txn"
         warp_log_ok "已切换端点为 ${cand} 并重启 sing-box"
       else
-        warp_log_err "sing-box 重启失败，请用 journalctl -u sing-box 查看"
+        warp_transaction_rollback "$txn"
+        warp_log_err "sing-box 重启失败，已恢复原端点"
+        pause_screen
+        return 1
       fi
       pause_screen
       return 0
@@ -599,6 +752,8 @@ warp_do_endpoint_pick(){
 # 适用：老版本装的 WARP（缺 YouTube 规则集、缺域名嗅探、缺 DNS 解析器）升级修复
 warp_do_reinject(){
   require_root || return 1
+  require_singbox_installed || return 1
+  ensure_jq || return 1
   render_section_header "${WARP_APP_NAME} - 重新注入分流规则"
   echo -e "  ${D}用途：升级旧配置（补 YouTube 规则集 / 域名嗅探 / DNS 解析器 / reserved 字段）或修复被改坏的规则${N}"
   echo -e "  ${D}不改 WARP 账号，不改已优选的端点${N}"
@@ -606,14 +761,18 @@ warp_do_reinject(){
 
   warp_require_singbox_112 || { pause_screen; return 1; }
 
-  local kv
-  kv=$(warp_parse_profile) || { pause_screen; return 1; }
-  eval "$kv"
-
-  warp_config_inject "$WARP_LOCAL_V4" "$WARP_LOCAL_V6" "$WARP_PRIVATE_KEY" "$WARP_PEER_PK" "$WARP_RESERVED" \
-    || { pause_screen; return 1; }
-  config_check_and_restart && warp_log_ok "规则已重新注入，sing-box 已重启" \
-                          || warp_log_err "sing-box 重启失败，请用 journalctl -u sing-box 查看"
+  local txn WARP_PRIVATE_KEY WARP_LOCAL_V4 WARP_LOCAL_V6 WARP_PEER_PK WARP_RESERVED
+  warp_load_profile || { pause_screen; return 1; }
+  txn=$(warp_transaction_begin) || { warp_log_err "WARP 事务快照失败"; pause_screen; return 1; }
+  if ! warp_config_inject "$WARP_LOCAL_V4" "$WARP_LOCAL_V6" "$WARP_PRIVATE_KEY" "$WARP_PEER_PK" "$WARP_RESERVED" \
+     || ! config_check_and_restart; then
+    warp_transaction_rollback "$txn"
+    warp_log_err "重新注入失败，已恢复原配置"
+    pause_screen
+    return 1
+  fi
+  warp_transaction_commit "$txn"
+  warp_log_ok "规则已重新注入，sing-box 已重启"
   pause_screen
 }
 

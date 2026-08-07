@@ -5,6 +5,7 @@ install_anytls_node(){
   local install_mode="ipv4" mode_label=""
   local PORT SNI TAG LISTEN_CHOICE LISTEN_ADDR PASSWORD confirm
   local default_port default_sni keypair private_key public_key short_id
+  local txn="" old_port="" old_mode="ipv4"
 
   if ! require_root; then return 1; fi
 
@@ -41,6 +42,8 @@ install_anytls_node(){
       echo -e "  已取消"
       return 0
     fi
+    old_port=$(get_node_value anytls Port 2>/dev/null || true)
+    old_mode=$(get_node_value anytls Mode 2>/dev/null || echo ipv4)
   fi
 
   # ── 端口（默认随机，避开 reality 端口与已占端口）
@@ -59,7 +62,7 @@ install_anytls_node(){
       echo -e "${R}端口与 Reality 节点冲突（Reality 已使用 ${reality_port}）${N}"
       continue
     fi
-    if check_port_in_use "$PORT"; then
+    if [ "$PORT" != "$old_port" ] && check_port_in_use "$PORT" tcp; then
       echo -e "${R}端口 ${PORT} 已被其他服务占用${N}"
       local force_port=""
       read -p "  仍然使用此端口？(y/N): " force_port
@@ -165,6 +168,7 @@ install_anytls_node(){
 
   echo -e "${Y}==> 写入配置...${N}"
   ensure_jq || { pause_screen; return 1; }
+  txn=$(node_transaction_begin anytls) || { echo -e "${R}节点事务快照失败${N}"; pause_screen; return 1; }
 
   local inbound_json
   inbound_json=$(jq -n \
@@ -192,20 +196,27 @@ install_anytls_node(){
     }')
 
   if ! config_add_inbound "$inbound_json"; then
+    node_transaction_rollback "$txn"
     echo -e "${R}写入 inbound 失败${N}"
     pause_screen
     return 1
   fi
 
   echo -e "${Y}==> 校验并启动...${N}"
-  if ! config_check_and_restart; then
+  if ! config_check_and_restart "$PORT" tcp; then
+    node_transaction_rollback "$txn"
     echo ""
     echo -e "${R}sing-box 校验或重启失败${N}"
     pause_screen
     return 1
   fi
 
-  node_apply_firewall_for_mode "$PORT" tcp "$install_mode"
+  if ! node_apply_firewall_for_mode "$PORT" tcp "$install_mode"; then
+    node_transaction_rollback "$txn"
+    echo -e "${R}防火墙放行失败，节点配置已回滚${N}"
+    pause_screen
+    return 1
+  fi
   print_firewall_hint "$PORT" tcp "AnyTLS 节点入站"
 
   link=$(build_anytls_link "$PASSWORD" "$access_ip" "$PORT" "$SNI" "$public_key" "$short_id" "$TAG" 2>/dev/null || true)
@@ -213,8 +224,7 @@ install_anytls_node(){
     ipv6_link=$(build_anytls_link "$PASSWORD" "$public_ipv6" "$PORT" "$SNI" "$public_key" "$short_id" "${TAG}-ipv6" 2>/dev/null || true)
   fi
 
-  ensure_nodes_dir
-  cat > "$(node_info_path anytls)" <<EOF
+  if ! write_node_info_file anytls <<EOF
 Type=anytls
 Tag=$TAG
 Mode=$install_mode
@@ -228,6 +238,22 @@ ShortID=$short_id
 IP=$access_ip
 Link=$link
 EOF
+  then
+    node_transaction_rollback "$txn"
+    echo -e "${R}节点信息保存失败，已完整回滚${N}"
+    pause_screen
+    return 1
+  fi
+
+  if [ -n "$old_port" ] && [ "$old_port" != "$PORT" ]; then
+    if ! node_revoke_firewall_for_mode "$old_port" tcp "$old_mode"; then
+      node_transaction_rollback "$txn"
+      echo -e "${R}旧端口防火墙清理失败，已完整回滚${N}"
+      pause_screen
+      return 1
+    fi
+  fi
+  node_transaction_commit "$txn"
 
   register_sb_command || true
 
@@ -268,6 +294,7 @@ install_tuic_node(){
   local public_ipv4="" public_ipv6="" access_ip=""
   local link="" ipv6_link="" mode_label="" confirm
   local cert_paths cert_path key_path
+  local txn="" old_port="" old_mode="ipv4"
 
   if ! require_root; then return 1; fi
 
@@ -282,6 +309,8 @@ install_tuic_node(){
       echo -e "  已取消"
       return 0
     fi
+    old_port=$(get_node_value tuic Port 2>/dev/null || true)
+    old_mode=$(get_node_value tuic Mode 2>/dev/null || echo ipv4)
   fi
 
   # 端口（默认随机高位 UDP，复用 hy2 的端口生成器）
@@ -292,6 +321,14 @@ install_tuic_node(){
     PORT="${port_input:-$default_port}"
     if validate_port "$PORT"; then
       PORT=$((10#$PORT))
+      if [ "$PORT" != "$old_port" ] && check_port_in_use "$PORT" udp; then
+        echo -e "${R}UDP 端口 ${PORT} 已被其他服务占用${N}"
+        local force_port=""
+        read -p "  仍然使用此端口？(y/N): " force_port
+        if [ "$force_port" != "y" ] && [ "$force_port" != "Y" ]; then
+          continue
+        fi
+      fi
       break
     fi
     echo -e "${R}端口必须是 1-65535 的数字${N}"
@@ -416,40 +453,59 @@ install_tuic_node(){
 
   mode_label=$(describe_install_mode "$install_mode")
 
+  echo -e "${Y}==> 建立节点事务快照...${N}"
+  ensure_jq || { pause_screen; return 1; }
+  txn=$(node_transaction_begin tuic) || { echo -e "${R}节点事务快照失败${N}"; pause_screen; return 1; }
+
   # 准备证书
   if [ "$cert_source" = "self" ]; then
     echo -e "${Y}==> 生成自签证书...${N}"
-    cert_paths=$(generate_self_signed_cert_for_tuic "$SNI") || { pause_screen; return 1; }
+    if ! cert_paths=$(generate_self_signed_cert_for_tuic "$SNI"); then
+      node_transaction_rollback "$txn"
+      pause_screen
+      return 1
+    fi
     cert_path=$(echo "$cert_paths" | sed -n '1p')
     key_path=$(echo "$cert_paths" | sed -n '2p')
   fi
 
   echo -e "${Y}==> 写入配置...${N}"
-  ensure_jq || { pause_screen; return 1; }
 
   local tls_json
   if [ "$cert_source" = "acme" ]; then
-    tls_json=$(jq -n --arg sni "$SNI" --arg email "$acme_email" '{
+    if ! tls_json=$(jq -n --arg sni "$SNI" --arg email "$acme_email" '{
       enabled: true,
       server_name: $sni,
       alpn: ["h3"],
       acme: {domain: [$sni], email: $email}
-    }')
+    }'); then
+      node_transaction_rollback "$txn"
+      pause_screen
+      return 1
+    fi
   else
-    tls_json=$(jq -n --arg sni "$SNI" --arg crt "$cert_path" --arg key "$key_path" '{
+    if ! tls_json=$(jq -n --arg sni "$SNI" --arg crt "$cert_path" --arg key "$key_path" '{
       enabled: true,
       server_name: $sni,
       alpn: ["h3"],
       certificate_path: $crt,
       key_path: $key
-    }')
+    }'); then
+      node_transaction_rollback "$txn"
+      pause_screen
+      return 1
+    fi
   fi
 
   local user_obj
-  user_obj=$(jq -n --arg uuid "$UUID" --arg pw "$PASSWORD" '{uuid: $uuid, password: $pw}')
+  if ! user_obj=$(jq -n --arg uuid "$UUID" --arg pw "$PASSWORD" '{uuid: $uuid, password: $pw}'); then
+    node_transaction_rollback "$txn"
+    pause_screen
+    return 1
+  fi
 
   local inbound_json
-  inbound_json=$(jq -n \
+  if ! inbound_json=$(jq -n \
     --arg listen "$LISTEN_ADDR" \
     --argjson port "$PORT" \
     --argjson user "$user_obj" \
@@ -466,23 +522,42 @@ install_tuic_node(){
       zero_rtt_handshake: false,
       heartbeat: "10s",
       tls: $tls
-    }')
+    }'); then
+    node_transaction_rollback "$txn"
+    pause_screen
+    return 1
+  fi
 
   if ! config_add_inbound "$inbound_json"; then
+    node_transaction_rollback "$txn"
     echo -e "${R}写入 inbound 失败${N}"
     pause_screen
     return 1
   fi
 
   echo -e "${Y}==> 校验并启动...${N}"
-  if ! config_check_and_restart; then
+  if ! config_check_and_restart "$PORT" udp; then
+    node_transaction_rollback "$txn"
     echo ""
     echo -e "${R}sing-box 校验或重启失败${N}"
     pause_screen
     return 1
   fi
 
-  node_apply_firewall_for_mode "$PORT" udp "$install_mode"
+  if [ -n "$old_port" ] && { [ "$old_port" != "$PORT" ] || [ "$old_mode" != "$install_mode" ]; }; then
+    if ! node_revoke_firewall_for_mode "$old_port" udp "$old_mode"; then
+      node_transaction_rollback "$txn"
+      echo -e "${R}旧端口防火墙清理失败，已完整回滚${N}"
+      pause_screen
+      return 1
+    fi
+  fi
+  if ! node_apply_firewall_for_mode "$PORT" udp "$install_mode"; then
+    node_transaction_rollback "$txn"
+    echo -e "${R}防火墙放行失败，已完整回滚${N}"
+    pause_screen
+    return 1
+  fi
   print_firewall_hint "$PORT" udp "TUIC v5 节点入站"
   if [ "$cert_source" = "acme" ]; then
     print_firewall_hint 80 tcp "ACME 证书签发与续期，签发期间必须可外部访问"
@@ -496,8 +571,7 @@ install_tuic_node(){
     ipv6_link=$(build_tuic_link "$UUID" "$PASSWORD" "$public_ipv6" "$PORT" "$SNI" "$insecure" "$CC" "${TAG}-ipv6" 2>/dev/null || true)
   fi
 
-  ensure_nodes_dir
-  cat > "$(node_info_path tuic)" <<EOF
+  if ! write_node_info_file tuic <<EOF
 Type=tuic
 Tag=$TAG
 Mode=$install_mode
@@ -515,6 +589,22 @@ Insecure=$insecure
 IP=$access_ip
 Link=$link
 EOF
+  then
+    node_transaction_rollback "$txn"
+    echo -e "${R}节点信息保存失败，已完整回滚${N}"
+    pause_screen
+    return 1
+  fi
+
+  if [ "$cert_source" = "acme" ]; then
+    if ! rm -f -- "$CERTS_DIR/tuic.crt" "$CERTS_DIR/tuic.key"; then
+      node_transaction_rollback "$txn"
+      echo -e "${R}旧自签证书清理失败，已完整回滚${N}"
+      pause_screen
+      return 1
+    fi
+  fi
+  node_transaction_commit "$txn"
 
   register_sb_command || true
 
@@ -561,17 +651,11 @@ uninstall_anytls_node(){
     return 0
   fi
 
-  # 必须在 remove_node_info 之前撤防火墙规则，否则读不到 Mode/Port
-  local at_port at_mode
-  at_port=$(get_node_value anytls Port 2>/dev/null || true)
-  at_mode=$(get_node_value anytls Mode 2>/dev/null || echo ipv4)
-  if [ -n "$at_port" ]; then
-    node_revoke_firewall_for_mode "$at_port" tcp "$at_mode"
+  if ! uninstall_node_transaction anytls anytls-in tcp; then
+    echo -e "${R}AnyTLS 节点卸载失败，已恢复原配置${N}"
+    pause_screen
+    return 1
   fi
-
-  config_remove_inbound_by_tag "anytls-in" || true
-  remove_node_info anytls
-  post_uninstall_service_step
   echo -e "${G}AnyTLS 节点已卸载${N}"
   pause_screen
 }
@@ -590,22 +674,14 @@ uninstall_tuic_node(){
     return 0
   fi
 
-  # 必须在 remove_node_info 之前撤防火墙规则，否则读不到 Mode/Port
-  local tuic_port tuic_mode
-  tuic_port=$(get_node_value tuic Port 2>/dev/null || true)
-  tuic_mode=$(get_node_value tuic Mode 2>/dev/null || echo ipv4)
-  if [ -n "$tuic_port" ]; then
-    node_revoke_firewall_for_mode "$tuic_port" udp "$tuic_mode"
+  if ! uninstall_node_transaction tuic tuic-in udp; then
+    echo -e "${R}TUIC 节点卸载失败，已恢复原配置${N}"
+    pause_screen
+    return 1
   fi
-
-  config_remove_inbound_by_tag "tuic-in" || true
-  remove_node_info tuic
-  rm -f "$CERTS_DIR/tuic.crt" "$CERTS_DIR/tuic.key" 2>/dev/null || true
-  post_uninstall_service_step
   echo -e "${G}TUIC 节点已卸载${N}"
   pause_screen
 }
 
 # ─── Shadowsocks-2022 ─────────────────────────────────
 # 抗主动探测能力弱于 Reality / Hysteria2，菜单中标记为 [谨慎]
-

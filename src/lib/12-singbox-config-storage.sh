@@ -24,12 +24,14 @@ set_info_value(){
   local value="$2"
   local tmp_file
 
+  mkdir -p "$(dirname -- "$INFO_PATH")" || return 1
   if [ ! -f "$INFO_PATH" ]; then
-    printf '%s=%s\n' "$key" "$value" > "$INFO_PATH"
+    (umask 077; printf '%s=%s\n' "$key" "$value" > "$INFO_PATH")
+    chmod 600 "$INFO_PATH" 2>/dev/null || return 1
     return 0
   fi
 
-  tmp_file=$(mktemp)
+  tmp_file=$(mktemp "${INFO_PATH}.tmp.XXXXXX") || return 1
   awk -v key="$key" -v value="$value" '
     BEGIN { updated = 0 }
     index($0, key "=") == 1 {
@@ -44,12 +46,14 @@ set_info_value(){
       }
     }
   ' "$INFO_PATH" > "$tmp_file"
-  mv "$tmp_file" "$INFO_PATH"
+  chmod 600 "$tmp_file" 2>/dev/null || { rm -f -- "$tmp_file"; return 1; }
+  mv -f "$tmp_file" "$INFO_PATH"
 }
 
 # ─── 节点存储 (per-node info file) ──────────────────
 ensure_nodes_dir(){
-  mkdir -p "$NODES_DIR" "$CERTS_DIR" 2>/dev/null || true
+  ensure_private_dir "$NODES_DIR" 700 || return 1
+  ensure_private_dir "$CERTS_DIR" 700 || return 1
 }
 
 node_info_path(){
@@ -86,23 +90,25 @@ get_node_value(){
 set_node_value(){
   local type="$1" key="$2" value="$3" f tmp
   f=$(node_info_path "$type")
-  ensure_nodes_dir
+  ensure_nodes_dir || return 1
   if [ ! -f "$f" ]; then
-    printf '%s=%s\n' "$key" "$value" > "$f"
+    (umask 077; printf '%s=%s\n' "$key" "$value" > "$f")
+    chmod 600 "$f" 2>/dev/null || return 1
     return 0
   fi
-  tmp=$(mktemp)
+  tmp=$(mktemp "${f}.tmp.XXXXXX") || return 1
   awk -v key="$key" -v value="$value" '
     BEGIN { updated = 0 }
     index($0, key "=") == 1 { print key "=" value; updated = 1; next }
     { print }
     END { if (!updated) print key "=" value }
   ' "$f" > "$tmp"
-  mv "$tmp" "$f"
+  chmod 600 "$tmp" 2>/dev/null || { rm -f -- "$tmp"; return 1; }
+  mv -f "$tmp" "$f"
 }
 
 remove_node_info(){
-  rm -f "$(node_info_path "$1")"
+  rm -f -- "$(node_info_path "$1")"
 }
 
 # 在多节点情况下让用户选一个节点；仅 1 个时直接回显；0 个返回 1
@@ -158,9 +164,13 @@ ensure_jq(){
 
 config_ensure_skeleton(){
   ensure_jq || return 1
-  mkdir -p /etc/sing-box
-  if [ ! -f "$CONFIG_PATH" ] || ! jq empty "$CONFIG_PATH" >/dev/null 2>&1; then
-    cat > "$CONFIG_PATH" <<'EOF'
+  local config_dir tmp invalid_backup
+  config_dir=$(dirname -- "$CONFIG_PATH")
+  mkdir -p "$config_dir" || return 1
+
+  if [ ! -f "$CONFIG_PATH" ]; then
+    tmp=$(mktemp "${CONFIG_PATH}.tmp.XXXXXX") || return 1
+    cat > "$tmp" <<'EOF'
 {
   "log": {"disabled": false, "level": "warn", "timestamp": true},
   "dns": {"servers": [{"type": "local", "tag": "dns-local"}]},
@@ -175,40 +185,48 @@ config_ensure_skeleton(){
   }
 }
 EOF
+    chmod 600 "$tmp" 2>/dev/null || { rm -f -- "$tmp"; return 1; }
+    mv -f "$tmp" "$CONFIG_PATH"
     return 0
   fi
 
-  local tmp
-  tmp=$(mktemp)
-  # 透明升级：
-  # 1) DNS 只保留一个 local 解析器（走系统 resolv.conf），不做任何劫持/分流；
-  #    清理老脚本残留的 hijack-dns 规则与出站级 domain_resolver
-  #    （sing-box 1.12+ 用户态出站如 WireGuard endpoint 拨域名必须有内部解析器，
-  #      否则运行时报 missing domain resolver，流量全断）
-  # 2) 若没 outbounds 或为空，建一条 tagged direct-out
-  # 3) 若 direct outbound 没 tag，加上 tag=direct-out
-  # 4) 确保 route 块存在，final 默认 direct-out，default_domain_resolver 指向 local
+  if ! jq empty "$CONFIG_PATH" >/dev/null 2>&1; then
+    invalid_backup="${CONFIG_PATH}.invalid.$(date +%Y%m%d%H%M%S)"
+    echo -e "${R}现有 sing-box 配置不是有效 JSON，已拒绝覆盖。${N}" >&2
+    if cp -a -- "$CONFIG_PATH" "$invalid_backup" 2>/dev/null; then
+      echo -e "${Y}原文件保留在 ${CONFIG_PATH}，副本：${invalid_backup}${N}" >&2
+    else
+      echo -e "${Y}原文件仍保留在 ${CONFIG_PATH}，但额外副本创建失败。${N}" >&2
+    fi
+    return 1
+  fi
+
+  tmp=$(mktemp "${CONFIG_PATH}.tmp.XXXXXX") || return 1
+  # 只补充脚本运行所需的缺失字段，绝不删除用户 inbound、DNS、路由或出站。
   if jq '
       .log = (.log // {"disabled": false, "level": "warn", "timestamp": true})
-    | .dns = {"servers": [{"type": "local", "tag": "dns-local"}]}
-    | .inbounds = ((.inbounds // []) | map(select(.tag == "reality-in" or .tag == "hy2-in" or .tag == "anytls-in" or .tag == "tuic-in" or .tag == "ss2022-in")))
-    | .outbounds = (if ((.outbounds // []) | length) == 0
-                    then [{"type":"direct","tag":"direct-out"}]
-                    else (.outbounds | map(
-                        if .type == "direct" and (.tag // "") == ""
-                        then .tag = "direct-out"
-                        else . end)
-                      | map(del(.domain_resolver)))
-                    end)
+    | .dns = (.dns // {})
+    | .dns.servers = (.dns.servers // [])
+    | if any(.dns.servers[]?; (.tag // "") == "dns-local")
+      then .
+      else .dns.servers += [{"type":"local","tag":"dns-local"}]
+      end
+    | .inbounds = (.inbounds // [])
+    | .outbounds = (.outbounds // [])
+    | if any(.outbounds[]?; (.tag // "") == "direct-out")
+      then .
+      else .outbounds += [{"type":"direct","tag":"direct-out"}]
+      end
     | .route = (.route // {})
-    | .route.default_domain_resolver = "dns-local"
-    | .route.rules = ((.route.rules // []) | map(select(.action != "hijack-dns" and (.port // null) != 53)))
+    | .route.default_domain_resolver = (.route.default_domain_resolver // "dns-local")
+    | .route.rules = (.route.rules // [])
     | .route.final = (.route.final // "direct-out")
   ' "$CONFIG_PATH" > "$tmp" 2>/dev/null; then
-    mv "$tmp" "$CONFIG_PATH"
+    chmod 600 "$tmp" 2>/dev/null || { rm -f -- "$tmp"; return 1; }
+    mv -f "$tmp" "$CONFIG_PATH"
     return 0
   fi
-  rm -f "$tmp"
+  rm -f -- "$tmp"
   return 1
 }
 
@@ -222,27 +240,30 @@ config_add_inbound(){
     echo -e "${R}内部错误：inbound 缺少 tag${N}"
     return 1
   fi
-  tmp=$(mktemp)
+  tmp=$(mktemp "${CONFIG_PATH}.tmp.XXXXXX") || return 1
   if ! jq --argjson nb "$inbound" --arg tag "$tag" '
     .inbounds = ((.inbounds // []) | map(select(.tag != $tag))) + [$nb]
   ' "$CONFIG_PATH" > "$tmp" 2>/dev/null; then
     rm -f "$tmp"
     return 1
   fi
-  mv "$tmp" "$CONFIG_PATH"
+  chmod 600 "$tmp" 2>/dev/null || { rm -f -- "$tmp"; return 1; }
+  mv -f "$tmp" "$CONFIG_PATH"
 }
 
 config_remove_inbound_by_tag(){
   local tag="$1"
   ensure_jq || return 1
   [ -f "$CONFIG_PATH" ] || return 0
+  jq empty "$CONFIG_PATH" >/dev/null 2>&1 || return 1
   local tmp
-  tmp=$(mktemp)
+  tmp=$(mktemp "${CONFIG_PATH}.tmp.XXXXXX") || return 1
   if ! jq --arg tag "$tag" '.inbounds = ((.inbounds // []) | map(select(.tag != $tag)))' "$CONFIG_PATH" > "$tmp" 2>/dev/null; then
     rm -f "$tmp"
     return 1
   fi
-  mv "$tmp" "$CONFIG_PATH"
+  chmod 600 "$tmp" 2>/dev/null || { rm -f -- "$tmp"; return 1; }
+  mv -f "$tmp" "$CONFIG_PATH"
 }
 
 config_add_outbound(){
@@ -255,56 +276,101 @@ config_add_outbound(){
     echo -e "${R}内部错误：outbound 缺少 tag${N}"
     return 1
   fi
-  tmp=$(mktemp)
+  tmp=$(mktemp "${CONFIG_PATH}.tmp.XXXXXX") || return 1
   if ! jq --argjson nb "$outbound" --arg tag "$tag" '
     .outbounds = ((.outbounds // []) | map(select(.tag != $tag))) + [$nb]
   ' "$CONFIG_PATH" > "$tmp" 2>/dev/null; then
     rm -f "$tmp"
     return 1
   fi
-  mv "$tmp" "$CONFIG_PATH"
+  chmod 600 "$tmp" 2>/dev/null || { rm -f -- "$tmp"; return 1; }
+  mv -f "$tmp" "$CONFIG_PATH"
 }
 
 config_remove_outbound_by_tag(){
   local tag="$1"
   ensure_jq || return 1
   [ -f "$CONFIG_PATH" ] || return 0
+  jq empty "$CONFIG_PATH" >/dev/null 2>&1 || return 1
   # 不允许移除 direct-out
   if [ "$tag" = "direct-out" ]; then
     return 0
   fi
   local tmp
-  tmp=$(mktemp)
+  tmp=$(mktemp "${CONFIG_PATH}.tmp.XXXXXX") || return 1
   if ! jq --arg tag "$tag" '.outbounds = ((.outbounds // []) | map(select(.tag != $tag)))' "$CONFIG_PATH" > "$tmp" 2>/dev/null; then
     rm -f "$tmp"
     return 1
   fi
-  mv "$tmp" "$CONFIG_PATH"
+  chmod 600 "$tmp" 2>/dev/null || { rm -f -- "$tmp"; return 1; }
+  mv -f "$tmp" "$CONFIG_PATH"
 }
 
 config_check_and_restart(){
+  local expected_port="${1:-}"
+  local expected_proto="${2:-tcp}"
+  local i
+
   if ! sing-box check -c "$CONFIG_PATH"; then
     return 1
   fi
-  systemctl enable sing-box >/dev/null 2>&1 || true
+  if ! systemctl enable sing-box >/dev/null 2>&1; then
+    return 1
+  fi
   if ! systemctl restart sing-box; then
     return 1
   fi
-  return 0
+
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    if systemctl is-active --quiet sing-box 2>/dev/null; then
+      if [ -z "$expected_port" ] || check_port_in_use "$expected_port" "$expected_proto"; then
+        return 0
+      fi
+    fi
+    sleep 0.5
+  done
+  echo -e "${R}sing-box 重启后未保持运行${expected_port:+，或未监听 ${expected_port}/${expected_proto}}${N}" >&2
+  return 1
 }
 
 # 旧 /root/proxy-info.txt 迁移到 /etc/sing-box/nodes/reality.info
 migrate_legacy_info(){
   # 旧配置里 reality inbound 的 tag 是 vless-in，统一重命名为 reality-in
-  if [ -f "$CONFIG_PATH" ] && grep -q '"vless-in"' "$CONFIG_PATH" 2>/dev/null; then
-    if command -v jq >/dev/null 2>&1; then
-      local tmp
-      tmp=$(mktemp)
-      if jq '(.inbounds[]? | select(.tag == "vless-in") | .tag) = "reality-in"' "$CONFIG_PATH" > "$tmp" 2>/dev/null; then
-        mv "$tmp" "$CONFIG_PATH"
-      else
-        rm -f "$tmp"
+  if [ -f "$CONFIG_PATH" ] && command -v jq >/dev/null 2>&1 \
+     && jq -e 'any(.inbounds[]?; (.tag // "") == "vless-in")' "$CONFIG_PATH" >/dev/null 2>&1; then
+    local tmp migration_txn migration_ok=1
+    migration_txn=$(config_transaction_begin legacy-reality-tag) || return 1
+    tmp=$(mktemp "${CONFIG_PATH}.tmp.XXXXXX") || {
+      config_transaction_rollback "$migration_txn"
+      return 1
+    }
+    if ! jq '
+        (.inbounds[]? | select(.tag == "vless-in") | .tag) = "reality-in"
+      | .route.rules = ((.route.rules // []) | map(
+          if ((.inbound // null) | type) == "array" then
+            .inbound |= map(if . == "vless-in" then "reality-in" else . end)
+          elif (.inbound // "") == "vless-in" then
+            .inbound = "reality-in"
+          else . end
+        ))
+      ' "$CONFIG_PATH" > "$tmp" 2>/dev/null \
+       || ! chmod 600 "$tmp" \
+       || ! mv -f -- "$tmp" "$CONFIG_PATH"; then
+      rm -f -- "$tmp"
+      migration_ok=0
+    fi
+    if [ "$migration_ok" -eq 1 ] && command -v sing-box >/dev/null 2>&1; then
+      sing-box check -c "$CONFIG_PATH" >/dev/null 2>&1 || migration_ok=0
+      if [ "$migration_ok" -eq 1 ] && systemctl is-active --quiet sing-box 2>/dev/null; then
+        systemctl restart sing-box >/dev/null 2>&1 || migration_ok=0
       fi
+    fi
+    if [ "$migration_ok" -eq 1 ]; then
+      config_transaction_commit "$migration_txn"
+    else
+      config_transaction_rollback "$migration_txn"
+      echo -e "${R}旧 Reality tag 迁移失败，已恢复原配置${N}" >&2
+      return 1
     fi
   fi
 
@@ -331,10 +397,10 @@ migrate_legacy_info(){
     return 0
   fi
 
-  ensure_nodes_dir
+  ensure_nodes_dir || return 1
   local f
   f=$(node_info_path reality)
-  cat > "$f" <<EOF
+  write_node_info_file reality <<EOF
 Type=reality
 Tag=${tag:-reality}
 Mode=${mode:-ipv4}
@@ -365,7 +431,10 @@ write_proxy_info(){
   local mode="${11:-ipv4}"
   local bind_ipv4="${12:-}"
 
-  cat > "$INFO_PATH" << EOF
+  mkdir -p "$(dirname -- "$INFO_PATH")" || return 1
+  local tmp_info
+  tmp_info=$(mktemp "${INFO_PATH}.tmp.XXXXXX") || return 1
+  cat > "$tmp_info" << EOF
 UUID=$uuid
 PublicKey=$public_key
 PrivateKey=$private_key
@@ -379,6 +448,8 @@ Link=$link
 Mode=$mode
 BindIPv4=$bind_ipv4
 EOF
+  chmod 600 "$tmp_info" 2>/dev/null || { rm -f -- "$tmp_info"; return 1; }
+  mv -f "$tmp_info" "$INFO_PATH"
 }
 
 load_proxy_context(){

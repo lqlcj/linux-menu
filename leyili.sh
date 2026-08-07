@@ -1,7 +1,9 @@
 #!/bin/bash
 set -o pipefail
+umask 077
 
-SAGERNET_KEY_URL="https://sing-box.app/gpg.key"
+SAGERNET_KEY_URL="https://deb.sagernet.org/gpg.key"
+SAGERNET_KEY_FINGERPRINT="2C317FBD5D886B4E89BAE8DA6D9152172A2B2F0C"
 SAGERNET_KEYRING="/etc/apt/keyrings/sagernet.asc"
 SAGERNET_SOURCES="/etc/apt/sources.list.d/sagernet.sources"
 SAGERNET_REPO_URI="https://deb.sagernet.org/"
@@ -9,21 +11,34 @@ CONFIG_PATH="/etc/sing-box/config.json"
 INFO_PATH="/root/proxy-info.txt"
 NODES_DIR="/etc/sing-box/nodes"
 CERTS_DIR="/etc/sing-box/certs"
+LEYILI_DIR="/etc/leyili"
+LEYILI_STATE_DIR="${LEYILI_DIR}/state"
+SAGERNET_REPO_STATE="${LEYILI_STATE_DIR}/sagernet-repo.state"
+LEYILI_CACHE_DIR="/var/cache/leyili"
+LEYILI_LOCK_PATH="/run/lock/leyili.lock"
+FIREWALL_PORT_STATE="${LEYILI_STATE_DIR}/firewall-ports.state"
 
 # 首页展示「最新稳定版」用的缓存（避免每次刷新菜单都请求 GitHub）
-SINGBOX_LATEST_CACHE="/tmp/.leyili-singbox-latest"
+SINGBOX_LATEST_CACHE="${LEYILI_CACHE_DIR}/singbox-latest"
 SINGBOX_LATEST_TTL="21600"     # 有效缓存 6 小时
 SINGBOX_LATEST_NEG_TTL="300"   # 联网失败后 5 分钟内不再重试
 APP_NAME="Leyili"
 COMMAND_NAME="sb"
 SCRIPT_PATH="/usr/local/bin/${COMMAND_NAME}"
 SELF_INSTALL_URL="${SELF_INSTALL_URL:-https://raw.githubusercontent.com/lqlcj/linux-menu/main/leyili.sh}"
+SELF_INSTALL_SHA256="${SELF_INSTALL_SHA256:-}"
 TCP_TUNING_PATH="/etc/sysctl.d/99-proxy-optimized.conf"
 QUIC_TUNING_PATH="/etc/sysctl.d/99-quic-optimized.conf"
+TCP_TUNING_STATE="${LEYILI_STATE_DIR}/tcp-sysctl.state"
+TCP_QDISC_STATE="${LEYILI_STATE_DIR}/tcp-qdisc.state"
+QUIC_TUNING_STATE="${LEYILI_STATE_DIR}/quic-sysctl.state"
 INITCWND_SERVICE_PATH="/etc/systemd/system/initcwnd.service"
+INITCWND_HELPER_PATH="/usr/local/libexec/leyili-initcwnd"
+INITCWND_STATE_PATH="${LEYILI_STATE_DIR}/initcwnd.state"
 INITCWND_VALUE="24"
 SWAPFILE_PATH="/swapfile"
 SWAP_SYSCTL_PATH="/etc/sysctl.d/99-swap-tuning.conf"
+SWAP_STATE_PATH="${LEYILI_STATE_DIR}/swap.state"
 SWAPPINESS_VALUE="10"
 
 SYSTEM_TIMEZONE="Asia/Shanghai"
@@ -32,15 +47,24 @@ SSHD_CONFIG_PATH="/etc/ssh/sshd_config"
 SUDOERS_DROPIN_DIR="/etc/sudoers.d"
 SSH_RANDOM_PORT_MIN="20000"
 SSH_RANDOM_PORT_MAX="65535"
+SSHD_SOCKET_DROPIN_PATH="/etc/systemd/system/ssh.socket.d/99-leyili-port.conf"
+FAIL2BAN_JAIL_PATH="/etc/fail2ban/jail.d/leyili-sshd.local"
+FAIL2BAN_MAXRETRY="5"
+FAIL2BAN_BANTIME="600"
+FAIL2BAN_FINDTIME="300"
 IP6_RULES_PATH_DEBIAN="/etc/iptables/rules.v6"
 IP6_RULES_PATH_RHEL="/etc/sysconfig/ip6tables"
 IP4_RULES_PATH_DEBIAN="/etc/iptables/rules.v4"
 IP4_RULES_PATH_RHEL="/etc/sysconfig/iptables"
+IP4_LEYILI_CHAIN="LEYILI_INPUT"
+IP6_LEYILI_CHAIN="LEYILI6_INPUT"
 
 # ─── WARP 谷歌解锁分流 ───────────────────────────────
 WARP_APP_NAME="WARP 谷歌解锁分流"
 WARP_DIR="/etc/leyili/warp"
 WARP_ACCOUNT_JSON="${WARP_DIR}/account.json"
+WARP_MANAGED_STATE="${WARP_DIR}/managed.state"
+WARP_CACHE_DEFAULT="/var/lib/sing-box/cache.db"
 # 旧版 wgcf 方案的遗留二进制路径：仅在卸载时清理用
 WARP_WGCF_BIN="/usr/local/bin/wgcf"
 # 模拟官方安卓客户端的注册 API（与 fscarmen/warp、warp-reg 同款参数）
@@ -49,9 +73,11 @@ WARP_API_UA="okhttp/3.12.1"
 WARP_API_CLIENT_VER="a-6.10-2158"
 WARP_OUTBOUND_TAG="warp-out"
 WARP_RULESET_TAG="geosite-google"
-WARP_RULESET_URL="https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-google.srs"
+WARP_SNIFF_INBOUNDS_JSON='["reality-in","hy2-in","anytls-in","tuic-in","ss2022-in"]'
+WARP_RULESET_COMMIT="db558913a68c00c07524b211472b968231874b5f"
+WARP_RULESET_URL="https://raw.githubusercontent.com/SagerNet/sing-geosite/${WARP_RULESET_COMMIT}/geosite-google.srs"
 WARP_RULESET_TAG_YT="geosite-youtube"
-WARP_RULESET_URL_YT="https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-youtube.srs"
+WARP_RULESET_URL_YT="https://raw.githubusercontent.com/SagerNet/sing-geosite/${WARP_RULESET_COMMIT}/geosite-youtube.srs"
 WARP_PEER_PUBLIC_KEY="bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo="
 WARP_ENDPOINT_HOST="162.159.192.1"
 WARP_ENDPOINT_PORT="2408"
@@ -112,7 +138,7 @@ require_debian_family(){
 cleanup_old_backups(){
   local pattern="$1"
   local keep="${2:-5}"
-  local dir base victim
+  local dir base victim rc=0
   local -a victims=()
 
   if [ -z "$pattern" ]; then
@@ -140,29 +166,564 @@ cleanup_old_backups(){
 
   local i
   for ((i = keep; i < ${#victims[@]}; i++)); do
-    [ -n "${victims[i]}" ] && rm -f -- "${victims[i]}"
+    if [ -n "${victims[i]}" ] && ! rm -f -- "${victims[i]}"; then
+      rc=1
+    fi
+  done
+  return "$rc"
+}
+
+ensure_private_dir(){
+  local dir="$1"
+  local mode="${2:-700}"
+
+  [ -n "$dir" ] || return 1
+  if [ -L "$dir" ]; then
+    echo -e "${R}拒绝使用符号链接目录：${dir}${N}" >&2
+    return 1
+  fi
+  if ! install -d -m "$mode" "$dir" 2>/dev/null; then
+    return 1
+  fi
+  chmod "$mode" "$dir" 2>/dev/null || return 1
+}
+
+ensure_leyili_state_dir(){
+  ensure_private_dir "$LEYILI_DIR" 700 || return 1
+  ensure_private_dir "$LEYILI_STATE_DIR" 700
+}
+
+atomic_replace_file(){
+  local source="$1"
+  local target="$2"
+  local mode="${3:-600}"
+  local target_dir tmp
+
+  [ -f "$source" ] || return 1
+  target_dir=$(dirname -- "$target")
+  if [ -L "$target_dir" ]; then
+    echo -e "${R}拒绝写入符号链接目录：${target_dir}${N}" >&2
+    return 1
+  fi
+  mkdir -p "$target_dir" 2>/dev/null || return 1
+  tmp=$(mktemp "${target}.tmp.XXXXXX") || return 1
+  if ! install -m "$mode" "$source" "$tmp" 2>/dev/null; then
+    rm -f -- "$tmp"
+    return 1
+  fi
+  if ! mv -f -- "$tmp" "$target"; then
+    rm -f -- "$tmp"
+    return 1
+  fi
+}
+
+# 从事务快照恢复文件：在目标目录内准备副本后原子替换，保留原权限/属主/时间戳。
+restore_file_snapshot(){
+  local source="$1"
+  local target="$2"
+  local target_dir stage_dir stage_file
+
+  [ -e "$source" ] || return 1
+  target_dir=$(dirname -- "$target")
+  if [ -L "$target_dir" ]; then
+    echo -e "${R}拒绝向符号链接目录恢复文件：${target_dir}${N}" >&2
+    return 1
+  fi
+  mkdir -p -- "$target_dir" || return 1
+  stage_dir=$(mktemp -d "${target_dir}/.leyili-restore.XXXXXX") || return 1
+  chmod 700 "$stage_dir" 2>/dev/null || { rm -rf -- "$stage_dir"; return 1; }
+  stage_file="${stage_dir}/snapshot"
+  if ! cp -a -- "$source" "$stage_file"; then
+    rm -rf -- "$stage_dir"
+    return 1
+  fi
+  if ! mv -f -- "$stage_file" "$target"; then
+    rm -rf -- "$stage_dir"
+    return 1
+  fi
+  rmdir -- "$stage_dir" 2>/dev/null || true
+}
+
+# 脚本若要接管固定路径，先保存同名用户文件；移除功能时恢复，而不是写死默认值。
+managed_file_prepare(){
+  local path="$1"
+  local marker_regex="${2:-Managed by Leyili|leyili-}"
+  local original="${path}.leyili-original"
+
+  if [ ! -e "$path" ]; then
+    return 0
+  fi
+  if [ -L "$path" ]; then
+    echo -e "${R}拒绝覆盖符号链接：${path}${N}" >&2
+    return 1
+  fi
+  if grep -Eq "$marker_regex" "$path" 2>/dev/null; then
+    return 0
+  fi
+  if [ -e "$original" ]; then
+    echo -e "${R}检测到未托管文件及旧备份并存，拒绝覆盖：${path}${N}" >&2
+    return 1
+  fi
+  cp -a -- "$path" "$original"
+}
+
+managed_file_restore(){
+  local path="$1"
+  local original="${path}.leyili-original"
+
+  if [ -e "$original" ]; then
+    mv -f -- "$original" "$path"
+  else
+    rm -f -- "$path"
+  fi
+}
+
+managed_file_transaction_begin(){
+  local path="$1"
+  local marker_regex="${2:-Managed by Leyili|leyili-}"
+  local txn original="${path}.leyili-original"
+
+  txn=$(mktemp -d "${TMPDIR:-/tmp}/leyili-file.XXXXXX") || return 1
+  chmod 700 "$txn" 2>/dev/null || { rm -rf -- "$txn"; return 1; }
+  if [ -e "$path" ]; then
+    cp -a -- "$path" "$txn/current" || { rm -rf -- "$txn"; return 1; }
+    : > "$txn/current.existed"
+  fi
+  if [ -e "$original" ]; then
+    cp -a -- "$original" "$txn/original" || { rm -rf -- "$txn"; return 1; }
+    : > "$txn/original.preexisting"
+  fi
+  if ! managed_file_prepare "$path" "$marker_regex"; then
+    rm -rf -- "$txn"
+    return 1
+  fi
+  if [ -e "$original" ] && [ ! -f "$txn/original.preexisting" ]; then
+    : > "$txn/original.created"
+  fi
+  printf '%s' "$txn"
+}
+
+managed_file_transaction_rollback(){
+  local path="$1" txn="$2"
+  local rc=0
+  [ -d "$txn" ] || return 1
+  if [ -f "$txn/current.existed" ]; then
+    restore_file_snapshot "$txn/current" "$path" || rc=1
+  else
+    rm -f -- "$path" || rc=1
+  fi
+  if [ -f "$txn/original.preexisting" ]; then
+    restore_file_snapshot "$txn/original" "${path}.leyili-original" || rc=1
+  elif [ -f "$txn/original.created" ]; then
+    rm -f -- "${path}.leyili-original" || rc=1
+  fi
+  if [ "$rc" -eq 0 ]; then
+    rm -rf -- "$txn" || rc=1
+  fi
+  if [ "$rc" -ne 0 ]; then
+    echo -e "${R}警告：文件事务回滚未完全成功，私有快照保留在 ${txn}${N}" >&2
+  fi
+  return "$rc"
+}
+
+managed_file_transaction_commit(){
+  rm -rf -- "$1"
+}
+
+acquire_global_lock(){
+  local lock_path="$LEYILI_LOCK_PATH"
+
+  [ "${LEYILI_SKIP_LOCK:-0}" = "1" ] && return 0
+  if [ "$(id -u)" -ne 0 ]; then
+    lock_path="${TMPDIR:-/tmp}/leyili-${UID}.lock"
+  else
+    mkdir -p "$(dirname -- "$lock_path")" 2>/dev/null || return 1
+  fi
+
+  if command -v flock >/dev/null 2>&1; then
+    # shellcheck disable=SC3045
+    exec 9>"$lock_path" || return 1
+    if ! flock -n 9; then
+      echo -e "${Y}另一个 ${APP_NAME} 菜单正在运行，请先退出后重试。${N}" >&2
+      return 1
+    fi
+    return 0
+  fi
+
+  LEYILI_LOCK_DIR="${lock_path}.d"
+  if ! mkdir "$LEYILI_LOCK_DIR" 2>/dev/null; then
+    echo -e "${Y}另一个 ${APP_NAME} 菜单可能正在运行：${LEYILI_LOCK_DIR}${N}" >&2
+    return 1
+  fi
+  trap 'release_global_lock' EXIT
+}
+
+release_global_lock(){
+  if [ -n "${LEYILI_LOCK_DIR:-}" ] && [ -d "$LEYILI_LOCK_DIR" ]; then
+    rmdir -- "$LEYILI_LOCK_DIR" 2>/dev/null || true
+  fi
+}
+
+config_transaction_begin(){
+  local label="${1:-config}"
+  local txn
+
+  txn=$(mktemp -d "${TMPDIR:-/tmp}/leyili-${label}.XXXXXX") || return 1
+  chmod 700 "$txn" 2>/dev/null || { rm -rf -- "$txn"; return 1; }
+  if [ -f "$CONFIG_PATH" ]; then
+    cp -a -- "$CONFIG_PATH" "$txn/config.json" || { rm -rf -- "$txn"; return 1; }
+    : > "$txn/config.existed"
+  fi
+  if systemctl is-active --quiet sing-box 2>/dev/null; then
+    : > "$txn/service.active"
+  fi
+  if systemctl is-enabled --quiet sing-box 2>/dev/null; then
+    : > "$txn/service.enabled"
+  fi
+  printf '%s' "$txn"
+}
+
+config_transaction_restore(){
+  local txn="$1"
+  local rc=0
+
+  [ -d "$txn" ] || return 1
+  if [ -f "$txn/config.existed" ]; then
+    restore_file_snapshot "$txn/config.json" "$CONFIG_PATH" || return 1
+  else
+    rm -f -- "$CONFIG_PATH" || return 1
+  fi
+
+  if command -v sing-box >/dev/null 2>&1; then
+    if [ -f "$txn/service.enabled" ]; then
+      systemctl enable sing-box >/dev/null 2>&1 || rc=1
+    else
+      systemctl disable sing-box >/dev/null 2>&1 || rc=1
+    fi
+    if [ -f "$txn/service.active" ]; then
+      systemctl restart sing-box >/dev/null 2>&1 || rc=1
+    else
+      systemctl stop sing-box >/dev/null 2>&1 || rc=1
+    fi
+  fi
+  return "$rc"
+}
+
+config_transaction_rollback(){
+  local txn="$1"
+  local rc=0
+  config_transaction_restore "$txn" || rc=1
+  if [ "$rc" -eq 0 ]; then
+    rm -rf -- "$txn" || rc=1
+  fi
+  if [ "$rc" -ne 0 ]; then
+    echo -e "${R}警告：sing-box 配置/服务回滚未完全成功，私有快照保留在 ${txn}${N}" >&2
+  fi
+  return "$rc"
+}
+
+config_transaction_commit(){
+  local txn="$1"
+  rm -rf -- "$txn"
+}
+
+node_transaction_begin(){
+  local type="$1"
+  local txn info cert
+
+  txn=$(config_transaction_begin "node-${type}") || return 1
+  printf '%s\n' "$type" > "$txn/node.type"
+  info="$NODES_DIR/${type}.info"
+  if [ -f "$info" ]; then
+    cp -a -- "$info" "$txn/node.info" || { config_transaction_rollback "$txn"; return 1; }
+    : > "$txn/node.existed"
+  fi
+  case "$type" in
+    hy2|tuic)
+      for cert in "${type}.crt" "${type}.key"; do
+        if [ -f "$CERTS_DIR/$cert" ]; then
+          cp -a -- "$CERTS_DIR/$cert" "$txn/$cert" || { config_transaction_rollback "$txn"; return 1; }
+          : > "$txn/${cert}.existed"
+        fi
+      done
+      ;;
+  esac
+  if command -v iptables-save >/dev/null 2>&1; then
+    iptables-save > "$txn/iptables.rules" 2>/dev/null || rm -f "$txn/iptables.rules"
+  fi
+  if command -v ip6tables-save >/dev/null 2>&1; then
+    ip6tables-save > "$txn/ip6tables.rules" 2>/dev/null || rm -f "$txn/ip6tables.rules"
+  fi
+  if [ -f "$FIREWALL_PORT_STATE" ]; then
+    cp -a -- "$FIREWALL_PORT_STATE" "$txn/firewall-ports.state" \
+      || { config_transaction_rollback "$txn"; return 1; }
+    : > "$txn/firewall-ports.existed"
+  else
+    : > "$txn/firewall-ports.state"
+  fi
+  printf '%s' "$txn"
+}
+
+node_transaction_rollback(){
+  local txn="$1"
+  local type info cert
+  local rc=0
+
+  [ -d "$txn" ] || return 1
+  type=$(cat "$txn/node.type" 2>/dev/null)
+  info="$NODES_DIR/${type}.info"
+  config_transaction_restore "$txn" || rc=1
+
+  ensure_nodes_dir >/dev/null 2>&1 || rc=1
+  if [ -f "$txn/node.existed" ]; then
+    restore_file_snapshot "$txn/node.info" "$info" || rc=1
+  else
+    rm -f -- "$info" || rc=1
+  fi
+  case "$type" in
+    hy2|tuic)
+      for cert in "${type}.crt" "${type}.key"; do
+        if [ -f "$txn/${cert}.existed" ]; then
+          restore_file_snapshot "$txn/$cert" "$CERTS_DIR/$cert" || rc=1
+        else
+          rm -f -- "$CERTS_DIR/$cert" || rc=1
+        fi
+      done
+      ;;
+  esac
+  firewall_owned_ports_restore "$txn/firewall-ports.state" "$txn/firewall-ports.existed" || rc=1
+  if [ -s "$txn/iptables.rules" ] && command -v iptables-restore >/dev/null 2>&1; then
+    iptables-restore < "$txn/iptables.rules" 2>/dev/null || rc=1
+    ip4_save_rules >/dev/null 2>&1 || rc=1
+  fi
+  if [ -s "$txn/ip6tables.rules" ] && command -v ip6tables-restore >/dev/null 2>&1; then
+    ip6tables-restore < "$txn/ip6tables.rules" 2>/dev/null || rc=1
+    ip6_save_rules >/dev/null 2>&1 || rc=1
+  fi
+  if [ "$rc" -eq 0 ]; then
+    rm -rf -- "$txn" || rc=1
+  fi
+  [ "$rc" -eq 0 ] || echo -e "${R}警告：事务回滚有步骤失败，请立即检查 sing-box 与防火墙状态；快照保留在 ${txn}${N}" >&2
+  return "$rc"
+}
+
+node_transaction_commit(){
+  config_transaction_commit "$1"
+}
+
+write_node_info_file(){
+  local type="$1"
+  local target tmp
+
+  ensure_nodes_dir || return 1
+  target=$(node_info_path "$type")
+  tmp=$(mktemp "${target}.tmp.XXXXXX") || return 1
+  if ! cat > "$tmp"; then
+    rm -f -- "$tmp"
+    return 1
+  fi
+  chmod 600 "$tmp" || { rm -f -- "$tmp"; return 1; }
+  mv -f -- "$tmp" "$target"
+}
+
+sysctl_state_capture(){
+  local state_file="$1"
+  shift
+  local key value
+
+  [ -f "$state_file" ] && return 0
+  ensure_leyili_state_dir || return 1
+  : > "$state_file" || return 1
+  chmod 600 "$state_file" 2>/dev/null || { rm -f -- "$state_file"; return 1; }
+  for key in "$@"; do
+    value=$(sysctl -n "$key" 2>/dev/null) || continue
+    printf '%s=%s\n' "$key" "$value" >> "$state_file" || return 1
   done
 }
 
+sysctl_state_restore(){
+  local state_file="$1"
+  local key value rc=0
+
+  [ -r "$state_file" ] || return 0
+  while IFS='=' read -r key value; do
+    [ -n "$key" ] || continue
+    sysctl -w "${key}=${value}" >/dev/null 2>&1 || rc=1
+  done < "$state_file"
+  if [ "$rc" -eq 0 ]; then
+    rm -f -- "$state_file" || rc=1
+  else
+    echo -e "${R}警告：部分 sysctl 参数恢复失败，状态快照已保留：${state_file}${N}" >&2
+  fi
+  return "$rc"
+}
 # ═══ source: 01-firewall-common.sh ═══
 check_port_in_use(){
   local port="$1"
+  local proto="${2:-tcp}"
+  local ss_args="-tlnH"
+  local netstat_args="-tln"
 
   if [ -z "$port" ]; then
     return 1
   fi
 
+  case "$proto" in
+    udp) ss_args="-ulnH"; netstat_args="-uln" ;;
+    tcp) ;;
+    *) return 1 ;;
+  esac
+
   if command -v ss >/dev/null 2>&1; then
-    ss -tlnH 2>/dev/null | awk -v p=":${port}$" '$4 ~ p {found=1} END {exit !found}'
+    ss $ss_args 2>/dev/null | awk -v p=":${port}$" '$4 ~ p {found=1} END {exit !found}'
     return $?
   fi
 
   if command -v netstat >/dev/null 2>&1; then
-    netstat -tln 2>/dev/null | awk -v p=":${port}$" '$4 ~ p {found=1} END {exit !found}'
+    netstat $netstat_args 2>/dev/null | awk -v p=":${port}$" '$4 ~ p {found=1} END {exit !found}'
     return $?
   fi
 
   return 1
+}
+
+firewall_owned_port_key(){
+  printf '%s\t%s\t%s' "$1" "$2" "$3"
+}
+
+firewall_owned_port_has(){
+  local backend="$1" port="$2" proto="$3" key
+  [ -r "$FIREWALL_PORT_STATE" ] || return 1
+  key=$(firewall_owned_port_key "$backend" "$port" "$proto")
+  grep -Fqx "$key" "$FIREWALL_PORT_STATE"
+}
+
+firewall_owned_port_add(){
+  local backend="$1" port="$2" proto="$3" key tmp
+  ensure_leyili_state_dir || return 1
+  key=$(firewall_owned_port_key "$backend" "$port" "$proto")
+  tmp=$(mktemp "${FIREWALL_PORT_STATE}.tmp.XXXXXX") || return 1
+  if [ -f "$FIREWALL_PORT_STATE" ]; then
+    cat "$FIREWALL_PORT_STATE" > "$tmp" || { rm -f -- "$tmp"; return 1; }
+  fi
+  grep -Fqx "$key" "$tmp" 2>/dev/null || printf '%s\n' "$key" >> "$tmp" \
+    || { rm -f -- "$tmp"; return 1; }
+  chmod 600 "$tmp" || { rm -f -- "$tmp"; return 1; }
+  mv -f -- "$tmp" "$FIREWALL_PORT_STATE"
+}
+
+firewall_owned_port_remove(){
+  local backend="$1" port="$2" proto="$3" tmp
+  [ -f "$FIREWALL_PORT_STATE" ] || return 0
+  tmp=$(mktemp "${FIREWALL_PORT_STATE}.tmp.XXXXXX") || return 1
+  if ! awk -F '\t' -v b="$backend" -v p="$port" -v r="$proto" \
+      '!(NF >= 3 && $1 == b && $2 == p && $3 == r)' \
+      "$FIREWALL_PORT_STATE" > "$tmp"; then
+    rm -f -- "$tmp"
+    return 1
+  fi
+  chmod 600 "$tmp" || { rm -f -- "$tmp"; return 1; }
+  mv -f -- "$tmp" "$FIREWALL_PORT_STATE"
+}
+
+firewall_backend_port_exists(){
+  local backend="$1" port="$2" proto="$3"
+  case "$backend" in
+    ufw)
+      command -v ufw >/dev/null 2>&1 || return 1
+      ufw status 2>/dev/null | awk -v rule="${port}/${proto}" \
+        '$1 == rule && $2 == "ALLOW" { found=1 } END { exit !found }'
+      ;;
+    firewalld)
+      command -v firewall-cmd >/dev/null 2>&1 || return 1
+      firewall-cmd --permanent --query-port="${port}/${proto}" >/dev/null 2>&1
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+firewall_backend_add_port_raw(){
+  local backend="$1" port="$2" proto="$3"
+  case "$backend" in
+    ufw)
+      firewall_backend_port_exists ufw "$port" "$proto" && return 0
+      ufw allow "${port}/${proto}" >/dev/null 2>&1
+      ;;
+    firewalld)
+      firewall_backend_port_exists firewalld "$port" "$proto" && return 0
+      firewall-cmd --permanent --add-port="${port}/${proto}" >/dev/null 2>&1 \
+        && firewall-cmd --reload >/dev/null 2>&1
+      ;;
+    none) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+firewall_backend_remove_port_raw(){
+  local backend="$1" port="$2" proto="$3"
+  case "$backend" in
+    ufw)
+      firewall_backend_port_exists ufw "$port" "$proto" || return 0
+      ufw delete allow "${port}/${proto}" >/dev/null 2>&1
+      ;;
+    firewalld)
+      firewall_backend_port_exists firewalld "$port" "$proto" || return 0
+      firewall-cmd --permanent --remove-port="${port}/${proto}" >/dev/null 2>&1 \
+        && firewall-cmd --reload >/dev/null 2>&1
+      ;;
+    none) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+firewall_owned_ports_restore(){
+  local desired="$1" existed_marker="$2"
+  local current backend port proto rc=0
+
+  current=$(mktemp "${TMPDIR:-/tmp}/leyili-fw-owned.XXXXXX") || return 1
+  if [ -f "$FIREWALL_PORT_STATE" ]; then
+    cp -a -- "$FIREWALL_PORT_STATE" "$current" || { rm -f -- "$current"; return 1; }
+  else
+    : > "$current"
+  fi
+
+  while IFS=$'\t' read -r backend port proto; do
+    [ -n "$backend" ] && [ -n "$port" ] && [ -n "$proto" ] || continue
+    if ! grep -Fqx "$(firewall_owned_port_key "$backend" "$port" "$proto")" "$desired" 2>/dev/null; then
+      firewall_backend_remove_port_raw "$backend" "$port" "$proto" || rc=1
+    fi
+  done < "$current"
+  while IFS=$'\t' read -r backend port proto; do
+    [ -n "$backend" ] && [ -n "$port" ] && [ -n "$proto" ] || continue
+    if ! grep -Fqx "$(firewall_owned_port_key "$backend" "$port" "$proto")" "$current" 2>/dev/null; then
+      firewall_backend_add_port_raw "$backend" "$port" "$proto" || rc=1
+    fi
+  done < "$desired"
+
+  if [ -f "$existed_marker" ]; then
+    ensure_leyili_state_dir || rc=1
+    if [ "$rc" -eq 0 ]; then
+      restore_file_snapshot "$desired" "$FIREWALL_PORT_STATE" || rc=1
+      chmod 600 "$FIREWALL_PORT_STATE" 2>/dev/null || rc=1
+    fi
+  else
+    rm -f -- "$FIREWALL_PORT_STATE" || rc=1
+  fi
+  rm -f -- "$current"
+  return "$rc"
+}
+
+firewall_remove_all_owned_ports(){
+  local backend port proto rc=0
+  [ -f "$FIREWALL_PORT_STATE" ] || return 0
+  while IFS=$'\t' read -r backend port proto; do
+    [ -n "$backend" ] && [ -n "$port" ] && [ -n "$proto" ] || continue
+    firewall_backend_remove_port_raw "$backend" "$port" "$proto" || rc=1
+  done < "$FIREWALL_PORT_STATE"
+  if [ "$rc" -eq 0 ]; then
+    rm -f -- "$FIREWALL_PORT_STATE" || rc=1
+  fi
+  return "$rc"
 }
 
 detect_firewall_backend(){
@@ -187,24 +748,38 @@ allow_port_in_firewall(){
 
   case "$backend" in
     ufw)
-      if ufw allow "${port}/${proto}" >/dev/null 2>&1; then
-        echo -e "  防火墙  : ${C}ufw 已放行 ${port}/${proto}${N}"
+      if firewall_backend_port_exists ufw "$port" "$proto"; then
+        echo -e "  防火墙  : ${D}ufw 已有 ${port}/${proto} 规则，保持不变${N}"
+      elif firewall_backend_add_port_raw ufw "$port" "$proto" \
+           && firewall_owned_port_add ufw "$port" "$proto"; then
+        echo -e "  防火墙  : ${C}ufw 已放行 ${port}/${proto}（脚本托管）${N}"
       else
+        if ! firewall_backend_remove_port_raw ufw "$port" "$proto" >/dev/null 2>&1; then
+          echo -e "  防火墙  : ${R}ufw 所有权记录失败，且新增规则撤销失败，请立即检查 ${port}/${proto}${N}"
+        fi
         echo -e "  防火墙  : ${Y}ufw 放行失败，请手动执行 ufw allow ${port}/${proto}${N}"
+        return 1
       fi
       ;;
     firewalld)
-      if firewall-cmd --permanent --add-port="${port}/${proto}" >/dev/null 2>&1 \
-         && firewall-cmd --reload >/dev/null 2>&1; then
-        echo -e "  防火墙  : ${C}firewalld 已放行 ${port}/${proto}${N}"
+      if firewall_backend_port_exists firewalld "$port" "$proto"; then
+        echo -e "  防火墙  : ${D}firewalld 已有 ${port}/${proto} 规则，保持不变${N}"
+      elif firewall_backend_add_port_raw firewalld "$port" "$proto" \
+           && firewall_owned_port_add firewalld "$port" "$proto"; then
+        echo -e "  防火墙  : ${C}firewalld 已放行 ${port}/${proto}（脚本托管）${N}"
       else
+        if ! firewall_backend_remove_port_raw firewalld "$port" "$proto" >/dev/null 2>&1; then
+          echo -e "  防火墙  : ${R}firewalld 所有权记录失败，且新增规则撤销失败，请立即检查 ${port}/${proto}${N}"
+        fi
         echo -e "  防火墙  : ${Y}firewalld 放行失败，请手动执行 firewall-cmd --permanent --add-port=${port}/${proto}${N}"
+        return 1
       fi
       ;;
     *)
       echo -e "  防火墙  : ${D}未启用 ufw/firewalld（如有外部安全组请自行放行 ${port}/${proto}）${N}"
       ;;
   esac
+  return 0
 }
 
 allow_tcp_port_in_firewall(){
@@ -219,18 +794,117 @@ deny_port_in_firewall(){
 
   case "$backend" in
     ufw)
-      ufw delete allow "${port}/${proto}" >/dev/null 2>&1 || true
-      echo -e "  防火墙  : ${D}ufw 撤销 ${port}/${proto}${N}"
+      if firewall_owned_port_has ufw "$port" "$proto"; then
+        if ! firewall_backend_remove_port_raw ufw "$port" "$proto"; then
+          return 1
+        fi
+        if ! firewall_owned_port_remove ufw "$port" "$proto"; then
+          if ! firewall_backend_add_port_raw ufw "$port" "$proto" >/dev/null 2>&1; then
+            echo -e "${R}ufw 所有权记录更新失败，且旧规则恢复失败：${port}/${proto}${N}" >&2
+          fi
+          return 1
+        fi
+        echo -e "  防火墙  : ${D}ufw 已撤销脚本托管的 ${port}/${proto}${N}"
+      else
+        echo -e "  防火墙  : ${D}ufw 的 ${port}/${proto} 非脚本托管，已保留${N}"
+      fi
       ;;
     firewalld)
-      firewall-cmd --permanent --remove-port="${port}/${proto}" >/dev/null 2>&1 || true
-      firewall-cmd --reload >/dev/null 2>&1 || true
-      echo -e "  防火墙  : ${D}firewalld 撤销 ${port}/${proto}${N}"
+      if firewall_owned_port_has firewalld "$port" "$proto"; then
+        if ! firewall_backend_remove_port_raw firewalld "$port" "$proto"; then
+          return 1
+        fi
+        if ! firewall_owned_port_remove firewalld "$port" "$proto"; then
+          if ! firewall_backend_add_port_raw firewalld "$port" "$proto" >/dev/null 2>&1; then
+            echo -e "${R}firewalld 所有权记录更新失败，且旧规则恢复失败：${port}/${proto}${N}" >&2
+          fi
+          return 1
+        fi
+        echo -e "  防火墙  : ${D}firewalld 已撤销脚本托管的 ${port}/${proto}${N}"
+      else
+        echo -e "  防火墙  : ${D}firewalld 的 ${port}/${proto} 非脚本托管，已保留${N}"
+      fi
       ;;
     *)
       :
       ;;
   esac
+  return 0
+}
+
+firewall_managed_chain_exists(){
+  local family="$1"
+  local cmd chain
+  case "$family" in
+    4) cmd="iptables"; chain="$IP4_LEYILI_CHAIN" ;;
+    6) cmd="ip6tables"; chain="$IP6_LEYILI_CHAIN" ;;
+    *) return 1 ;;
+  esac
+  command -v "$cmd" >/dev/null 2>&1 || return 1
+  "$cmd" -nL "$chain" >/dev/null 2>&1
+}
+
+firewall_ensure_managed_chain(){
+  local family="$1"
+  local cmd chain
+  case "$family" in
+    4) cmd="iptables"; chain="$IP4_LEYILI_CHAIN" ;;
+    6) cmd="ip6tables"; chain="$IP6_LEYILI_CHAIN" ;;
+    *) return 1 ;;
+  esac
+  command -v "$cmd" >/dev/null 2>&1 || return 1
+  "$cmd" -nL "$chain" >/dev/null 2>&1 || "$cmd" -N "$chain" || return 1
+  # 放在 INPUT 末尾：先让 fail2ban / 用户已有规则执行，避免脚本 ACCEPT 绕过封禁链。
+  "$cmd" -C INPUT -j "$chain" >/dev/null 2>&1 || "$cmd" -A INPUT -j "$chain" || return 1
+}
+
+firewall_add_managed_port(){
+  local family="$1" proto="$2" port="$3"
+  local cmd chain
+  case "$family" in
+    4) cmd="iptables"; chain="$IP4_LEYILI_CHAIN" ;;
+    6) cmd="ip6tables"; chain="$IP6_LEYILI_CHAIN" ;;
+    *) return 1 ;;
+  esac
+  firewall_ensure_managed_chain "$family" || return 1
+  "$cmd" -C "$chain" -p "$proto" --dport "$port" -m comment --comment "leyili-managed" -j ACCEPT >/dev/null 2>&1 \
+    || "$cmd" -A "$chain" -p "$proto" --dport "$port" -m comment --comment "leyili-managed" -j ACCEPT
+}
+
+firewall_remove_managed_port(){
+  local family="$1" proto="$2" port="$3"
+  local cmd chain removed=0
+  case "$family" in
+    4) cmd="iptables"; chain="$IP4_LEYILI_CHAIN" ;;
+    6) cmd="ip6tables"; chain="$IP6_LEYILI_CHAIN" ;;
+    *) return 1 ;;
+  esac
+  firewall_managed_chain_exists "$family" || return 0
+  while "$cmd" -C "$chain" -p "$proto" --dport "$port" -m comment --comment "leyili-managed" -j ACCEPT >/dev/null 2>&1; do
+    if ! "$cmd" -D "$chain" -p "$proto" --dport "$port" -m comment --comment "leyili-managed" -j ACCEPT; then
+      return 1
+    fi
+    removed=1
+  done
+  [ "$removed" -eq 0 ] || return 0
+}
+
+firewall_remove_managed_chain(){
+  local family="$1"
+  local cmd chain
+  case "$family" in
+    4) cmd="iptables"; chain="$IP4_LEYILI_CHAIN" ;;
+    6) cmd="ip6tables"; chain="$IP6_LEYILI_CHAIN" ;;
+    *) return 1 ;;
+  esac
+  command -v "$cmd" >/dev/null 2>&1 || return 0
+  while "$cmd" -C INPUT -j "$chain" >/dev/null 2>&1; do
+    "$cmd" -D INPUT -j "$chain" || return 1
+  done
+  if "$cmd" -nL "$chain" >/dev/null 2>&1; then
+    "$cmd" -F "$chain" || return 1
+    "$cmd" -X "$chain" || return 1
+  fi
 }
 
 # 节点入站统一开放端口：
@@ -242,7 +916,7 @@ node_apply_firewall_for_mode(){
   local port="$1"
   local proto="${2:-tcp}"
   local mode="${3:-ipv4}"
-  local need_v4=0 need_v6=0
+  local need_v4=0 need_v6=0 backend txn
 
   case "$mode" in
     ipv4)              need_v4=1 ;;
@@ -251,41 +925,43 @@ node_apply_firewall_for_mode(){
     *)                 need_v4=1 ;;
   esac
 
-  # ufw / firewalld 是双栈，只要任一侧需要就调一次
+  backend=$(detect_firewall_backend)
+  # ufw / firewalld 是双栈，只要任一侧需要就调一次。
   if [ "$need_v4" = "1" ] || [ "$need_v6" = "1" ]; then
-    allow_port_in_firewall "$port" "$proto"
+    allow_port_in_firewall "$port" "$proto" || return 1
   fi
 
-  # 脚本自管的 iptables 防火墙（默认策略 DROP 时 INPUT 是白名单制）
-  if [ "$need_v4" = "1" ] && command -v iptables >/dev/null 2>&1; then
-    local v4_pol
-    v4_pol=$(ip4_get_input_policy 2>/dev/null || true)
-    if [ "$v4_pol" = "DROP" ]; then
-      if iptables -C INPUT -p "$proto" --dport "$port" -j ACCEPT 2>/dev/null; then
-        echo -e "  v4 防火墙: ${D}${port}/${proto} 已在放行列表${N}"
-      else
-        iptables -A INPUT -p "$proto" --dport "$port" -j ACCEPT 2>/dev/null \
-          && echo -e "  v4 防火墙: ${C}iptables 已放行 ${port}/${proto}${N}" \
-          || echo -e "  v4 防火墙: ${Y}iptables 放行失败，请手动检查${N}"
-        ip4_save_rules >/dev/null 2>&1 || true
-      fi
+  # ufw/firewalld 活跃时不再额外插裸 iptables ACCEPT，避免绕过其封禁语义。
+  if [ "$backend" != "none" ]; then
+    return 0
+  fi
+
+  if [ "$need_v4" = "1" ] && command -v iptables >/dev/null 2>&1 \
+     && { [ "$(ip4_get_input_policy 2>/dev/null)" = "DROP" ] || firewall_managed_chain_exists 4; }; then
+    txn=$(firewall_transaction_begin 4) || return 1
+    if firewall_add_managed_port 4 "$proto" "$port" && ip4_save_rules; then
+      firewall_transaction_commit "$txn"
+      echo -e "  v4 防火墙: ${C}已放行 ${port}/${proto}${N}"
+    else
+      firewall_transaction_rollback 4 "$txn"
+      echo -e "  v4 防火墙: ${R}放行失败，已恢复原规则${N}"
+      return 1
     fi
   fi
 
-  if [ "$need_v6" = "1" ] && command -v ip6tables >/dev/null 2>&1; then
-    local v6_pol
-    v6_pol=$(ip6_get_input_policy 2>/dev/null || true)
-    if [ "$v6_pol" = "DROP" ]; then
-      if ip6tables -C INPUT -p "$proto" --dport "$port" -j ACCEPT 2>/dev/null; then
-        echo -e "  v6 防火墙: ${D}${port}/${proto} 已在放行列表${N}"
-      else
-        ip6tables -A INPUT -p "$proto" --dport "$port" -j ACCEPT 2>/dev/null \
-          && echo -e "  v6 防火墙: ${C}ip6tables 已放行 ${port}/${proto}${N}" \
-          || echo -e "  v6 防火墙: ${Y}ip6tables 放行失败，请手动检查${N}"
-        ip6_save_rules >/dev/null 2>&1 || true
-      fi
+  if [ "$need_v6" = "1" ] && command -v ip6tables >/dev/null 2>&1 \
+     && { [ "$(ip6_get_input_policy 2>/dev/null)" = "DROP" ] || firewall_managed_chain_exists 6; }; then
+    txn=$(firewall_transaction_begin 6) || return 1
+    if firewall_add_managed_port 6 "$proto" "$port" && ip6_save_rules; then
+      firewall_transaction_commit "$txn"
+      echo -e "  v6 防火墙: ${C}已放行 ${port}/${proto}${N}"
+    else
+      firewall_transaction_rollback 6 "$txn"
+      echo -e "  v6 防火墙: ${R}放行失败，已恢复原规则${N}"
+      return 1
     fi
   fi
+  return 0
 }
 
 # 节点入站统一撤销端口（uninstall / 改端口时配套使用）
@@ -294,7 +970,7 @@ node_revoke_firewall_for_mode(){
   local port="$1"
   local proto="${2:-tcp}"
   local mode="${3:-ipv4}"
-  local need_v4=0 need_v6=0
+  local need_v4=0 need_v6=0 backend txn
 
   case "$mode" in
     ipv4)              need_v4=1 ;;
@@ -303,33 +979,35 @@ node_revoke_firewall_for_mode(){
     *)                 need_v4=1 ;;
   esac
 
+  backend=$(detect_firewall_backend)
   if [ "$need_v4" = "1" ] || [ "$need_v6" = "1" ]; then
-    deny_port_in_firewall "$port" "$proto"
+    deny_port_in_firewall "$port" "$proto" || return 1
   fi
 
-  if [ "$need_v4" = "1" ] && command -v iptables >/dev/null 2>&1; then
-    local v4_removed=0
-    while iptables -C INPUT -p "$proto" --dport "$port" -j ACCEPT 2>/dev/null; do
-      iptables -D INPUT -p "$proto" --dport "$port" -j ACCEPT 2>/dev/null || break
-      v4_removed=1
-    done
-    if [ "$v4_removed" = "1" ]; then
-      echo -e "  v4 防火墙: ${D}iptables 撤销 ${port}/${proto}${N}"
-      ip4_save_rules >/dev/null 2>&1 || true
+  [ "$backend" != "none" ] && return 0
+
+  if [ "$need_v4" = "1" ] && firewall_managed_chain_exists 4; then
+    txn=$(firewall_transaction_begin 4) || return 1
+    if firewall_remove_managed_port 4 "$proto" "$port" && ip4_save_rules; then
+      firewall_transaction_commit "$txn"
+      echo -e "  v4 防火墙: ${D}已撤销 ${port}/${proto}${N}"
+    else
+      firewall_transaction_rollback 4 "$txn"
+      return 1
     fi
   fi
 
-  if [ "$need_v6" = "1" ] && command -v ip6tables >/dev/null 2>&1; then
-    local v6_removed=0
-    while ip6tables -C INPUT -p "$proto" --dport "$port" -j ACCEPT 2>/dev/null; do
-      ip6tables -D INPUT -p "$proto" --dport "$port" -j ACCEPT 2>/dev/null || break
-      v6_removed=1
-    done
-    if [ "$v6_removed" = "1" ]; then
-      echo -e "  v6 防火墙: ${D}ip6tables 撤销 ${port}/${proto}${N}"
-      ip6_save_rules >/dev/null 2>&1 || true
+  if [ "$need_v6" = "1" ] && firewall_managed_chain_exists 6; then
+    txn=$(firewall_transaction_begin 6) || return 1
+    if firewall_remove_managed_port 6 "$proto" "$port" && ip6_save_rules; then
+      firewall_transaction_commit "$txn"
+      echo -e "  v6 防火墙: ${D}已撤销 ${port}/${proto}${N}"
+    else
+      firewall_transaction_rollback 6 "$txn"
+      return 1
     fi
   fi
+  return 0
 }
 
 # 给用户打印"请自行放行端口"的提示，覆盖 IPv4(ufw/firewalld)、IPv6(本脚本菜单)、云安全组
@@ -480,31 +1158,101 @@ ensure_iptables_installed(){
 
 ip6_save_rules(){
   local target="$IP6_RULES_PATH_DEBIAN"
+  local tmp
 
   if ! is_debian_family; then
     target="$IP6_RULES_PATH_RHEL"
   fi
 
-  mkdir -p "$(dirname "$target")"
-  if ! ip6tables-save > "$target"; then
+  mkdir -p "$(dirname "$target")" || return 1
+  tmp=$(mktemp "${target}.tmp.XXXXXX") || return 1
+  if ! ip6tables-save > "$tmp"; then
+    rm -f -- "$tmp"
     return 1
   fi
-  return 0
+  chmod 600 "$tmp" || { rm -f -- "$tmp"; return 1; }
+  mv -f -- "$tmp" "$target"
 }
 
 # ─── IPv4 防火墙底层 helpers ──────────────────────────
 ip4_save_rules(){
   local target="$IP4_RULES_PATH_DEBIAN"
+  local tmp
 
   if ! is_debian_family; then
     target="$IP4_RULES_PATH_RHEL"
   fi
 
-  mkdir -p "$(dirname "$target")"
-  if ! iptables-save > "$target"; then
+  mkdir -p "$(dirname "$target")" || return 1
+  tmp=$(mktemp "${target}.tmp.XXXXXX") || return 1
+  if ! iptables-save > "$tmp"; then
+    rm -f -- "$tmp"
     return 1
   fi
-  return 0
+  chmod 600 "$tmp" || { rm -f -- "$tmp"; return 1; }
+  mv -f -- "$tmp" "$target"
+}
+
+firewall_transaction_begin(){
+  local family="$1"
+  local txn save_cmd target
+
+  case "$family" in
+    4)
+      save_cmd="iptables-save"
+      target="$IP4_RULES_PATH_DEBIAN"
+      is_debian_family || target="$IP4_RULES_PATH_RHEL"
+      ;;
+    6)
+      save_cmd="ip6tables-save"
+      target="$IP6_RULES_PATH_DEBIAN"
+      is_debian_family || target="$IP6_RULES_PATH_RHEL"
+      ;;
+    *) return 1 ;;
+  esac
+  command -v "$save_cmd" >/dev/null 2>&1 || return 1
+  txn=$(mktemp -d "${TMPDIR:-/tmp}/leyili-fw${family}.XXXXXX") || return 1
+  chmod 700 "$txn" 2>/dev/null || { rm -rf -- "$txn"; return 1; }
+  if ! "$save_cmd" > "$txn/active.rules"; then
+    rm -rf -- "$txn"
+    return 1
+  fi
+  printf '%s\n' "$target" > "$txn/persistent.path"
+  if [ -f "$target" ]; then
+    cp -a -- "$target" "$txn/persistent.rules" || { rm -rf -- "$txn"; return 1; }
+    : > "$txn/persistent.existed"
+  fi
+  printf '%s' "$txn"
+}
+
+firewall_transaction_rollback(){
+  local family="$1" txn="$2"
+  local restore_cmd target rc=0
+
+  [ -d "$txn" ] || return 1
+  case "$family" in
+    4) restore_cmd="iptables-restore" ;;
+    6) restore_cmd="ip6tables-restore" ;;
+    *) return 1 ;;
+  esac
+  "$restore_cmd" < "$txn/active.rules" 2>/dev/null || rc=1
+  target=$(cat "$txn/persistent.path" 2>/dev/null)
+  if [ -n "$target" ]; then
+    if [ -f "$txn/persistent.existed" ]; then
+      restore_file_snapshot "$txn/persistent.rules" "$target" || rc=1
+    else
+      rm -f -- "$target" || rc=1
+    fi
+  fi
+  if [ "$rc" -eq 0 ]; then
+    rm -rf -- "$txn" || rc=1
+  fi
+  [ "$rc" -eq 0 ] || echo -e "${R}警告：IPv${family} 防火墙回滚未完全成功，请立即检查规则；快照保留在 ${txn}${N}" >&2
+  return "$rc"
+}
+
+firewall_transaction_commit(){
+  rm -rf -- "$1"
 }
 
 ip4_get_input_policy(){
@@ -547,61 +1295,34 @@ ip4_detect_1panel(){
   return 1
 }
 
-# 把 IPv4 防火墙交还 1Panel：清掉 INPUT 规则 + 默认策略 ACCEPT，并持久化
+# 把 IPv4 防火墙交还 1Panel：只清脚本专属链，保留用户/fail2ban 规则。
 ip4_handover_to_1panel(){
-  iptables -P INPUT ACCEPT 2>/dev/null || return 1
-  iptables -F INPUT 2>/dev/null || return 1
-  ip4_save_rules >/dev/null 2>&1 || true
-  return 0
+  local txn
+  txn=$(firewall_transaction_begin 4) || return 1
+  if iptables -P INPUT ACCEPT \
+     && firewall_remove_managed_chain 4 \
+     && ip4_save_rules; then
+    firewall_transaction_commit "$txn"
+    return 0
+  fi
+  firewall_transaction_rollback 4 "$txn"
+  return 1
 }
 
-# ─── 防火墙锁库兜底机制 ──────────────────────────────
-# 验证 sshd 真的在指定端口监听（不依赖 sshd 进程名 grep，更稳）
+# ─── 防火墙锁库校验 ──────────────────────────────────
+# 验证指定 SSH 端口确实在监听；兼容 ssh.socket 下监听进程显示为 systemd。
 verify_sshd_listening_on_port(){
   local port="$1"
   if [ -z "$port" ]; then return 1; fi
   # 无 ss 工具时无法验证 → 视为未通过，让调用方触发回滚保护
   # （ss 在 Debian/Ubuntu 默认 iproute2 内，缺失极罕见）
   command -v ss >/dev/null 2>&1 || return 1
-  ss -tlnp 2>/dev/null \
-    | awk -v p=":${port}$" '$4 ~ p && $0 ~ /sshd/ {found=1} END {exit !found}'
-}
-
-# 安排一个延时回滚守护：seconds 秒后自动恢复 iptables/ip6tables 备份
-# 用法：rb_pid=$(schedule_iptables_rollback 180 /tmp/v4.bak /tmp/v6.bak)
-# 取消：cancel_rollback_pid "$rb_pid"
-schedule_iptables_rollback(){
-  local seconds="${1:-180}"
-  local backup_v4="${2:-}"
-  local backup_v6="${3:-}"
-  local cmd=""
-
-  if [ -n "$backup_v4" ] && [ -s "$backup_v4" ]; then
-    cmd="iptables-restore < '$backup_v4' 2>/dev/null; "
-  fi
-  if [ -n "$backup_v6" ] && [ -s "$backup_v6" ]; then
-    cmd="${cmd}ip6tables-restore < '$backup_v6' 2>/dev/null; "
-  fi
-  if [ -z "$cmd" ]; then
-    return 1
-  fi
-
-  # 用 setsid 让守护脱离会话，避免 SSH 断开被 SIGHUP 杀掉
-  setsid bash -c "sleep $seconds; $cmd rm -f '$backup_v4' '$backup_v6' 2>/dev/null" \
-    </dev/null >/dev/null 2>&1 &
-  local pid=$!
-  disown "$pid" 2>/dev/null || true
-  printf '%s' "$pid"
-}
-
-cancel_rollback_pid(){
-  local pid="$1"
-  [ -n "$pid" ] || return 0
-  kill "$pid" 2>/dev/null || true
+  ss -tlnH 2>/dev/null \
+    | awk -v p=":${port}$" '$4 ~ p {found=1} END {exit !found}'
 }
 # ═══ source: 02-utils-ui.sh ═══
 register_sb_command(){
-  local source_path="" src_real dst_real
+  local source_path="" src_real dst_real tmp_file="" actual_sha=""
 
   if [ -n "${BASH_SOURCE[0]:-}" ] && [ -f "${BASH_SOURCE[0]}" ]; then
     source_path="${BASH_SOURCE[0]}"
@@ -615,25 +1336,43 @@ register_sb_command(){
     src_real=$(readlink -f "$source_path" 2>/dev/null || printf '%s' "$source_path")
     dst_real=$(readlink -f "$SCRIPT_PATH" 2>/dev/null || printf '%s' "$SCRIPT_PATH")
     if [ -n "$src_real" ] && [ "$src_real" = "$dst_real" ]; then
-      chmod +x "$SCRIPT_PATH" 2>/dev/null || true
-      return 0
+      chmod 755 "$SCRIPT_PATH" 2>/dev/null && return 0
+      echo -e "${Y}警告：无法修正 ${SCRIPT_PATH} 的执行权限${N}" >&2
+      return 1
     fi
   fi
 
   if [ -n "$source_path" ]; then
-    if cp "$source_path" "$SCRIPT_PATH" 2>/dev/null && chmod +x "$SCRIPT_PATH" 2>/dev/null; then
+    if [ -L "$SCRIPT_PATH" ]; then
+      echo -e "${Y}警告：拒绝覆盖符号链接脚本入口 ${SCRIPT_PATH}${N}" >&2
+      return 1
+    fi
+    if bash -n "$source_path" >/dev/null 2>&1 \
+       && atomic_replace_file "$source_path" "$SCRIPT_PATH" 755; then
       return 0
     fi
   fi
 
-  if [ -n "$SELF_INSTALL_URL" ]; then
-    if curl -fsSL --max-time 15 "$SELF_INSTALL_URL" -o "$SCRIPT_PATH" && chmod +x "$SCRIPT_PATH"; then
-      return 0
+  # 无本地源时不静默执行可变 URL。只有显式提供固定 SHA-256 才允许下载安装。
+  if [ -n "$SELF_INSTALL_URL" ] && [ -n "$SELF_INSTALL_SHA256" ]; then
+    case "$SELF_INSTALL_URL" in https://*) ;; *) return 1 ;; esac
+    tmp_file=$(mktemp) || return 1
+    if curl --proto '=https' --proto-redir '=https' --tlsv1.2 -fsSL --max-time 15 \
+         "$SELF_INSTALL_URL" -o "$tmp_file" \
+       && bash -n "$tmp_file" >/dev/null 2>&1; then
+      actual_sha=$(sha256sum "$tmp_file" 2>/dev/null | awk '{print tolower($1)}')
+      if [ -n "$actual_sha" ] \
+         && [ "$actual_sha" = "$(printf '%s' "$SELF_INSTALL_SHA256" | tr 'A-F' 'a-f')" ] \
+         && atomic_replace_file "$tmp_file" "$SCRIPT_PATH" 755; then
+        rm -f -- "$tmp_file"
+        return 0
+      fi
     fi
+    rm -f -- "$tmp_file"
   fi
 
   echo -e "${Y}警告：${N} 无法自动安装 ${B}${APP_NAME}${N} 到 ${SCRIPT_PATH}。"
-  echo -e "  请从本地文件运行脚本，或在安装前设置 ${B}SELF_INSTALL_URL${N}。"
+  echo -e "  请从本地文件运行脚本；无本地源时需同时设置 ${B}SELF_INSTALL_URL${N} 与 ${B}SELF_INSTALL_SHA256${N}。"
   return 1
 }
 
@@ -703,7 +1442,6 @@ validate_port(){
 sanitize_sni(){
   printf '%s' "$1" | tr -d '\r\n' | tr -d '"'
 }
-
 # ═══ source: 03-system-admin-low.sh ═══
 require_root(){
   if [ "$(id -u)" -eq 0 ]; then
@@ -765,7 +1503,12 @@ get_sshd_binary(){
 get_current_ssh_port(){
   local current_port=""
 
-  if [ -f "$SSHD_CONFIG_PATH" ]; then
+  current_port=$(get_effective_sshd_value Port root 127.0.0.1 2>/dev/null || true)
+  case "$current_port" in
+    ''|*[!0-9]*) current_port="" ;;
+  esac
+
+  if [ -z "$current_port" ] && [ -f "$SSHD_CONFIG_PATH" ]; then
     current_port=$(awk '
       BEGIN { in_match = 0 }
       /^[[:space:]]*Match[[:space:]]+/ {
@@ -790,8 +1533,11 @@ get_current_ssh_port(){
 # 返回小写值，找不到时返回空。失败不终止调用方。
 get_effective_sshd_value(){
   local key="$1"
+  local user="${2:-root}"
+  local addr="${3:-127.0.0.1}"
   local sshd_bin=""
   local lower_key=""
+  local host=""
 
   [ -z "$key" ] && return 0
   sshd_bin=$(get_sshd_binary)
@@ -799,7 +1545,9 @@ get_effective_sshd_value(){
   [ ! -f "$SSHD_CONFIG_PATH" ] && return 0
 
   lower_key=$(printf '%s' "$key" | tr '[:upper:]' '[:lower:]')
-  "$sshd_bin" -T -f "$SSHD_CONFIG_PATH" 2>/dev/null \
+  host=$(hostname -f 2>/dev/null || hostname 2>/dev/null || echo localhost)
+  "$sshd_bin" -T -f "$SSHD_CONFIG_PATH" \
+    -C "user=${user},host=${host},addr=${addr}" 2>/dev/null \
     | awk -v k="$lower_key" 'tolower($1) == k {print $2; exit}'
 }
 
@@ -814,6 +1562,7 @@ neutralize_sshd_dropin_overrides(){
   local timestamp=""
   local touched=0
   local lower_expected=""
+  local tmp_file=""
 
   [ -z "$key" ] && return 1
   [ -d "$dropin_dir" ] || return 0
@@ -835,9 +1584,13 @@ neutralize_sshd_dropin_overrides(){
       }
       END{ exit !found }
     ' "$file"; then
-      cp "$file" "${file}.bak.${timestamp}" 2>/dev/null || true
+      if ! cp -a -- "$file" "${file}.bak.${timestamp}"; then
+        shopt -u nullglob
+        return 1
+      fi
       # 注释掉所有 <key> 行（在 Match 之前），保留 Match 之后不动
-      awk -v k="$key" '
+      tmp_file=$(mktemp "${file}.tmp.XXXXXX") || { shopt -u nullglob; return 1; }
+      if ! awk -v k="$key" '
         BEGIN{ in_match=0 }
         /^[[:space:]]*Match[[:space:]]+/ { in_match=1; print; next }
         {
@@ -847,7 +1600,22 @@ neutralize_sshd_dropin_overrides(){
           }
           print
         }
-      ' "$file" > "${file}.tmp.$$" && mv "${file}.tmp.$$" "$file"
+      ' "$file" > "$tmp_file"; then
+        rm -f -- "$tmp_file"
+        shopt -u nullglob
+        return 1
+      fi
+      if ! chmod --reference="$file" "$tmp_file" 2>/dev/null \
+         || ! chown --reference="$file" "$tmp_file" 2>/dev/null; then
+        rm -f -- "$tmp_file"
+        shopt -u nullglob
+        return 1
+      fi
+      if ! mv -f -- "$tmp_file" "$file"; then
+        rm -f -- "$tmp_file"
+        shopt -u nullglob
+        return 1
+      fi
       touched=1
       echo -e "  ${Y}已注释覆盖项：${N}${C}${file}${N} ${D}(备份 .bak.${timestamp})${N}"
     fi
@@ -879,7 +1647,7 @@ set_sshd_global_directive(){
   local value="$2"
   local tmp_file=""
 
-  tmp_file=$(mktemp)
+  tmp_file=$(mktemp "${SSHD_CONFIG_PATH}.tmp.XXXXXX") || return 1
   if ! awk -v key="$key" -v value="$value" '
     BEGIN {
       updated = 0
@@ -910,7 +1678,154 @@ set_sshd_global_directive(){
     return 1
   fi
 
-  mv "$tmp_file" "$SSHD_CONFIG_PATH"
+  chmod --reference="$SSHD_CONFIG_PATH" "$tmp_file" 2>/dev/null \
+    || chmod 600 "$tmp_file" 2>/dev/null \
+    || { rm -f -- "$tmp_file"; return 1; }
+  chown --reference="$SSHD_CONFIG_PATH" "$tmp_file" 2>/dev/null \
+    || { rm -f -- "$tmp_file"; return 1; }
+  mv -f "$tmp_file" "$SSHD_CONFIG_PATH"
+}
+
+sshd_transaction_begin(){
+  local txn
+  txn=$(mktemp -d "${TMPDIR:-/tmp}/leyili-sshd.XXXXXX") || return 1
+  chmod 700 "$txn" 2>/dev/null || { rm -rf -- "$txn"; return 1; }
+  cp -a -- "$SSHD_CONFIG_PATH" "$txn/sshd_config" || { rm -rf -- "$txn"; return 1; }
+  if [ -d /etc/ssh/sshd_config.d ]; then
+    cp -a -- /etc/ssh/sshd_config.d "$txn/sshd_config.d" || { rm -rf -- "$txn"; return 1; }
+    : > "$txn/sshd_config.d.existed"
+  fi
+  if [ -f "$SSHD_SOCKET_DROPIN_PATH" ]; then
+    cp -a -- "$SSHD_SOCKET_DROPIN_PATH" "$txn/ssh.socket.conf" || { rm -rf -- "$txn"; return 1; }
+    : > "$txn/ssh.socket.conf.existed"
+  fi
+  if systemctl is-active --quiet ssh.socket 2>/dev/null; then : > "$txn/socket.active"; fi
+  if systemctl is-enabled --quiet ssh.socket 2>/dev/null; then : > "$txn/socket.enabled"; fi
+  printf '%s' "$txn"
+}
+
+sshd_transaction_restore(){
+  local txn="$1"
+  local prepared="" current_backup="" rc=0 dropin_ok=1
+  [ -d "$txn" ] || return 1
+
+  restore_file_snapshot "$txn/sshd_config" "$SSHD_CONFIG_PATH" || rc=1
+
+  if [ -f "$txn/sshd_config.d.existed" ]; then
+    prepared=$(mktemp -d "/etc/ssh/.sshd_config.d.restore.XXXXXX") || rc=1
+    if [ -n "$prepared" ] && ! cp -a -- "$txn/sshd_config.d/." "$prepared/"; then
+      rm -rf -- "$prepared"
+      prepared=""
+      rc=1
+    fi
+    if [ -n "$prepared" ]; then
+      if [ -e /etc/ssh/sshd_config.d ]; then
+        current_backup=$(mktemp -d "/etc/ssh/.sshd_config.d.current.XXXXXX") || {
+          rm -rf -- "$prepared"
+          prepared=""
+          rc=1
+          dropin_ok=0
+        }
+        if [ -n "$current_backup" ] && ! rmdir -- "$current_backup"; then
+          rm -rf -- "$prepared" "$current_backup"
+          prepared=""
+          current_backup=""
+          rc=1
+          dropin_ok=0
+        fi
+      fi
+      if [ -n "$prepared" ] && [ -e /etc/ssh/sshd_config.d ]; then
+        if ! mv -- /etc/ssh/sshd_config.d "$current_backup"; then
+          rc=1
+          dropin_ok=0
+        fi
+      fi
+      if [ "$dropin_ok" -eq 1 ] && ! mv -- "$prepared" /etc/ssh/sshd_config.d; then
+        if [ -n "$current_backup" ] && [ -e "$current_backup" ]; then
+          mv -- "$current_backup" /etc/ssh/sshd_config.d 2>/dev/null || rc=1
+        fi
+        rc=1
+      elif [ "$dropin_ok" -ne 1 ]; then
+        [ -n "$prepared" ] && rm -rf -- "$prepared"
+      fi
+      if [ "$dropin_ok" -eq 1 ] && [ -n "$current_backup" ] && [ -e "$current_backup" ]; then
+        rm -rf -- "$current_backup" || rc=1
+      fi
+    fi
+  elif [ -e /etc/ssh/sshd_config.d ]; then
+    dropin_ok=1
+    current_backup=$(mktemp -d "/etc/ssh/.sshd_config.d.remove.XXXXXX") || { rc=1; dropin_ok=0; }
+    if [ -n "$current_backup" ]; then
+      rmdir -- "$current_backup" || { rc=1; dropin_ok=0; }
+      if [ "$dropin_ok" -eq 1 ]; then
+        mv -- /etc/ssh/sshd_config.d "$current_backup" || rc=1
+      fi
+      if [ ! -e /etc/ssh/sshd_config.d ] && [ -e "$current_backup" ]; then
+        rm -rf -- "$current_backup" || rc=1
+      fi
+    fi
+  fi
+
+  if [ -f "$txn/ssh.socket.conf.existed" ]; then
+    restore_file_snapshot "$txn/ssh.socket.conf" "$SSHD_SOCKET_DROPIN_PATH" || rc=1
+  else
+    rm -f -- "$SSHD_SOCKET_DROPIN_PATH" || rc=1
+  fi
+  systemctl daemon-reload >/dev/null 2>&1 || rc=1
+  if [ -f "$txn/socket.enabled" ]; then
+    systemctl enable ssh.socket >/dev/null 2>&1 || rc=1
+  else
+    systemctl disable ssh.socket >/dev/null 2>&1 || rc=1
+  fi
+  if [ -f "$txn/socket.active" ]; then
+    systemctl restart ssh.socket >/dev/null 2>&1 || rc=1
+  elif systemctl is-active --quiet ssh.socket 2>/dev/null; then
+    systemctl stop ssh.socket >/dev/null 2>&1 || rc=1
+  fi
+  return "$rc"
+}
+
+sshd_transaction_rollback(){
+  local txn="$1"
+  local service rc=0
+  sshd_transaction_restore "$txn" || rc=1
+  service=$(detect_ssh_service_name)
+  systemctl restart "$service" >/dev/null 2>&1 || rc=1
+  if [ "$rc" -eq 0 ]; then
+    rm -rf -- "$txn" || rc=1
+  fi
+  [ "$rc" -eq 0 ] || echo -e "${R}警告：SSH 配置回滚未完全成功，请保持当前会话并立即检查 sshd；快照保留在 ${txn}${N}" >&2
+  return "$rc"
+}
+
+sshd_transaction_commit(){
+  rm -rf -- "$1"
+}
+
+ssh_socket_activation_in_use(){
+  systemctl cat ssh.socket >/dev/null 2>&1 || return 1
+  systemctl is-active --quiet ssh.socket 2>/dev/null \
+    || systemctl is-enabled --quiet ssh.socket 2>/dev/null
+}
+
+configure_ssh_socket_port(){
+  local port="$1"
+  local dir tmp
+
+  ssh_socket_activation_in_use || return 0
+  dir=$(dirname -- "$SSHD_SOCKET_DROPIN_PATH")
+  mkdir -p "$dir" || return 1
+  tmp=$(mktemp "${SSHD_SOCKET_DROPIN_PATH}.tmp.XXXXXX") || return 1
+  cat > "$tmp" <<EOF
+# Managed by Leyili. Empty assignment resets vendor ListenStream entries.
+[Socket]
+ListenStream=
+ListenStream=${port}
+EOF
+  chmod 644 "$tmp" || { rm -f -- "$tmp"; return 1; }
+  mv -f -- "$tmp" "$SSHD_SOCKET_DROPIN_PATH" || return 1
+  systemctl daemon-reload || return 1
+  systemctl restart ssh.socket
 }
 
 apply_sshd_setting(){
@@ -924,6 +1839,7 @@ apply_sshd_setting(){
   local lower_key=""
   local lower_value=""
   local listen_ok=0
+  local txn=""
 
   if ! require_root; then
     return 1
@@ -944,8 +1860,14 @@ apply_sshd_setting(){
     return 1
   fi
 
+  txn=$(sshd_transaction_begin) || {
+    echo -e "${R}SSH 配置事务快照失败${N}"
+    pause_screen
+    return 1
+  }
   backup_path="${SSHD_CONFIG_PATH}.bak.$(date +%Y%m%d%H%M%S)"
   if ! cp "$SSHD_CONFIG_PATH" "$backup_path"; then
+    sshd_transaction_rollback "$txn"
     echo ""
     echo -e "${R}SSH 配置备份失败${N}"
     pause_screen
@@ -953,7 +1875,7 @@ apply_sshd_setting(){
   fi
 
   if ! set_sshd_global_directive "$key" "$value"; then
-    cp "$backup_path" "$SSHD_CONFIG_PATH" 2>/dev/null || true
+    sshd_transaction_rollback "$txn"
     echo ""
     echo -e "${R}SSH 配置写入失败，已恢复备份${N}"
     pause_screen
@@ -961,7 +1883,7 @@ apply_sshd_setting(){
   fi
 
   if ! "$sshd_bin" -t -f "$SSHD_CONFIG_PATH"; then
-    cp "$backup_path" "$SSHD_CONFIG_PATH" 2>/dev/null || true
+    sshd_transaction_rollback "$txn"
     echo ""
     echo -e "${R}SSH 配置校验失败，已恢复备份${N}"
     pause_screen
@@ -976,16 +1898,21 @@ apply_sshd_setting(){
   if [ -n "$effective_value" ] && [ "$(printf '%s' "$effective_value" | tr '[:upper:]' '[:lower:]')" != "$lower_value" ]; then
     echo -e "  ${Y}sshd -T 报告 ${key} 实际生效=${effective_value}，与目标 ${value} 不一致${N}"
     echo -e "  ${Y}尝试清理 /etc/ssh/sshd_config.d/*.conf 中的覆盖项...${N}"
-    neutralize_sshd_dropin_overrides "$key" "$value" || true
+    if ! neutralize_sshd_dropin_overrides "$key" "$value"; then
+      sshd_transaction_rollback "$txn"
+      echo -e "${R}处理 sshd_config.d 覆盖项失败，已完整回滚${N}"
+      pause_screen
+      return 1
+    fi
     if ! "$sshd_bin" -t -f "$SSHD_CONFIG_PATH"; then
-      cp "$backup_path" "$SSHD_CONFIG_PATH" 2>/dev/null || true
+      sshd_transaction_rollback "$txn"
       echo -e "${R}清理覆盖后 sshd -t 校验失败，已恢复备份${N}"
       pause_screen
       return 1
     fi
     effective_value=$(get_effective_sshd_value "$key")
     if [ -n "$effective_value" ] && [ "$(printf '%s' "$effective_value" | tr '[:upper:]' '[:lower:]')" != "$lower_value" ]; then
-      cp "$backup_path" "$SSHD_CONFIG_PATH" 2>/dev/null || true
+      sshd_transaction_rollback "$txn"
       echo ""
       echo -e "${R}sshd -T 仍显示 ${key}=${effective_value}，无法达到 ${value}，已恢复备份${N}"
       echo -e "${Y}可能存在 Match 块限制，请手动检查 /etc/ssh/sshd_config 与 /etc/ssh/sshd_config.d/${N}"
@@ -994,11 +1921,17 @@ apply_sshd_setting(){
     fi
   fi
 
+  if [ "$key" = "Port" ] && ! configure_ssh_socket_port "$value"; then
+    sshd_transaction_rollback "$txn"
+    echo ""
+    echo -e "${R}ssh.socket 端口配置失败，已恢复主配置、drop-in 与 socket 配置${N}"
+    pause_screen
+    return 1
+  fi
+
   ssh_service=$(detect_ssh_service_name)
   if ! systemctl restart "$ssh_service"; then
-    cp "$backup_path" "$SSHD_CONFIG_PATH" 2>/dev/null || true
-    "$sshd_bin" -t -f "$SSHD_CONFIG_PATH" >/dev/null 2>&1 || true
-    systemctl restart "$ssh_service" >/dev/null 2>&1 || true
+    sshd_transaction_rollback "$txn"
     echo ""
     echo -e "${R}SSH 服务重启失败，已恢复备份并尝试恢复原配置${N}"
     pause_screen
@@ -1019,8 +1952,7 @@ apply_sshd_setting(){
       i=$((i + 1))
     done
     if [ "$listen_ok" -ne 1 ]; then
-      cp "$backup_path" "$SSHD_CONFIG_PATH" 2>/dev/null || true
-      systemctl restart "$ssh_service" >/dev/null 2>&1 || true
+      sshd_transaction_rollback "$txn"
       echo ""
       echo -e "${R}sshd 已重启，但新端口 ${value} 未检测到监听，已回滚配置${N}"
       pause_screen
@@ -1028,96 +1960,14 @@ apply_sshd_setting(){
     fi
   fi
 
+  sshd_transaction_commit "$txn"
+
   echo ""
   echo -e "${G}${success_message}${N}"
   echo -e "  备份文件: ${C}$backup_path${N}"
   if [ "$key" = "Port" ]; then
     echo -e "  ${Y}重要：${N}请立即开新终端验证新端口可登录，再关闭当前会话！"
   fi
-  return 0
-}
-
-# 幂等：确保 SSH 密码登录全局生效
-# - 主 sshd_config 写入 PasswordAuthentication=yes、KbdInteractiveAuthentication=yes
-# - 清理 /etc/ssh/sshd_config.d/*.conf 里的反向覆盖
-# - sshd -t 校验 + sshd -T 验证实际生效值 + 重启服务
-# 失败时尽量回滚。返回 0=成功或已是预期状态，1=失败
-ensure_password_auth_enabled(){
-  local sshd_bin=""
-  local ssh_service=""
-  local backup_path=""
-  local effective=""
-  local need_restart=0
-
-  if ! require_root; then
-    return 1
-  fi
-
-  if [ ! -f "$SSHD_CONFIG_PATH" ]; then
-    echo -e "${R}未找到 $SSHD_CONFIG_PATH${N}"
-    return 1
-  fi
-
-  sshd_bin=$(get_sshd_binary)
-  if [ -z "$sshd_bin" ]; then
-    echo -e "${R}未找到 sshd 可执行文件${N}"
-    return 1
-  fi
-
-  # 已经 yes 就早退（幂等）
-  effective=$(get_effective_sshd_value PasswordAuthentication)
-  local kbd_effective
-  kbd_effective=$(get_effective_sshd_value KbdInteractiveAuthentication)
-  if [ "$effective" = "yes" ] && { [ -z "$kbd_effective" ] || [ "$kbd_effective" = "yes" ]; }; then
-    echo -e "  ${D}密码登录已启用（PasswordAuthentication=yes），跳过${N}"
-    return 0
-  fi
-
-  echo -e "${Y}==> 确保 SSH 密码登录可用${N}"
-  backup_path="${SSHD_CONFIG_PATH}.bak.$(date +%Y%m%d%H%M%S)"
-  if ! cp "$SSHD_CONFIG_PATH" "$backup_path"; then
-    echo -e "${R}SSH 配置备份失败${N}"
-    return 1
-  fi
-
-  if ! set_sshd_global_directive "PasswordAuthentication" "yes"; then
-    cp "$backup_path" "$SSHD_CONFIG_PATH" 2>/dev/null || true
-    echo -e "${R}写入 PasswordAuthentication 失败，已回滚${N}"
-    return 1
-  fi
-  if ! set_sshd_global_directive "KbdInteractiveAuthentication" "yes"; then
-    cp "$backup_path" "$SSHD_CONFIG_PATH" 2>/dev/null || true
-    echo -e "${R}写入 KbdInteractiveAuthentication 失败，已回滚${N}"
-    return 1
-  fi
-
-  neutralize_sshd_dropin_overrides "PasswordAuthentication" "yes" || true
-  neutralize_sshd_dropin_overrides "KbdInteractiveAuthentication" "yes" || true
-
-  if ! "$sshd_bin" -t -f "$SSHD_CONFIG_PATH"; then
-    cp "$backup_path" "$SSHD_CONFIG_PATH" 2>/dev/null || true
-    echo -e "${R}sshd -t 校验失败，已回滚主配置${N}"
-    return 1
-  fi
-
-  effective=$(get_effective_sshd_value PasswordAuthentication)
-  if [ -n "$effective" ] && [ "$effective" != "yes" ]; then
-    cp "$backup_path" "$SSHD_CONFIG_PATH" 2>/dev/null || true
-    echo -e "${R}sshd -T 显示 PasswordAuthentication 实际为 ${effective}，已回滚${N}"
-    echo -e "${Y}请手动检查 /etc/ssh/sshd_config.d/ 是否有未识别的覆盖${N}"
-    return 1
-  fi
-
-  ssh_service=$(detect_ssh_service_name)
-  if ! systemctl restart "$ssh_service"; then
-    cp "$backup_path" "$SSHD_CONFIG_PATH" 2>/dev/null || true
-    systemctl restart "$ssh_service" >/dev/null 2>&1 || true
-    echo -e "${R}SSH 服务重启失败，已回滚${N}"
-    return 1
-  fi
-
-  cleanup_old_backups "${SSHD_CONFIG_PATH}.bak.*" 5 2>/dev/null || true
-  echo -e "  ${G}PasswordAuthentication = yes (已生效)${N}"
   return 0
 }
 
@@ -1133,6 +1983,25 @@ is_private_ipv4(){
     100.6[4-9].*|100.[7-9][0-9].*|100.1[01][0-9].*|100.12[0-7].*) return 0 ;;
   esac
   return 1
+}
+
+is_valid_ipv4(){
+  local ip="$1" a b c d
+  IFS=. read -r a b c d <<EOF
+$ip
+EOF
+  [ -n "$a" ] && [ -n "$b" ] && [ -n "$c" ] && [ -n "$d" ] || return 1
+  case "$a$b$c$d" in *[!0-9]*) return 1 ;; esac
+  [ "$a" -le 255 ] && [ "$b" -le 255 ] && [ "$c" -le 255 ] && [ "$d" -le 255 ]
+}
+
+is_valid_ipv6_text(){
+  local ip="$1"
+  [ "${#ip}" -ge 2 ] && [ "${#ip}" -le 45 ] || return 1
+  case "$ip" in
+    *:*) printf '%s' "$ip" | grep -Eq '^[0-9A-Fa-f:.]+$' ;;
+    *) return 1 ;;
+  esac
 }
 
 # 判断 IPv6 是否属于 ULA / link-local / loopback / unspecified
@@ -1177,7 +2046,9 @@ detect_primary_ipv4(){
   fi
 
   if [ -z "$detected" ]; then
-    detected=$(curl -s4 --max-time 3 ip.sb 2>/dev/null || true)
+    detected=$(curl --proto '=https' --tlsv1.2 -fsS4 --max-time 5 \
+      https://api.ipify.org 2>/dev/null || true)
+    is_valid_ipv4 "$detected" || detected=""
   fi
 
   # curl 也失败时，宁可返回先前探到的内网 IP 也别返回空——
@@ -1220,7 +2091,9 @@ detect_primary_ipv6(){
   fi
 
   if [ -z "$detected" ]; then
-    detected=$(curl -s6 --max-time 3 ip.sb 2>/dev/null || true)
+    detected=$(curl --proto '=https' --tlsv1.2 -fsS6 --max-time 5 \
+      https://api64.ipify.org 2>/dev/null || true)
+    is_valid_ipv6_text "$detected" || detected=""
   fi
 
   if [ -z "$detected" ]; then
@@ -1243,14 +2116,88 @@ describe_install_mode(){
       ;;
   esac
 }
-
 # ═══ source: 10-singbox-core.sh ═══
 is_singbox_installed(){
   command -v sing-box >/dev/null 2>&1
 }
 
+sagernet_repo_state_get(){
+  local key="$1"
+  [ -f "$SAGERNET_REPO_STATE" ] || return 1
+  grep -m1 "^${key}=" "$SAGERNET_REPO_STATE" | cut -d= -f2-
+}
+
+sagernet_repo_capture_state(){
+  local source_existed=0 key_existed=0 tmp
+  [ -f "$SAGERNET_REPO_STATE" ] && return 0
+  ensure_leyili_state_dir || return 1
+
+  [ -e "$SAGERNET_SOURCES" ] && source_existed=1
+  [ -e "$SAGERNET_KEYRING" ] && key_existed=1
+  # 兼容旧版脚本：带明确托管标记的 sources 及其配套 key 视为脚本创建。
+  if grep -Fq '# Managed by Leyili' "$SAGERNET_SOURCES" 2>/dev/null; then
+    source_existed=0
+    key_existed=0
+  fi
+
+  tmp=$(mktemp "${SAGERNET_REPO_STATE}.tmp.XXXXXX") || return 1
+  if ! printf 'SourceExisted=%s\nKeyExisted=%s\n' "$source_existed" "$key_existed" > "$tmp" \
+     || ! chmod 600 "$tmp" \
+     || ! mv -f -- "$tmp" "$SAGERNET_REPO_STATE"; then
+    rm -f -- "$tmp"
+    return 1
+  fi
+}
+
+sagernet_repo_restore(){
+  local source_existed key_existed rc=0
+  source_existed=$(sagernet_repo_state_get SourceExisted 2>/dev/null || true)
+  key_existed=$(sagernet_repo_state_get KeyExisted 2>/dev/null || true)
+
+  case "$source_existed" in
+    0)
+      rm -f -- "$SAGERNET_SOURCES" "${SAGERNET_SOURCES}.leyili-original" || rc=1
+      ;;
+    1)
+      if [ -e "${SAGERNET_SOURCES}.leyili-original" ]; then
+        managed_file_restore "$SAGERNET_SOURCES" || rc=1
+      fi
+      ;;
+    *)
+      if [ -e "${SAGERNET_SOURCES}.leyili-original" ]; then
+        managed_file_restore "$SAGERNET_SOURCES" || rc=1
+      elif grep -Fq '# Managed by Leyili' "$SAGERNET_SOURCES" 2>/dev/null; then
+        rm -f -- "$SAGERNET_SOURCES" || rc=1
+      fi
+      ;;
+  esac
+
+  case "$key_existed" in
+    0)
+      rm -f -- "$SAGERNET_KEYRING" "${SAGERNET_KEYRING}.leyili-original" || rc=1
+      ;;
+    1)
+      if [ -e "${SAGERNET_KEYRING}.leyili-original" ]; then
+        managed_file_restore "$SAGERNET_KEYRING" || rc=1
+      fi
+      ;;
+    *)
+      # 无所有权记录时宁可保留未知 key；只有明确备份存在才恢复。
+      if [ -e "${SAGERNET_KEYRING}.leyili-original" ]; then
+        managed_file_restore "$SAGERNET_KEYRING" || rc=1
+      fi
+      ;;
+  esac
+
+  if [ "$rc" -eq 0 ]; then
+    rm -f -- "$SAGERNET_REPO_STATE" || rc=1
+  fi
+  return "$rc"
+}
+
 ensure_sagernet_repo(){
-  local pkg need=()
+  local pkg need=() tmp_key actual_fpr installed_fpr="" key_existed
+  local source_txn tmp_sources
   for pkg in curl gnupg ca-certificates; do
     command -v "$pkg" >/dev/null 2>&1 || dpkg -s "$pkg" >/dev/null 2>&1 || need+=("$pkg")
   done
@@ -1263,18 +2210,49 @@ ensure_sagernet_repo(){
   fi
 
   mkdir -p /etc/apt/keyrings || { echo -e "${R}无法创建 /etc/apt/keyrings${N}"; return 1; }
+  sagernet_repo_capture_state || { echo -e "${R}无法记录 SagerNet 仓库文件所有权${N}"; return 1; }
 
-  if [ ! -s "$SAGERNET_KEYRING" ]; then
-    if ! curl -fsSL --max-time 15 "$SAGERNET_KEY_URL" -o "$SAGERNET_KEYRING"; then
+  if [ -s "$SAGERNET_KEYRING" ]; then
+    installed_fpr=$(gpg --batch --show-keys --with-colons --fingerprint "$SAGERNET_KEYRING" 2>/dev/null \
+      | awk -F: '$1 == "fpr" {print toupper($10); exit}')
+  fi
+  if [ "$installed_fpr" != "$SAGERNET_KEY_FINGERPRINT" ]; then
+    tmp_key=$(mktemp) || return 1
+    if ! curl --proto '=https' --tlsv1.2 -fsSL --max-time 20 "$SAGERNET_KEY_URL" -o "$tmp_key"; then
       echo -e "${R}下载 SagerNet GPG key 失败：$SAGERNET_KEY_URL${N}"
-      rm -f "$SAGERNET_KEYRING"
+      rm -f -- "$tmp_key"
       return 1
     fi
-    chmod a+r "$SAGERNET_KEYRING"
+    actual_fpr=$(gpg --batch --show-keys --with-colons --fingerprint "$tmp_key" 2>/dev/null \
+      | awk -F: '$1 == "fpr" {print toupper($10); exit}')
+    if [ "$actual_fpr" != "$SAGERNET_KEY_FINGERPRINT" ]; then
+      echo -e "${R}SagerNet GPG key 指纹不匹配，拒绝安装${N}"
+      echo -e "  预期: ${C}${SAGERNET_KEY_FINGERPRINT}${N}"
+      echo -e "  实际: ${C}${actual_fpr:-无法解析}${N}"
+      rm -f -- "$tmp_key"
+      return 1
+    fi
+    key_existed=$(sagernet_repo_state_get KeyExisted 2>/dev/null || echo 0)
+    if [ "$key_existed" = "1" ] && [ -e "$SAGERNET_KEYRING" ] \
+       && [ ! -e "${SAGERNET_KEYRING}.leyili-original" ]; then
+      cp -a -- "$SAGERNET_KEYRING" "${SAGERNET_KEYRING}.leyili-original" \
+        || { rm -f -- "$tmp_key"; return 1; }
+    fi
+    if ! atomic_replace_file "$tmp_key" "$SAGERNET_KEYRING" 644; then
+      rm -f -- "$tmp_key"
+      return 1
+    fi
+    rm -f -- "$tmp_key"
   fi
 
-  if [ ! -f "$SAGERNET_SOURCES" ]; then
-    cat > "$SAGERNET_SOURCES" <<EOF
+  source_txn=$(managed_file_transaction_begin "$SAGERNET_SOURCES" 'Managed by Leyili|URIs:[[:space:]]*https://deb\.sagernet\.org/') \
+    || return 1
+  tmp_sources=$(mktemp "${SAGERNET_SOURCES}.tmp.XXXXXX") || {
+    managed_file_transaction_rollback "$SAGERNET_SOURCES" "$source_txn"
+    return 1
+  }
+  if ! cat > "$tmp_sources" <<EOF
+# Managed by Leyili
 Types: deb
 URIs: $SAGERNET_REPO_URI
 Suites: *
@@ -1282,21 +2260,36 @@ Components: *
 Enabled: yes
 Signed-By: $SAGERNET_KEYRING
 EOF
+  then
+    rm -f -- "$tmp_sources"
+    managed_file_transaction_rollback "$SAGERNET_SOURCES" "$source_txn"
+    return 1
   fi
+  if ! chmod 644 "$tmp_sources" \
+     || ! mv -f -- "$tmp_sources" "$SAGERNET_SOURCES"; then
+    rm -f -- "$tmp_sources"
+    managed_file_transaction_rollback "$SAGERNET_SOURCES" "$source_txn"
+    return 1
+  fi
+  managed_file_transaction_commit "$source_txn"
 
   return 0
 }
 
 install_singbox(){
+  local txn
   if ! ensure_sagernet_repo; then
     return 1
   fi
+
+  txn=$(config_transaction_begin singbox-install) || return 1
 
   # 关键：在 apt-get install 之前预写干净骨架，dpkg 看到 conffile 已存在
   # 配合 --force-confold 就不会落地 deb 自带的危险默认配置
   # （含端口 8080、固定密码 Gn1JUS14bLUHgv1cWDDp4A== 的 shadowsocks 入站）
   if ! config_ensure_skeleton; then
     echo -e "${R}写入 sing-box 配置骨架失败${N}"
+    config_transaction_rollback "$txn"
     return 1
   fi
 
@@ -1309,21 +2302,41 @@ install_singbox(){
         -o Dpkg::Options::="--force-confold" \
         sing-box; then
     echo -e "${R}apt-get install sing-box 失败${N}"
+    config_transaction_rollback "$txn"
     return 1
   fi
 
   if ! command -v sing-box >/dev/null 2>&1; then
     echo -e "${R}sing-box 安装后仍找不到可执行文件${N}"
+    config_transaction_rollback "$txn"
     return 1
   fi
 
   # postinst 可能已拉起服务（虽然此时配置是空骨架，无监听）。停下来由业务流程后续 restart。
-  systemctl stop sing-box >/dev/null 2>&1 || true
+  if systemctl is-active --quiet sing-box 2>/dev/null \
+     && ! systemctl stop sing-box >/dev/null 2>&1; then
+    echo -e "${R}sing-box 安装后自动启动，但无法安全停止${N}"
+    config_transaction_rollback "$txn"
+    return 1
+  fi
+  config_transaction_commit "$txn"
   return 0
 }
 
 upgrade_singbox(){
+  local old_pkg_version txn upgrade_ok=0
   if ! ensure_sagernet_repo; then
+    return 1
+  fi
+
+  old_pkg_version=$(dpkg-query -W -f='${Version}' sing-box 2>/dev/null || true)
+  txn=$(config_transaction_begin singbox-upgrade) || {
+    echo -e "${R}升级前配置快照失败${N}"
+    return 1
+  }
+  if [ -f "$CONFIG_PATH" ] && ! sing-box check -c "$CONFIG_PATH" >/dev/null 2>&1; then
+    echo -e "${R}当前配置本身未通过校验，已拒绝升级${N}"
+    config_transaction_rollback "$txn"
     return 1
   fi
 
@@ -1336,10 +2349,38 @@ upgrade_singbox(){
         -o Dpkg::Options::="--force-confold" \
         sing-box; then
     echo -e "${R}apt-get install --only-upgrade sing-box 失败${N}"
+    config_transaction_rollback "$txn"
     return 1
   fi
 
-  return 0
+  if [ -f "$CONFIG_PATH" ]; then
+    if [ -f "$txn/service.active" ]; then
+      config_check_and_restart && upgrade_ok=1
+    elif sing-box check -c "$CONFIG_PATH" >/dev/null 2>&1; then
+      if ! systemctl is-active --quiet sing-box 2>/dev/null \
+         || systemctl stop sing-box >/dev/null 2>&1; then
+        upgrade_ok=1
+      fi
+    fi
+  else
+    upgrade_ok=1
+  fi
+
+  if [ "$upgrade_ok" = "1" ]; then
+    config_transaction_commit "$txn"
+    return 0
+  fi
+
+  echo -e "${R}新版未通过配置/服务健康检查，开始回滚${N}"
+  if [ -n "$old_pkg_version" ]; then
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --allow-downgrades \
+      -o Dpkg::Options::="--force-confdef" \
+      -o Dpkg::Options::="--force-confold" \
+      "sing-box=${old_pkg_version}" >/dev/null 2>&1 || \
+      echo -e "${Y}旧版本 ${old_pkg_version} 已不在仓库，请人工安装后再启动服务${N}"
+  fi
+  config_transaction_rollback "$txn"
+  return 1
 }
 # ═══ source: 12-singbox-config-storage.sh ═══
 require_singbox_installed(){
@@ -1368,12 +2409,14 @@ set_info_value(){
   local value="$2"
   local tmp_file
 
+  mkdir -p "$(dirname -- "$INFO_PATH")" || return 1
   if [ ! -f "$INFO_PATH" ]; then
-    printf '%s=%s\n' "$key" "$value" > "$INFO_PATH"
+    (umask 077; printf '%s=%s\n' "$key" "$value" > "$INFO_PATH")
+    chmod 600 "$INFO_PATH" 2>/dev/null || return 1
     return 0
   fi
 
-  tmp_file=$(mktemp)
+  tmp_file=$(mktemp "${INFO_PATH}.tmp.XXXXXX") || return 1
   awk -v key="$key" -v value="$value" '
     BEGIN { updated = 0 }
     index($0, key "=") == 1 {
@@ -1388,12 +2431,14 @@ set_info_value(){
       }
     }
   ' "$INFO_PATH" > "$tmp_file"
-  mv "$tmp_file" "$INFO_PATH"
+  chmod 600 "$tmp_file" 2>/dev/null || { rm -f -- "$tmp_file"; return 1; }
+  mv -f "$tmp_file" "$INFO_PATH"
 }
 
 # ─── 节点存储 (per-node info file) ──────────────────
 ensure_nodes_dir(){
-  mkdir -p "$NODES_DIR" "$CERTS_DIR" 2>/dev/null || true
+  ensure_private_dir "$NODES_DIR" 700 || return 1
+  ensure_private_dir "$CERTS_DIR" 700 || return 1
 }
 
 node_info_path(){
@@ -1430,23 +2475,25 @@ get_node_value(){
 set_node_value(){
   local type="$1" key="$2" value="$3" f tmp
   f=$(node_info_path "$type")
-  ensure_nodes_dir
+  ensure_nodes_dir || return 1
   if [ ! -f "$f" ]; then
-    printf '%s=%s\n' "$key" "$value" > "$f"
+    (umask 077; printf '%s=%s\n' "$key" "$value" > "$f")
+    chmod 600 "$f" 2>/dev/null || return 1
     return 0
   fi
-  tmp=$(mktemp)
+  tmp=$(mktemp "${f}.tmp.XXXXXX") || return 1
   awk -v key="$key" -v value="$value" '
     BEGIN { updated = 0 }
     index($0, key "=") == 1 { print key "=" value; updated = 1; next }
     { print }
     END { if (!updated) print key "=" value }
   ' "$f" > "$tmp"
-  mv "$tmp" "$f"
+  chmod 600 "$tmp" 2>/dev/null || { rm -f -- "$tmp"; return 1; }
+  mv -f "$tmp" "$f"
 }
 
 remove_node_info(){
-  rm -f "$(node_info_path "$1")"
+  rm -f -- "$(node_info_path "$1")"
 }
 
 # 在多节点情况下让用户选一个节点；仅 1 个时直接回显；0 个返回 1
@@ -1502,9 +2549,13 @@ ensure_jq(){
 
 config_ensure_skeleton(){
   ensure_jq || return 1
-  mkdir -p /etc/sing-box
-  if [ ! -f "$CONFIG_PATH" ] || ! jq empty "$CONFIG_PATH" >/dev/null 2>&1; then
-    cat > "$CONFIG_PATH" <<'EOF'
+  local config_dir tmp invalid_backup
+  config_dir=$(dirname -- "$CONFIG_PATH")
+  mkdir -p "$config_dir" || return 1
+
+  if [ ! -f "$CONFIG_PATH" ]; then
+    tmp=$(mktemp "${CONFIG_PATH}.tmp.XXXXXX") || return 1
+    cat > "$tmp" <<'EOF'
 {
   "log": {"disabled": false, "level": "warn", "timestamp": true},
   "dns": {"servers": [{"type": "local", "tag": "dns-local"}]},
@@ -1519,40 +2570,48 @@ config_ensure_skeleton(){
   }
 }
 EOF
+    chmod 600 "$tmp" 2>/dev/null || { rm -f -- "$tmp"; return 1; }
+    mv -f "$tmp" "$CONFIG_PATH"
     return 0
   fi
 
-  local tmp
-  tmp=$(mktemp)
-  # 透明升级：
-  # 1) DNS 只保留一个 local 解析器（走系统 resolv.conf），不做任何劫持/分流；
-  #    清理老脚本残留的 hijack-dns 规则与出站级 domain_resolver
-  #    （sing-box 1.12+ 用户态出站如 WireGuard endpoint 拨域名必须有内部解析器，
-  #      否则运行时报 missing domain resolver，流量全断）
-  # 2) 若没 outbounds 或为空，建一条 tagged direct-out
-  # 3) 若 direct outbound 没 tag，加上 tag=direct-out
-  # 4) 确保 route 块存在，final 默认 direct-out，default_domain_resolver 指向 local
+  if ! jq empty "$CONFIG_PATH" >/dev/null 2>&1; then
+    invalid_backup="${CONFIG_PATH}.invalid.$(date +%Y%m%d%H%M%S)"
+    echo -e "${R}现有 sing-box 配置不是有效 JSON，已拒绝覆盖。${N}" >&2
+    if cp -a -- "$CONFIG_PATH" "$invalid_backup" 2>/dev/null; then
+      echo -e "${Y}原文件保留在 ${CONFIG_PATH}，副本：${invalid_backup}${N}" >&2
+    else
+      echo -e "${Y}原文件仍保留在 ${CONFIG_PATH}，但额外副本创建失败。${N}" >&2
+    fi
+    return 1
+  fi
+
+  tmp=$(mktemp "${CONFIG_PATH}.tmp.XXXXXX") || return 1
+  # 只补充脚本运行所需的缺失字段，绝不删除用户 inbound、DNS、路由或出站。
   if jq '
       .log = (.log // {"disabled": false, "level": "warn", "timestamp": true})
-    | .dns = {"servers": [{"type": "local", "tag": "dns-local"}]}
-    | .inbounds = ((.inbounds // []) | map(select(.tag == "reality-in" or .tag == "hy2-in" or .tag == "anytls-in" or .tag == "tuic-in" or .tag == "ss2022-in")))
-    | .outbounds = (if ((.outbounds // []) | length) == 0
-                    then [{"type":"direct","tag":"direct-out"}]
-                    else (.outbounds | map(
-                        if .type == "direct" and (.tag // "") == ""
-                        then .tag = "direct-out"
-                        else . end)
-                      | map(del(.domain_resolver)))
-                    end)
+    | .dns = (.dns // {})
+    | .dns.servers = (.dns.servers // [])
+    | if any(.dns.servers[]?; (.tag // "") == "dns-local")
+      then .
+      else .dns.servers += [{"type":"local","tag":"dns-local"}]
+      end
+    | .inbounds = (.inbounds // [])
+    | .outbounds = (.outbounds // [])
+    | if any(.outbounds[]?; (.tag // "") == "direct-out")
+      then .
+      else .outbounds += [{"type":"direct","tag":"direct-out"}]
+      end
     | .route = (.route // {})
-    | .route.default_domain_resolver = "dns-local"
-    | .route.rules = ((.route.rules // []) | map(select(.action != "hijack-dns" and (.port // null) != 53)))
+    | .route.default_domain_resolver = (.route.default_domain_resolver // "dns-local")
+    | .route.rules = (.route.rules // [])
     | .route.final = (.route.final // "direct-out")
   ' "$CONFIG_PATH" > "$tmp" 2>/dev/null; then
-    mv "$tmp" "$CONFIG_PATH"
+    chmod 600 "$tmp" 2>/dev/null || { rm -f -- "$tmp"; return 1; }
+    mv -f "$tmp" "$CONFIG_PATH"
     return 0
   fi
-  rm -f "$tmp"
+  rm -f -- "$tmp"
   return 1
 }
 
@@ -1566,27 +2625,30 @@ config_add_inbound(){
     echo -e "${R}内部错误：inbound 缺少 tag${N}"
     return 1
   fi
-  tmp=$(mktemp)
+  tmp=$(mktemp "${CONFIG_PATH}.tmp.XXXXXX") || return 1
   if ! jq --argjson nb "$inbound" --arg tag "$tag" '
     .inbounds = ((.inbounds // []) | map(select(.tag != $tag))) + [$nb]
   ' "$CONFIG_PATH" > "$tmp" 2>/dev/null; then
     rm -f "$tmp"
     return 1
   fi
-  mv "$tmp" "$CONFIG_PATH"
+  chmod 600 "$tmp" 2>/dev/null || { rm -f -- "$tmp"; return 1; }
+  mv -f "$tmp" "$CONFIG_PATH"
 }
 
 config_remove_inbound_by_tag(){
   local tag="$1"
   ensure_jq || return 1
   [ -f "$CONFIG_PATH" ] || return 0
+  jq empty "$CONFIG_PATH" >/dev/null 2>&1 || return 1
   local tmp
-  tmp=$(mktemp)
+  tmp=$(mktemp "${CONFIG_PATH}.tmp.XXXXXX") || return 1
   if ! jq --arg tag "$tag" '.inbounds = ((.inbounds // []) | map(select(.tag != $tag)))' "$CONFIG_PATH" > "$tmp" 2>/dev/null; then
     rm -f "$tmp"
     return 1
   fi
-  mv "$tmp" "$CONFIG_PATH"
+  chmod 600 "$tmp" 2>/dev/null || { rm -f -- "$tmp"; return 1; }
+  mv -f "$tmp" "$CONFIG_PATH"
 }
 
 config_add_outbound(){
@@ -1599,56 +2661,101 @@ config_add_outbound(){
     echo -e "${R}内部错误：outbound 缺少 tag${N}"
     return 1
   fi
-  tmp=$(mktemp)
+  tmp=$(mktemp "${CONFIG_PATH}.tmp.XXXXXX") || return 1
   if ! jq --argjson nb "$outbound" --arg tag "$tag" '
     .outbounds = ((.outbounds // []) | map(select(.tag != $tag))) + [$nb]
   ' "$CONFIG_PATH" > "$tmp" 2>/dev/null; then
     rm -f "$tmp"
     return 1
   fi
-  mv "$tmp" "$CONFIG_PATH"
+  chmod 600 "$tmp" 2>/dev/null || { rm -f -- "$tmp"; return 1; }
+  mv -f "$tmp" "$CONFIG_PATH"
 }
 
 config_remove_outbound_by_tag(){
   local tag="$1"
   ensure_jq || return 1
   [ -f "$CONFIG_PATH" ] || return 0
+  jq empty "$CONFIG_PATH" >/dev/null 2>&1 || return 1
   # 不允许移除 direct-out
   if [ "$tag" = "direct-out" ]; then
     return 0
   fi
   local tmp
-  tmp=$(mktemp)
+  tmp=$(mktemp "${CONFIG_PATH}.tmp.XXXXXX") || return 1
   if ! jq --arg tag "$tag" '.outbounds = ((.outbounds // []) | map(select(.tag != $tag)))' "$CONFIG_PATH" > "$tmp" 2>/dev/null; then
     rm -f "$tmp"
     return 1
   fi
-  mv "$tmp" "$CONFIG_PATH"
+  chmod 600 "$tmp" 2>/dev/null || { rm -f -- "$tmp"; return 1; }
+  mv -f "$tmp" "$CONFIG_PATH"
 }
 
 config_check_and_restart(){
+  local expected_port="${1:-}"
+  local expected_proto="${2:-tcp}"
+  local i
+
   if ! sing-box check -c "$CONFIG_PATH"; then
     return 1
   fi
-  systemctl enable sing-box >/dev/null 2>&1 || true
+  if ! systemctl enable sing-box >/dev/null 2>&1; then
+    return 1
+  fi
   if ! systemctl restart sing-box; then
     return 1
   fi
-  return 0
+
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    if systemctl is-active --quiet sing-box 2>/dev/null; then
+      if [ -z "$expected_port" ] || check_port_in_use "$expected_port" "$expected_proto"; then
+        return 0
+      fi
+    fi
+    sleep 0.5
+  done
+  echo -e "${R}sing-box 重启后未保持运行${expected_port:+，或未监听 ${expected_port}/${expected_proto}}${N}" >&2
+  return 1
 }
 
 # 旧 /root/proxy-info.txt 迁移到 /etc/sing-box/nodes/reality.info
 migrate_legacy_info(){
   # 旧配置里 reality inbound 的 tag 是 vless-in，统一重命名为 reality-in
-  if [ -f "$CONFIG_PATH" ] && grep -q '"vless-in"' "$CONFIG_PATH" 2>/dev/null; then
-    if command -v jq >/dev/null 2>&1; then
-      local tmp
-      tmp=$(mktemp)
-      if jq '(.inbounds[]? | select(.tag == "vless-in") | .tag) = "reality-in"' "$CONFIG_PATH" > "$tmp" 2>/dev/null; then
-        mv "$tmp" "$CONFIG_PATH"
-      else
-        rm -f "$tmp"
+  if [ -f "$CONFIG_PATH" ] && command -v jq >/dev/null 2>&1 \
+     && jq -e 'any(.inbounds[]?; (.tag // "") == "vless-in")' "$CONFIG_PATH" >/dev/null 2>&1; then
+    local tmp migration_txn migration_ok=1
+    migration_txn=$(config_transaction_begin legacy-reality-tag) || return 1
+    tmp=$(mktemp "${CONFIG_PATH}.tmp.XXXXXX") || {
+      config_transaction_rollback "$migration_txn"
+      return 1
+    }
+    if ! jq '
+        (.inbounds[]? | select(.tag == "vless-in") | .tag) = "reality-in"
+      | .route.rules = ((.route.rules // []) | map(
+          if ((.inbound // null) | type) == "array" then
+            .inbound |= map(if . == "vless-in" then "reality-in" else . end)
+          elif (.inbound // "") == "vless-in" then
+            .inbound = "reality-in"
+          else . end
+        ))
+      ' "$CONFIG_PATH" > "$tmp" 2>/dev/null \
+       || ! chmod 600 "$tmp" \
+       || ! mv -f -- "$tmp" "$CONFIG_PATH"; then
+      rm -f -- "$tmp"
+      migration_ok=0
+    fi
+    if [ "$migration_ok" -eq 1 ] && command -v sing-box >/dev/null 2>&1; then
+      sing-box check -c "$CONFIG_PATH" >/dev/null 2>&1 || migration_ok=0
+      if [ "$migration_ok" -eq 1 ] && systemctl is-active --quiet sing-box 2>/dev/null; then
+        systemctl restart sing-box >/dev/null 2>&1 || migration_ok=0
       fi
+    fi
+    if [ "$migration_ok" -eq 1 ]; then
+      config_transaction_commit "$migration_txn"
+    else
+      config_transaction_rollback "$migration_txn"
+      echo -e "${R}旧 Reality tag 迁移失败，已恢复原配置${N}" >&2
+      return 1
     fi
   fi
 
@@ -1675,10 +2782,10 @@ migrate_legacy_info(){
     return 0
   fi
 
-  ensure_nodes_dir
+  ensure_nodes_dir || return 1
   local f
   f=$(node_info_path reality)
-  cat > "$f" <<EOF
+  write_node_info_file reality <<EOF
 Type=reality
 Tag=${tag:-reality}
 Mode=${mode:-ipv4}
@@ -1709,7 +2816,10 @@ write_proxy_info(){
   local mode="${11:-ipv4}"
   local bind_ipv4="${12:-}"
 
-  cat > "$INFO_PATH" << EOF
+  mkdir -p "$(dirname -- "$INFO_PATH")" || return 1
+  local tmp_info
+  tmp_info=$(mktemp "${INFO_PATH}.tmp.XXXXXX") || return 1
+  cat > "$tmp_info" << EOF
 UUID=$uuid
 PublicKey=$public_key
 PrivateKey=$private_key
@@ -1723,6 +2833,8 @@ Link=$link
 Mode=$mode
 BindIPv4=$bind_ipv4
 EOF
+  chmod 600 "$tmp_info" 2>/dev/null || { rm -f -- "$tmp_info"; return 1; }
+  mv -f "$tmp_info" "$INFO_PATH"
 }
 
 load_proxy_context(){
@@ -1865,6 +2977,16 @@ url_encode_host(){
   esac
 }
 
+url_encode_component(){
+  local value="${1:-}"
+  if command -v jq >/dev/null 2>&1; then
+    printf '%s' "$value" | jq -sRr @uri
+    return
+  fi
+  # 节点创建流程本身依赖 jq；这里只在手工调用链接函数时给出明确失败。
+  return 1
+}
+
 build_reality_link(){
   local uuid="$1"
   local ip="$2"
@@ -1878,10 +3000,14 @@ build_reality_link(){
     return 1
   fi
 
-  local host
+  local host enc_sni enc_pub enc_sid enc_tag
   host=$(url_encode_host "$ip")
+  enc_sni=$(url_encode_component "$sni") || return 1
+  enc_pub=$(url_encode_component "$public_key") || return 1
+  enc_sid=$(url_encode_component "$short_id") || return 1
+  enc_tag=$(url_encode_component "$tag") || return 1
   printf 'vless://%s@%s:%s?encryption=none&flow=xtls-rprx-vision&security=reality&sni=%s&fp=chrome&pbk=%s&sid=%s&type=tcp#%s\n' \
-    "$uuid" "$host" "$port" "$sni" "$public_key" "$short_id" "$tag"
+    "$uuid" "$host" "$port" "$enc_sni" "$enc_pub" "$enc_sid" "$enc_tag"
 }
 
 build_anytls_link(){
@@ -1900,11 +3026,15 @@ build_anytls_link(){
     return 1
   fi
 
-  local host enc_pw
+  local host enc_pw enc_sni enc_pub enc_sid enc_tag
   host=$(url_encode_host "$ip")
-  enc_pw=$(printf '%s' "$password" | jq -sRr @uri)
+  enc_pw=$(url_encode_component "$password") || return 1
+  enc_sni=$(url_encode_component "$sni") || return 1
+  enc_pub=$(url_encode_component "$public_key") || return 1
+  enc_sid=$(url_encode_component "$short_id") || return 1
+  enc_tag=$(url_encode_component "$tag") || return 1
   printf 'anytls://%s@%s:%s/?security=reality&sni=%s&fp=chrome&pbk=%s&sid=%s&insecure=0#%s\n' \
-    "$enc_pw" "$host" "$port" "$sni" "$public_key" "$short_id" "$tag"
+    "$enc_pw" "$host" "$port" "$enc_sni" "$enc_pub" "$enc_sid" "$enc_tag"
 }
 
 build_hy2_link(){
@@ -1924,11 +3054,16 @@ build_hy2_link(){
     return 1
   fi
 
-  local host
+  local host enc_password enc_sni enc_obfs_type enc_obfs_password enc_tag
   host=$(url_encode_host "$ip")
-  local query="sni=${sni:-}&insecure=${insecure}"
+  enc_password=$(url_encode_component "$password") || return 1
+  enc_sni=$(url_encode_component "${sni:-}") || return 1
+  enc_tag=$(url_encode_component "$tag") || return 1
+  local query="sni=${enc_sni}&insecure=${insecure}"
   if [ -n "$obfs_type" ]; then
-    query="${query}&obfs=${obfs_type}&obfs-password=${obfs_password}"
+    enc_obfs_type=$(url_encode_component "$obfs_type") || return 1
+    enc_obfs_password=$(url_encode_component "$obfs_password") || return 1
+    query="${query}&obfs=${enc_obfs_type}&obfs-password=${enc_obfs_password}"
   fi
 
   local server_part
@@ -1938,7 +3073,7 @@ build_hy2_link(){
     server_part="${host}:${port}"
   fi
   printf 'hysteria2://%s@%s?%s#%s\n' \
-    "$password" "$server_part" "$query" "$tag"
+    "$enc_password" "$server_part" "$query" "$enc_tag"
 }
 
 build_tuic_link(){
@@ -1956,10 +3091,14 @@ build_tuic_link(){
     return 1
   fi
 
-  local host
+  local host enc_password enc_sni enc_cc enc_tag
   host=$(url_encode_host "$ip")
+  enc_password=$(url_encode_component "$password") || return 1
+  enc_sni=$(url_encode_component "${sni:-}") || return 1
+  enc_cc=$(url_encode_component "$cc") || return 1
+  enc_tag=$(url_encode_component "$tag") || return 1
   printf 'tuic://%s:%s@%s:%s?sni=%s&alpn=h3&congestion_control=%s&allow_insecure=%s#%s\n' \
-    "$uuid" "$password" "$host" "$port" "${sni:-}" "$cc" "$insecure" "$tag"
+    "$uuid" "$enc_password" "$host" "$port" "$enc_sni" "$enc_cc" "$insecure" "$enc_tag"
 }
 
 build_ss2022_link(){
@@ -1975,11 +3114,12 @@ build_ss2022_link(){
     return 1
   fi
 
-  local host userinfo
+  local host userinfo enc_tag
   host=$(url_encode_host "$ip")
   userinfo=$(printf '%s:%s' "$method" "$password" | base64 -w0 2>/dev/null | tr '+/' '-_' | tr -d '=')
+  enc_tag=$(url_encode_component "$tag") || return 1
   printf 'ss://%s@%s:%s#%s\n' \
-    "$userinfo" "$host" "$port" "$tag"
+    "$userinfo" "$host" "$port" "$enc_tag"
 }
 
 # 由节点 info 文件构造链接（dispatcher）
@@ -2088,7 +3228,6 @@ build_dualstack_ipv6_link(){
 
   build_reality_link "$uuid" "$ipv6" "$port" "$sni" "$public_key" "$short_id" "${tag}-ipv6"
 }
-
 # ═══ source: 21-menus-top.sh ═══
 show_status_menu(){
   if ! require_singbox_installed; then
@@ -2179,11 +3318,6 @@ show_system_menu(){
     render_menu_item 5 "网络优化"
     render_menu_item 6 "查看网络优化状态"
     render_menu_item 7 "添加 SWAP"
-    render_menu_item 8 "安装 / 配置 fail2ban (SSH 多端口防爆破)"
-    render_menu_item 9 "Reality 域名检测工具"
-    render_menu_item 10 "WARP 谷歌解锁分流"
-    render_menu_item 11 "服务器状态"
-    render_menu_item 12 "本地链路测评"
     render_menu_item 0 "返回上级"
     render_divider
     read -p "  请输入序号: " choice
@@ -2210,19 +3344,42 @@ show_system_menu(){
       7)
         show_swap_picker
         ;;
-      8)
+      0)
+        return
+        ;;
+      *)
+        notify_invalid_choice
+        ;;
+    esac
+  done
+}
+
+show_network_menu(){
+  while true; do
+    render_section_header "网络管理"
+    render_menu_item 1 "安装 / 配置 fail2ban (SSH 多端口防爆破)"
+    render_menu_item 2 "Reality 域名检测工具"
+    render_menu_item 3 "WARP 谷歌解锁分流"
+    render_menu_item 4 "服务器状态"
+    render_menu_item 5 "本地链路测评"
+    render_menu_item 0 "返回上级"
+    render_divider
+    read -p "  请输入序号: " choice
+
+    case $choice in
+      1)
         setup_fail2ban
         ;;
-      9)
+      2)
         check_reality_dest_domain
         ;;
-      10)
+      3)
         show_warp_menu
         ;;
-      11)
+      4)
         show_server_status
         ;;
-      12)
+      5)
         show_netbench_menu
         ;;
       0)
@@ -2308,7 +3465,7 @@ show_ipv6_firewall_menu(){
     render_divider
     render_menu_item 1 "查看当前规则"
     render_menu_item 2 "查看监听 IPv6 的服务"
-    render_menu_item 3 "一键关闭所有 IPv6 入站端口"
+    render_menu_item 3 "初始化 IPv6 防火墙（默认拒绝，保留用户规则）"
     render_menu_item 4 "开放端口"
     render_menu_item 5 "关闭端口"
     render_menu_item 6 "紧急放行 (关闭 v6 防火墙)"
@@ -2402,22 +3559,19 @@ ip6_view_listening(){
 
 ip6_close_all_inbound(){
   local confirm
-  local backup_rules="" rb_choice="y" rb_pid="" rb_seconds=180
+  local txn
 
   echo ""
-  echo -e "  ${B}${C}一键关闭所有 IPv6 入站端口${N}"
+  echo -e "  ${B}${C}初始化 IPv6 防火墙${N}"
   render_divider
   echo "  本次会执行："
-  echo "    1) 清空当前 IPv6 INPUT 规则"
-  echo "    2) 放行回环 lo"
-  echo "    3) 放行已建立的连接 (ESTABLISHED, RELATED)"
-  echo "    4) 放行 ICMPv6 (NDP / 邻居发现, IPv6 网络必需)"
-  echo -e "    5) ${R}${B}不放行任何业务端口 (含 SSH/80/443/节点端口)${N}"
-  echo "    6) INPUT 默认策略 = DROP"
-  echo "    7) OUTPUT 保持 ACCEPT (出站不受影响)"
-  echo "    8) FORWARD 不动 (留给 Docker)"
+  echo -e "    1) 仅重建脚本专属链 ${C}${IP6_LEYILI_CHAIN}${N}，保留用户与 fail2ban 规则"
+  echo "    2) 放行回环、已建立连接和 ICMPv6 (NDP 必需)"
+  echo -e "    3) ${R}${B}脚本专属链不放行业务端口${N}"
+  echo "    4) INPUT 默认策略 = DROP"
+  echo "    5) OUTPUT / FORWARD 保持原样"
   echo ""
-  echo -e "  ${Y}效果：外部无法主动连入任何 IPv6 端口；本机 IPv6 出站仍可用，回包能进。${N}"
+  echo -e "  ${Y}效果：未被用户既有规则放行的 IPv6 新入站会被拒绝；出站与回包可用。${N}"
   echo -e "  ${D}如需 IPv6 提供 HTTP/HTTPS/SSH 等服务，请改用本菜单 ${C}4) 开放端口${N}${D}。${N}"
   echo ""
 
@@ -2441,56 +3595,36 @@ ip6_close_all_inbound(){
     return 0
   fi
 
-  # 兜底：是否启用延时自动回滚守护
-  echo ""
-  echo -e "  ${B}延时自动回滚守护（强烈建议启用）${N}"
-  echo -e "  ${D}启用后规则应用 ${rb_seconds}s 内若未手动取消，将自动恢复旧规则${N}"
-  read -p "  启用 ${rb_seconds}s 自动回滚守护？(Y/n): " rb_choice
-  if [ "$rb_choice" = "n" ] || [ "$rb_choice" = "N" ]; then
-    rb_choice="n"
-  else
-    rb_choice="y"
-    backup_rules=$(mktemp /tmp/leyili-ip6tables-rb.XXXXXX 2>/dev/null) || backup_rules=""
-    if [ -n "$backup_rules" ]; then
-      ip6tables-save > "$backup_rules" 2>/dev/null || { rm -f "$backup_rules"; backup_rules=""; }
-    fi
-  fi
-
   if ! ip6_ensure_persistence; then
     echo ""
     echo -e "${R}持久化工具安装失败${N}"
-    [ -n "$backup_rules" ] && rm -f "$backup_rules"
     pause_screen
     return 1
   fi
 
-  ip6tables -F INPUT
-  ip6tables -A INPUT -i lo -j ACCEPT
-  ip6tables -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
-  ip6tables -A INPUT -p ipv6-icmp -j ACCEPT
-  ip6tables -P INPUT DROP
-  ip6tables -P OUTPUT ACCEPT
-
-  if ! ip6_save_rules; then
-    echo -e "${Y}规则已生效，但持久化失败，重启后可能丢失${N}"
+  txn=$(firewall_transaction_begin 6) || { echo -e "${R}防火墙快照失败${N}"; pause_screen; return 1; }
+  if ! firewall_ensure_managed_chain 6 \
+     || ! ip6tables -F "$IP6_LEYILI_CHAIN" \
+     || ! ip6tables -A "$IP6_LEYILI_CHAIN" -i lo -m comment --comment "leyili-managed" -j ACCEPT \
+     || ! ip6tables -A "$IP6_LEYILI_CHAIN" -m conntrack --ctstate ESTABLISHED,RELATED -m comment --comment "leyili-managed" -j ACCEPT \
+     || ! ip6tables -A "$IP6_LEYILI_CHAIN" -p ipv6-icmp -m comment --comment "leyili-managed" -j ACCEPT \
+     || ! ip6tables -P INPUT DROP \
+     || ! ip6_save_rules; then
+    firewall_transaction_rollback 6 "$txn"
+    echo -e "${R}规则写入或持久化失败，已恢复原规则${N}"
+    pause_screen
+    return 1
   fi
+  firewall_transaction_commit "$txn"
 
   echo ""
-  echo -e "${G}所有 IPv6 入站端口已关闭${N}"
-
-  if [ "$rb_choice" = "y" ] && [ -n "$backup_rules" ]; then
-    rb_pid=$(schedule_iptables_rollback "$rb_seconds" "" "$backup_rules")
-    if [ -n "$rb_pid" ]; then
-      echo -e "  ${Y}延时回滚守护已启动 (PID ${rb_pid})，${rb_seconds}s 后自动恢复旧规则${N}"
-      echo -e "  ${B}请尽快开新终端验证 SSH/服务仍可用 (走 IPv4)，然后执行：${N}"
-      echo -e "    ${C}kill ${rb_pid} && rm -f ${backup_rules}${N}  ${D}# 取消回滚${N}"
-    fi
-  fi
+  echo -e "${G}IPv6 默认拒绝策略已启用${N}"
+  echo -e "  ${D}用户 INPUT 规则均已保留；未启动延时回滚守护。${N}"
   pause_screen
 }
 
 ip6_open_port(){
-  local proto_choice protos="" port proto changed=0
+  local proto_choice protos="" port proto changed=0 txn
 
   echo ""
   echo -e "  ${B}${C}开放端口${N}"
@@ -2520,26 +3654,34 @@ ip6_open_port(){
     return 1
   fi
 
+  txn=$(firewall_transaction_begin 6) || { echo -e "${R}防火墙快照失败${N}"; pause_screen; return 1; }
   for proto in $protos; do
-    if ip6tables -C INPUT -p "$proto" --dport "$port" -j ACCEPT 2>/dev/null; then
+    if ip6tables -C "$IP6_LEYILI_CHAIN" -p "$proto" --dport "$port" -m comment --comment "leyili-managed" -j ACCEPT 2>/dev/null; then
       echo -e "  ${Y}${port}/${proto} 已放行，跳过${N}"
     else
-      ip6tables -A INPUT -p "$proto" --dport "$port" -j ACCEPT
+      if ! firewall_add_managed_port 6 "$proto" "$port"; then
+        firewall_transaction_rollback 6 "$txn"
+        echo -e "${R}规则写入失败，已恢复原规则${N}"
+        pause_screen
+        return 1
+      fi
       echo -e "  ${G}已放行 ${port}/${proto}${N}"
       changed=1
     fi
   done
 
-  if [ "$changed" -eq 1 ]; then
-    if ! ip6_save_rules; then
-      echo -e "${Y}持久化失败${N}"
-    fi
+  if [ "$changed" -eq 1 ] && ! ip6_save_rules; then
+    firewall_transaction_rollback 6 "$txn"
+    echo -e "${R}持久化失败，已恢复原规则${N}"
+    pause_screen
+    return 1
   fi
+  firewall_transaction_commit "$txn"
   pause_screen
 }
 
 ip6_close_port(){
-  local proto_choice protos="" port ssh_port confirm proto removed=0
+  local proto_choice protos="" port ssh_port confirm proto removed=0 txn
 
   echo ""
   echo -e "  ${B}${C}关闭端口${N}"
@@ -2583,34 +3725,49 @@ ip6_close_port(){
     fi
   fi
 
+  txn=$(firewall_transaction_begin 6) || { echo -e "${R}防火墙快照失败${N}"; pause_screen; return 1; }
   for proto in $protos; do
-    while ip6tables -C INPUT -p "$proto" --dport "$port" -j ACCEPT 2>/dev/null; do
-      ip6tables -D INPUT -p "$proto" --dport "$port" -j ACCEPT
-      echo -e "  ${G}已删除 ${port}/${proto}${N}"
+    if ip6tables -C "$IP6_LEYILI_CHAIN" -p "$proto" --dport "$port" -m comment --comment "leyili-managed" -j ACCEPT 2>/dev/null; then
+      if ! firewall_remove_managed_port 6 "$proto" "$port"; then
+        firewall_transaction_rollback 6 "$txn"
+        echo -e "${R}删除失败，已恢复原规则${N}"
+        pause_screen
+        return 1
+      fi
+      echo -e "  ${G}已删除脚本托管规则 ${port}/${proto}${N}"
       removed=$((removed + 1))
-    done
+    fi
   done
 
   if [ "$removed" -eq 0 ]; then
     echo -e "  ${Y}端口 ${port} 在所选协议下没有放行规则${N}"
   else
     if ! ip6_save_rules; then
-      echo -e "${Y}持久化失败${N}"
+      firewall_transaction_rollback 6 "$txn"
+      echo -e "${R}持久化失败，已恢复原规则${N}"
+      pause_screen
+      return 1
     fi
   fi
+  firewall_transaction_commit "$txn"
+  for proto in $protos; do
+    if ip6tables -C INPUT -p "$proto" --dport "$port" -j ACCEPT 2>/dev/null; then
+      echo -e "  ${Y}提示：INPUT 中仍有非脚本托管的 ${port}/${proto} ACCEPT 规则，本菜单未删除。${N}"
+    fi
+  done
   pause_screen
 }
 
 ip6_emergency_disable(){
-  local confirm confirm2
+  local confirm confirm2 txn
 
   echo ""
   echo -e "  ${R}${B}紧急放行（关闭 v6 防火墙）${N}"
   render_divider
   echo "  执行后："
-  echo "    - 清空所有 IPv6 INPUT 规则"
-  echo "    - 默认策略改回 ACCEPT"
-  echo "    - v6 入站回到完全裸奔状态"
+  echo -e "    - 删除脚本专属链 ${C}${IP6_LEYILI_CHAIN}${N}"
+  echo "    - INPUT 默认策略改回 ACCEPT"
+  echo "    - 保留用户规则、fail2ban 与面板规则"
   echo ""
 
   read -p "  确认？(y/N): " confirm
@@ -2626,14 +3783,19 @@ ip6_emergency_disable(){
     return 0
   fi
 
-  ip6tables -P INPUT ACCEPT
-  ip6tables -F INPUT
-  if ! ip6_save_rules; then
-    echo -e "${Y}持久化失败${N}"
+  txn=$(firewall_transaction_begin 6) || { echo -e "${R}防火墙快照失败${N}"; pause_screen; return 1; }
+  if ! ip6tables -P INPUT ACCEPT \
+     || ! firewall_remove_managed_chain 6 \
+     || ! ip6_save_rules; then
+    firewall_transaction_rollback 6 "$txn"
+    echo -e "${R}操作失败，已恢复原规则${N}"
+    pause_screen
+    return 1
   fi
+  firewall_transaction_commit "$txn"
 
   echo ""
-  echo -e "${Y}已关闭 v6 防火墙${N}"
+  echo -e "${Y}已停用脚本管理的 v6 防火墙（用户/面板规则仍保留）${N}"
   pause_screen
 }
 
@@ -2657,14 +3819,13 @@ show_ipv4_firewall_menu(){
     echo -e "  ${R}${B}检测到 1Panel 在管理 IPv4 防火墙${N}"
     render_divider
     echo -e "  ${Y}本脚本之前可能下发过 INPUT DROP/ACCEPT 规则，会与 1Panel 冲突${N}"
-    echo -e "  ${D}清理动作：${C}iptables -F INPUT${N} ${D}+ ${C}iptables -P INPUT ACCEPT${N} ${D}并持久化${N}"
-    echo -e "  ${D}清理后 IPv4 入站策略全部交给 1Panel 管理${N}"
-    echo -e "  ${R}注意：会清空 INPUT 链所有规则 (1Panel 通常走 ufw/firewalld，不直接挂 INPUT，一般安全)${N}"
+    echo -e "  ${D}清理动作：删除脚本专属链 ${C}${IP4_LEYILI_CHAIN}${N}，INPUT 改为 ACCEPT 并持久化${N}"
+    echo -e "  ${D}用户规则与 fail2ban 链不会被清空，清理后由 1Panel 接管新增策略${N}"
     echo ""
     read -p "  立即清理脚本残留 IPv4 规则交还 1Panel？(y/N): " hp_choice
     if [ "$hp_choice" = "y" ] || [ "$hp_choice" = "Y" ]; then
       if ip4_handover_to_1panel; then
-        echo -e "  ${G}已清空 INPUT 规则并切回 ACCEPT，IPv4 防火墙由 1Panel 接管${N}"
+        echo -e "  ${G}已移除脚本专属链并切回 ACCEPT，IPv4 防火墙由 1Panel 接管${N}"
       else
         echo -e "  ${R}清理失败，请手动检查${N}"
       fi
@@ -2791,10 +3952,9 @@ ip4_view_listening(){
 }
 
 ip4_init_firewall(){
-  local ssh_port confirm conflicts
-  local backup_rules="" rb_choice="y" rb_pid="" rb_seconds=180
+  local ssh_port confirm conflicts txn node node_port node_mode node_proto
 
-  # 缺 ss 工具无法验证 sshd 监听，直接拒绝避免应用规则后被回滚守护偷偷恢复
+  # 缺 ss 工具无法验证 sshd 监听，直接拒绝，避免写错 SSH 放行端口。
   if ! command -v ss >/dev/null 2>&1; then
     echo ""
     echo -e "  ${R}本机未安装 ss 命令（iproute2 包），无法安全验证 SSH 监听端口${N}"
@@ -2810,19 +3970,14 @@ ip4_init_firewall(){
   echo -e "  ${B}${C}一键初始化${N}"
   render_divider
   echo "  本次会执行："
-  echo "    1) 清空当前 IPv4 INPUT 规则"
-  echo "    2) 放行回环 lo"
-  echo "    3) 放行已建立的连接 (ESTABLISHED, RELATED)"
-  echo "    4) 放行 ICMP (ping 等必需)"
-  echo -e "    5) 放行 SSH 端口: ${C}${ssh_port}${N}/tcp  ${D}(自动检测)${N}"
-  echo "    6) 放行 80/tcp"
-  echo "    7) 放行 443/tcp"
-  echo "    8) INPUT 默认策略 = DROP"
-  echo "    9) OUTPUT 保持 ACCEPT"
-  echo "   10) FORWARD 不动 (留给 Docker)"
+  echo -e "    1) 仅重建脚本专属链 ${C}${IP4_LEYILI_CHAIN}${N}，保留用户与 fail2ban 规则"
+  echo "    2) 放行回环、已建立连接与 ICMP"
+  echo -e "    3) 放行 SSH ${C}${ssh_port}/tcp${N}、80/tcp、443/tcp"
+  echo "    4) 自动恢复全部已安装节点的 IPv4 主端口"
+  echo "    5) INPUT 默认策略 = DROP"
+  echo "    6) OUTPUT / FORWARD 保持原样"
   echo ""
-  echo -e "  ${D}注意：节点端口（Reality TCP / Hysteria2 UDP）不在此初始化范围内，${N}"
-  echo -e "  ${D}      请在初始化完成后到本菜单 ${C}4) 开放端口${N} ${D}里手动放行。${N}"
+  echo -e "  ${D}所有写入均先快照；任一步失败会立即恢复活动规则与持久化文件。${N}"
   echo ""
 
   # 锁库前置检查 1：sshd 必须真的在 ssh_port 监听
@@ -2861,129 +4016,62 @@ ip4_init_firewall(){
     return 0
   fi
 
-  # 兜底问询：是否启用延时自动回滚守护
-  echo ""
-  echo -e "  ${B}延时自动回滚守护（强烈建议启用）${N}"
-  echo -e "  ${D}若启用，规则应用后会启动后台守护，${rb_seconds} 秒内若你未手动取消，将自动恢复旧规则${N}"
-  echo -e "  ${D}规则生效后请立即开新终端验证 SSH 仍可登录，再回此菜单选「6) 紧急放行」之外的任意项即可取消守护${N}"
-  read -p "  启用 ${rb_seconds}s 自动回滚守护？(Y/n): " rb_choice
-  if [ "$rb_choice" = "n" ] || [ "$rb_choice" = "N" ]; then
-    rb_choice="n"
-  else
-    rb_choice="y"
-    backup_rules=$(mktemp /tmp/leyili-iptables-rb.XXXXXX 2>/dev/null) || backup_rules=""
-    if [ -n "$backup_rules" ]; then
-      iptables-save > "$backup_rules" 2>/dev/null || { rm -f "$backup_rules"; backup_rules=""; }
-    fi
-  fi
-
   if ! ip6_ensure_persistence; then
     echo ""
     echo -e "${R}持久化工具安装失败${N}"
-    [ -n "$backup_rules" ] && rm -f "$backup_rules"
     pause_screen
     return 1
   fi
 
-  iptables -F INPUT
-  iptables -A INPUT -i lo -j ACCEPT
-  iptables -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
-  iptables -A INPUT -p icmp -j ACCEPT
-  iptables -A INPUT -p tcp --dport "$ssh_port" -j ACCEPT
-  iptables -A INPUT -p tcp --dport 80 -j ACCEPT
-  iptables -A INPUT -p tcp --dport 443 -j ACCEPT
-  iptables -P INPUT DROP
-  iptables -P OUTPUT ACCEPT
-
-  # 自动恢复 reality / hy2 / anytls 节点主端口放行（IPv4 侧）
-  # 仅在节点 Mode 为 ipv4 / dualstack 时需要
-  local node_port node_mode
-  if node_installed reality; then
-    node_port=$(get_node_value reality Port 2>/dev/null || true)
-    node_mode=$(get_node_value reality Mode 2>/dev/null || echo ipv4)
-    if [ -n "$node_port" ] \
-       && { [ "$node_mode" = "ipv4" ] || [ "$node_mode" = "dualstack" ]; }; then
-      iptables -C INPUT -p tcp --dport "$node_port" -j ACCEPT 2>/dev/null \
-        || iptables -A INPUT -p tcp --dport "$node_port" -j ACCEPT 2>/dev/null || true
-      echo -e "  ${G}已自动恢复 reality 主端口放行：${node_port}/tcp${N}"
-    fi
-  fi
-  if node_installed hy2; then
-    node_port=$(get_node_value hy2 Port 2>/dev/null || true)
-    node_mode=$(get_node_value hy2 Mode 2>/dev/null || echo ipv4)
-    if [ -n "$node_port" ] \
-       && { [ "$node_mode" = "ipv4" ] || [ "$node_mode" = "dualstack" ]; }; then
-      iptables -C INPUT -p udp --dport "$node_port" -j ACCEPT 2>/dev/null \
-        || iptables -A INPUT -p udp --dport "$node_port" -j ACCEPT 2>/dev/null || true
-      echo -e "  ${G}已自动恢复 hy2 主端口放行：${node_port}/udp${N}"
-    fi
-  fi
-  if node_installed anytls; then
-    node_port=$(get_node_value anytls Port 2>/dev/null || true)
-    node_mode=$(get_node_value anytls Mode 2>/dev/null || echo ipv4)
-    if [ -n "$node_port" ] \
-       && { [ "$node_mode" = "ipv4" ] || [ "$node_mode" = "dualstack" ]; }; then
-      iptables -C INPUT -p tcp --dport "$node_port" -j ACCEPT 2>/dev/null \
-        || iptables -A INPUT -p tcp --dport "$node_port" -j ACCEPT 2>/dev/null || true
-      echo -e "  ${G}已自动恢复 anytls 主端口放行：${node_port}/tcp${N}"
-    fi
-  fi
-  if node_installed tuic; then
-    node_port=$(get_node_value tuic Port 2>/dev/null || true)
-    node_mode=$(get_node_value tuic Mode 2>/dev/null || echo ipv4)
-    if [ -n "$node_port" ] \
-       && { [ "$node_mode" = "ipv4" ] || [ "$node_mode" = "dualstack" ]; }; then
-      iptables -C INPUT -p udp --dport "$node_port" -j ACCEPT 2>/dev/null \
-        || iptables -A INPUT -p udp --dport "$node_port" -j ACCEPT 2>/dev/null || true
-      echo -e "  ${G}已自动恢复 tuic 主端口放行：${node_port}/udp${N}"
-    fi
-  fi
-  if node_installed ss2022; then
-    node_port=$(get_node_value ss2022 Port 2>/dev/null || true)
-    node_mode=$(get_node_value ss2022 Mode 2>/dev/null || echo ipv4)
-    if [ -n "$node_port" ] \
-       && { [ "$node_mode" = "ipv4" ] || [ "$node_mode" = "dualstack" ]; }; then
-      iptables -C INPUT -p tcp --dport "$node_port" -j ACCEPT 2>/dev/null \
-        || iptables -A INPUT -p tcp --dport "$node_port" -j ACCEPT 2>/dev/null || true
-      echo -e "  ${G}已自动恢复 ss2022 主端口放行：${node_port}/tcp${N}"
-    fi
-  fi
-
-  # 应用后再次校验 sshd 监听依然存在（防止备份/检测误差）
-  if ! verify_sshd_listening_on_port "$ssh_port"; then
-    if [ -n "$backup_rules" ]; then
-      iptables-restore < "$backup_rules" 2>/dev/null || true
-      rm -f "$backup_rules"
-      echo -e "${R}应用后 sshd 在 ${ssh_port} 上未监听，已自动回滚到旧规则${N}"
-    else
-      echo -e "${R}应用后 sshd 在 ${ssh_port} 上未监听，但你未启用回滚守护，请尽快人工处理${N}"
-    fi
+  txn=$(firewall_transaction_begin 4) || { echo -e "${R}防火墙快照失败${N}"; pause_screen; return 1; }
+  if ! firewall_ensure_managed_chain 4 \
+     || ! iptables -F "$IP4_LEYILI_CHAIN" \
+     || ! iptables -A "$IP4_LEYILI_CHAIN" -i lo -m comment --comment "leyili-managed" -j ACCEPT \
+     || ! iptables -A "$IP4_LEYILI_CHAIN" -m conntrack --ctstate ESTABLISHED,RELATED -m comment --comment "leyili-managed" -j ACCEPT \
+     || ! iptables -A "$IP4_LEYILI_CHAIN" -p icmp -m comment --comment "leyili-managed" -j ACCEPT \
+     || ! firewall_add_managed_port 4 tcp "$ssh_port" \
+     || ! firewall_add_managed_port 4 tcp 80 \
+     || ! firewall_add_managed_port 4 tcp 443; then
+    firewall_transaction_rollback 4 "$txn"
+    echo -e "${R}基础规则写入失败，已恢复原规则${N}"
     pause_screen
     return 1
   fi
 
-  if ! ip4_save_rules; then
-    echo -e "${Y}规则已生效，但持久化失败，重启后可能丢失${N}"
+  for node in reality hy2 anytls tuic ss2022; do
+    node_installed "$node" || continue
+    node_port=$(get_node_value "$node" Port 2>/dev/null || true)
+    node_mode=$(get_node_value "$node" Mode 2>/dev/null || echo ipv4)
+    [ -n "$node_port" ] || continue
+    { [ "$node_mode" = "ipv4" ] || [ "$node_mode" = "dualstack" ]; } || continue
+    case "$node" in hy2|tuic) node_proto="udp" ;; *) node_proto="tcp" ;; esac
+    if ! firewall_add_managed_port 4 "$node_proto" "$node_port"; then
+      firewall_transaction_rollback 4 "$txn"
+      echo -e "${R}恢复 ${node} 端口失败，已恢复原规则${N}"
+      pause_screen
+      return 1
+    fi
+    echo -e "  ${G}已恢复 ${node}：${node_port}/${node_proto}${N}"
+  done
+
+  if ! iptables -P INPUT DROP \
+     || ! verify_sshd_listening_on_port "$ssh_port" \
+     || ! ip4_save_rules; then
+    firewall_transaction_rollback 4 "$txn"
+    echo -e "${R}规则校验或持久化失败，已恢复原规则${N}"
+    pause_screen
+    return 1
   fi
+  firewall_transaction_commit "$txn"
 
   echo ""
   echo -e "${G}IPv4 防火墙已启用${N}"
-
-  # 启动延时回滚守护
-  if [ "$rb_choice" = "y" ] && [ -n "$backup_rules" ]; then
-    rb_pid=$(schedule_iptables_rollback "$rb_seconds" "$backup_rules" "")
-    if [ -n "$rb_pid" ]; then
-      echo -e "  ${Y}延时回滚守护已启动 (PID ${rb_pid})，${rb_seconds}s 后自动恢复旧规则${N}"
-      echo -e "  ${B}请在 ${rb_seconds} 秒内开新终端验证 SSH 可登录，然后执行：${N}"
-      echo -e "    ${C}kill ${rb_pid} && rm -f ${backup_rules}${N}  ${D}# 取消回滚${N}"
-      echo -e "  ${D}（也可以直接等待 ${rb_seconds}s 让规则被自动撤销）${N}"
-    fi
-  fi
+  echo -e "  ${D}用户 INPUT 规则与 fail2ban 链均已保留；未启动延时回滚守护。${N}"
   pause_screen
 }
 
 ip4_open_port(){
-  local proto_choice protos="" port proto changed=0
+  local proto_choice protos="" port proto changed=0 txn
 
   echo ""
   echo -e "  ${B}${C}开放端口${N}"
@@ -3013,26 +4101,34 @@ ip4_open_port(){
     return 1
   fi
 
+  txn=$(firewall_transaction_begin 4) || { echo -e "${R}防火墙快照失败${N}"; pause_screen; return 1; }
   for proto in $protos; do
-    if iptables -C INPUT -p "$proto" --dport "$port" -j ACCEPT 2>/dev/null; then
+    if iptables -C "$IP4_LEYILI_CHAIN" -p "$proto" --dport "$port" -m comment --comment "leyili-managed" -j ACCEPT 2>/dev/null; then
       echo -e "  ${Y}${port}/${proto} 已放行，跳过${N}"
     else
-      iptables -A INPUT -p "$proto" --dport "$port" -j ACCEPT
+      if ! firewall_add_managed_port 4 "$proto" "$port"; then
+        firewall_transaction_rollback 4 "$txn"
+        echo -e "${R}规则写入失败，已恢复原规则${N}"
+        pause_screen
+        return 1
+      fi
       echo -e "  ${G}已放行 ${port}/${proto}${N}"
       changed=1
     fi
   done
 
-  if [ "$changed" -eq 1 ]; then
-    if ! ip4_save_rules; then
-      echo -e "${Y}持久化失败${N}"
-    fi
+  if [ "$changed" -eq 1 ] && ! ip4_save_rules; then
+    firewall_transaction_rollback 4 "$txn"
+    echo -e "${R}持久化失败，已恢复原规则${N}"
+    pause_screen
+    return 1
   fi
+  firewall_transaction_commit "$txn"
   pause_screen
 }
 
 ip4_close_port(){
-  local proto_choice protos="" port ssh_port confirm proto removed=0
+  local proto_choice protos="" port ssh_port confirm proto removed=0 txn
 
   echo ""
   echo -e "  ${B}${C}关闭端口${N}"
@@ -3076,34 +4172,49 @@ ip4_close_port(){
     fi
   fi
 
+  txn=$(firewall_transaction_begin 4) || { echo -e "${R}防火墙快照失败${N}"; pause_screen; return 1; }
   for proto in $protos; do
-    while iptables -C INPUT -p "$proto" --dport "$port" -j ACCEPT 2>/dev/null; do
-      iptables -D INPUT -p "$proto" --dport "$port" -j ACCEPT
-      echo -e "  ${G}已删除 ${port}/${proto}${N}"
+    if iptables -C "$IP4_LEYILI_CHAIN" -p "$proto" --dport "$port" -m comment --comment "leyili-managed" -j ACCEPT 2>/dev/null; then
+      if ! firewall_remove_managed_port 4 "$proto" "$port"; then
+        firewall_transaction_rollback 4 "$txn"
+        echo -e "${R}删除失败，已恢复原规则${N}"
+        pause_screen
+        return 1
+      fi
+      echo -e "  ${G}已删除脚本托管规则 ${port}/${proto}${N}"
       removed=$((removed + 1))
-    done
+    fi
   done
 
   if [ "$removed" -eq 0 ]; then
     echo -e "  ${Y}端口 ${port} 在所选协议下没有放行规则${N}"
   else
     if ! ip4_save_rules; then
-      echo -e "${Y}持久化失败${N}"
+      firewall_transaction_rollback 4 "$txn"
+      echo -e "${R}持久化失败，已恢复原规则${N}"
+      pause_screen
+      return 1
     fi
   fi
+  firewall_transaction_commit "$txn"
+  for proto in $protos; do
+    if iptables -C INPUT -p "$proto" --dport "$port" -j ACCEPT 2>/dev/null; then
+      echo -e "  ${Y}提示：INPUT 中仍有非脚本托管的 ${port}/${proto} ACCEPT 规则，本菜单未删除。${N}"
+    fi
+  done
   pause_screen
 }
 
 ip4_emergency_disable(){
-  local confirm confirm2
+  local confirm confirm2 txn
 
   echo ""
   echo -e "  ${R}${B}紧急放行（关闭 v4 防火墙）${N}"
   render_divider
   echo "  执行后："
-  echo "    - 清空所有 IPv4 INPUT 规则"
-  echo "    - 默认策略改回 ACCEPT"
-  echo "    - v4 入站回到完全裸奔状态"
+  echo -e "    - 删除脚本专属链 ${C}${IP4_LEYILI_CHAIN}${N}"
+  echo "    - INPUT 默认策略改回 ACCEPT"
+  echo "    - 保留用户规则、fail2ban 与面板规则"
   echo ""
 
   read -p "  确认？(y/N): " confirm
@@ -3119,17 +4230,21 @@ ip4_emergency_disable(){
     return 0
   fi
 
-  iptables -P INPUT ACCEPT
-  iptables -F INPUT
-  if ! ip4_save_rules; then
-    echo -e "${Y}持久化失败${N}"
+  txn=$(firewall_transaction_begin 4) || { echo -e "${R}防火墙快照失败${N}"; pause_screen; return 1; }
+  if ! iptables -P INPUT ACCEPT \
+     || ! firewall_remove_managed_chain 4 \
+     || ! ip4_save_rules; then
+    firewall_transaction_rollback 4 "$txn"
+    echo -e "${R}操作失败，已恢复原规则${N}"
+    pause_screen
+    return 1
   fi
+  firewall_transaction_commit "$txn"
 
   echo ""
-  echo -e "${Y}已关闭 v4 防火墙（INPUT=ACCEPT 且规则清空）${N}"
+  echo -e "${Y}已停用脚本管理的 v4 防火墙（用户/面板规则仍保留）${N}"
   pause_screen
 }
-
 # ═══ source: 24-system-admin-high.sh ═══
 create_regular_user(){
   local username=""
@@ -3313,37 +4428,15 @@ configure_ssh_port(){
     return 0
   fi
 
-  # 先确保密码登录可用（防止云镜像 sshd_config.d 默认禁用密码登录），
-  # 否则改完端口、关掉旧会话后普通用户就连不上了。
   echo ""
-  if ! ensure_password_auth_enabled; then
-    echo -e "${R}密码登录配置失败，已中止 SSH 端口修改${N}"
+  if ! node_apply_firewall_for_mode "$ssh_port" tcp dualstack; then
+    echo -e "${R}新 SSH 端口防火墙放行失败，已中止修改${N}"
     pause_screen
     return 1
   fi
 
-  allow_tcp_port_in_firewall "$ssh_port"
-
   if apply_sshd_setting "Port" "$ssh_port" "SSH 端口已更新并重启服务"; then
     cleanup_old_backups "${SSHD_CONFIG_PATH}.bak.*" 5
-
-    # iptables 兜底：如果旧端口在 INPUT 链有显式 ACCEPT 规则
-    # （常见于搬瓦工预装 iptables-persistent 的镜像），给新端口加同样的规则
-    if command -v iptables >/dev/null 2>&1 \
-       && iptables -C INPUT -p tcp --dport "$current_ssh_port" -j ACCEPT 2>/dev/null; then
-      if ! iptables -C INPUT -p tcp --dport "$ssh_port" -j ACCEPT 2>/dev/null; then
-        if iptables -I INPUT -p tcp --dport "$ssh_port" -j ACCEPT 2>/dev/null; then
-          echo -e "  ${G}已在 iptables INPUT 链放行 ${ssh_port}/tcp${N}"
-          if command -v netfilter-persistent >/dev/null 2>&1; then
-            netfilter-persistent save >/dev/null 2>&1 || true
-          elif [ -d /etc/iptables ]; then
-            iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
-          fi
-        else
-          echo -e "  ${Y}iptables 规则追加失败，请手动执行：iptables -I INPUT -p tcp --dport ${ssh_port} -j ACCEPT${N}"
-        fi
-      fi
-    fi
 
     server_ip=$(detect_primary_ipv4)
     server_ip="${server_ip:-你的IP}"
@@ -3364,7 +4457,7 @@ disable_root_ssh_login(){
   local has_key=0
   local has_passwd=0
   local can_login_user=""
-  local pwd_auth_effective=""
+  local pwd_auth_effective="" pubkey_auth_effective=""
 
   if ! require_root; then
     return 1
@@ -3379,16 +4472,7 @@ disable_root_ssh_login(){
     return 0
   fi
 
-  # 防呆 1：保证密码登录可用（幂等，已开启就跳过）
-  echo ""
-  if ! ensure_password_auth_enabled; then
-    echo -e "${R}密码登录配置失败，已中止禁用 root 登录${N}"
-    pause_screen
-    return 1
-  fi
-
-  # 防呆 2：必须至少有 1 个非 root 的 sudo 用户能 SSH 登录
-  pwd_auth_effective=$(get_effective_sshd_value PasswordAuthentication)
+  # 必须至少有 1 个非 root 的 sudo 用户按当前认证策略可 SSH 登录。
   sudo_users=$(getent group sudo 2>/dev/null | awk -F: '{print $4}' | tr ',' '\n' | grep -v '^root$' | grep -v '^$')
   if [ -z "$sudo_users" ]; then
     echo ""
@@ -3404,8 +4488,11 @@ disable_root_ssh_login(){
     [ -z "$user" ] && continue
     has_key=0
     has_passwd=0
+    pwd_auth_effective=$(get_effective_sshd_value PasswordAuthentication "$user")
+    pubkey_auth_effective=$(get_effective_sshd_value PubkeyAuthentication "$user")
     home_dir=$(getent passwd "$user" | cut -d: -f6)
-    if [ -n "$home_dir" ] && [ -s "$home_dir/.ssh/authorized_keys" ]; then
+    if [ "$pubkey_auth_effective" != "no" ] \
+       && [ -n "$home_dir" ] && [ -s "$home_dir/.ssh/authorized_keys" ]; then
       has_key=1
     fi
     if [ "$pwd_auth_effective" = "yes" ] \
@@ -3580,7 +4667,6 @@ remove_passwordless_sudo(){
   echo -e "${G}已移除 ${C}$username${N}${G} 的 sudo 免密规则${N}"
   pause_screen
 }
-
 # ═══ source: 25-system-basic.sh ═══
 update_system_packages(){
   if ! require_root; then return 1; fi
@@ -3619,6 +4705,15 @@ enable_auto_updates(){
     fi
   fi
 
+  if grep -Fq '# Managed by Leyili' /etc/apt/apt.conf.d/20auto-upgrades 2>/dev/null \
+     || [ -e /etc/apt/apt.conf.d/20auto-upgrades.leyili-original ]; then
+    if ! managed_file_restore /etc/apt/apt.conf.d/20auto-upgrades; then
+      echo -e "${R}恢复启用前的自动更新配置失败${N}"
+      pause_screen
+      return 1
+    fi
+  fi
+
   echo ""
   echo -e "${Y}提示：${N} 如果出现交互界面，请选择 ${B}Yes${N}。"
   echo ""
@@ -3635,7 +4730,7 @@ enable_auto_updates(){
 }
 
 disable_auto_updates(){
-  local confirm=""
+  local confirm="" unit tmp_config="" rc=0
 
   if ! require_root; then
     return 1
@@ -3652,12 +4747,35 @@ disable_auto_updates(){
   read -p "  是否同时卸载 unattended-upgrades 软件包？(y/N): " confirm
 
   echo -e "${Y}==> 关闭自动更新...${N}"
-  systemctl disable --now unattended-upgrades.service >/dev/null 2>&1 || true
-  systemctl disable --now apt-daily.timer apt-daily-upgrade.timer >/dev/null 2>&1 || true
-  cat > /etc/apt/apt.conf.d/20auto-upgrades << 'EOF'
+  for unit in unattended-upgrades.service apt-daily.timer apt-daily-upgrade.timer; do
+    if systemctl is-active --quiet "$unit" 2>/dev/null \
+       || systemctl is-enabled --quiet "$unit" 2>/dev/null; then
+      systemctl disable --now "$unit" >/dev/null 2>&1 || rc=1
+    fi
+  done
+  if ! managed_file_prepare /etc/apt/apt.conf.d/20auto-upgrades 'Managed by Leyili'; then
+    rc=1
+  else
+    tmp_config=$(mktemp /etc/apt/apt.conf.d/20auto-upgrades.tmp.XXXXXX) || rc=1
+  fi
+  if [ -n "$tmp_config" ] && ! cat > "$tmp_config" << 'EOF'
+# Managed by Leyili
 APT::Periodic::Update-Package-Lists "0";
 APT::Periodic::Unattended-Upgrade "0";
 EOF
+  then
+    rc=1
+  fi
+  if [ -n "$tmp_config" ] \
+     && { ! chmod 644 "$tmp_config" || ! mv -f -- "$tmp_config" /etc/apt/apt.conf.d/20auto-upgrades; }; then
+    rm -f -- "$tmp_config"
+    rc=1
+  fi
+  if [ "$rc" -ne 0 ]; then
+    echo -e "${R}自动更新禁用未完全成功，请检查 systemd 定时器与 20auto-upgrades${N}"
+    pause_screen
+    return 1
+  fi
 
   if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
     echo -e "${Y}==> 卸载 unattended-upgrades...${N}"
@@ -3720,11 +4838,6 @@ install_basic_tools(){
 }
 
 # ─── fail2ban SSH 防爆破 ─────────────────────────────
-FAIL2BAN_JAIL_PATH="/etc/fail2ban/jail.d/leyili-sshd.local"
-FAIL2BAN_MAXRETRY="5"
-FAIL2BAN_BANTIME="600"
-FAIL2BAN_FINDTIME="300"
-
 normalize_fail2ban_port_list(){
   local raw="${1:-}" item ports="" count=0
   local -a items=()
@@ -3754,6 +4867,30 @@ normalize_fail2ban_port_list(){
   printf '%s' "$ports"
 }
 
+fail2ban_transaction_restore(){
+  local txn_dir="$1" was_active="$2" was_enabled="$3" rc=0
+  if [ -f "$txn_dir/jail.existed" ]; then
+    restore_file_snapshot "$txn_dir/jail.local" "$FAIL2BAN_JAIL_PATH" || rc=1
+  else
+    rm -f -- "$FAIL2BAN_JAIL_PATH" || rc=1
+  fi
+  if [ "$was_enabled" -eq 1 ]; then
+    systemctl enable fail2ban >/dev/null 2>&1 || rc=1
+  else
+    systemctl disable fail2ban >/dev/null 2>&1 || rc=1
+  fi
+  if [ "$was_active" -eq 1 ]; then
+    systemctl restart fail2ban >/dev/null 2>&1 || rc=1
+  else
+    systemctl stop fail2ban >/dev/null 2>&1 || rc=1
+  fi
+  if [ "$rc" -eq 0 ]; then
+    rm -rf -- "$txn_dir" || rc=1
+  fi
+  [ "$rc" -eq 0 ] || echo -e "${R}fail2ban 回滚未完全成功，私有快照保留在 ${txn_dir}${N}" >&2
+  return "$rc"
+}
+
 setup_fail2ban(){
   if ! require_root; then return 1; fi
   if ! require_debian_family; then
@@ -3764,6 +4901,7 @@ setup_fail2ban(){
   render_section_header "安装 / 配置 fail2ban (SSH 多端口)"
 
   local current_ssh_port default_ports saved_ports input_ports ports normalize_status
+  local txn_dir tmp_jail ping_ok=0 was_active=0 was_enabled=0 i
   current_ssh_port=$(get_current_ssh_port)
   default_ports="$current_ssh_port"
 
@@ -3821,14 +4959,27 @@ setup_fail2ban(){
     echo -e "  ${L}●${N} fail2ban 已安装，跳过安装步骤"
   fi
 
-  mkdir -p "$(dirname -- "$FAIL2BAN_JAIL_PATH")"
+  mkdir -p "$(dirname -- "$FAIL2BAN_JAIL_PATH")" || return 1
+  txn_dir=$(mktemp -d "${TMPDIR:-/tmp}/leyili-fail2ban.XXXXXX") || return 1
+  chmod 700 "$txn_dir" 2>/dev/null || { rm -rf -- "$txn_dir"; return 1; }
+  if [ -f "$FAIL2BAN_JAIL_PATH" ]; then
+    cp -a -- "$FAIL2BAN_JAIL_PATH" "$txn_dir/jail.local" || { rm -rf -- "$txn_dir"; return 1; }
+    : > "$txn_dir/jail.existed"
+  fi
+  systemctl is-active --quiet fail2ban 2>/dev/null && was_active=1
+  systemctl is-enabled --quiet fail2ban 2>/dev/null && was_enabled=1
 
   if [ -f "$FAIL2BAN_JAIL_PATH" ]; then
-    cp -a "$FAIL2BAN_JAIL_PATH" "${FAIL2BAN_JAIL_PATH}.bak.$(date +%Y%m%d%H%M%S)"
-    cleanup_old_backups "${FAIL2BAN_JAIL_PATH}.bak.*" 5
+    cp -a "$FAIL2BAN_JAIL_PATH" "${FAIL2BAN_JAIL_PATH}.bak.$(date +%Y%m%d%H%M%S)" || {
+      rm -rf -- "$txn_dir"
+      return 1
+    }
+    cleanup_old_backups "${FAIL2BAN_JAIL_PATH}.bak.*" 5 \
+      || echo -e "${Y}旧 fail2ban 备份清理失败，本次配置仍会继续${N}" >&2
   fi
 
-  cat > "$FAIL2BAN_JAIL_PATH" <<EOF
+  tmp_jail=$(mktemp "${FAIL2BAN_JAIL_PATH}.tmp.XXXXXX") || { rm -rf -- "$txn_dir"; return 1; }
+  cat > "$tmp_jail" <<EOF
 # Managed by ${APP_NAME} — do not edit by hand, it will be overwritten.
 [sshd]
 enabled  = true
@@ -3838,21 +4989,42 @@ maxretry = ${FAIL2BAN_MAXRETRY}
 bantime  = ${FAIL2BAN_BANTIME}
 findtime = ${FAIL2BAN_FINDTIME}
 EOF
-
-  systemctl enable fail2ban >/dev/null 2>&1 || true
-  if ! systemctl restart fail2ban; then
+  chmod 600 "$tmp_jail" || { rm -f -- "$tmp_jail"; rm -rf -- "$txn_dir"; return 1; }
+  if ! mv -f -- "$tmp_jail" "$FAIL2BAN_JAIL_PATH" \
+     || ! fail2ban-client -t >/dev/null 2>&1 \
+     || ! systemctl enable fail2ban >/dev/null 2>&1 \
+     || ! systemctl restart fail2ban; then
+    local rollback_ok=1
+    fail2ban_transaction_restore "$txn_dir" "$was_active" "$was_enabled" || rollback_ok=0
     echo ""
-    echo -e "${R}fail2ban 启动失败，请运行 systemctl status fail2ban 查看原因${N}"
+    if [ "$rollback_ok" -eq 1 ]; then
+      echo -e "${R}fail2ban 配置校验或启动失败，已恢复旧 jail 与服务状态${N}"
+    else
+      echo -e "${R}fail2ban 配置失败，且回滚未完全成功，请立即检查服务状态${N}"
+    fi
     pause_screen
     return 1
   fi
 
   # 等待 socket 就绪再调用 fail2ban-client，避免首次启动竞争
-  local i
   for i in 1 2 3 4 5; do
-    if fail2ban-client ping >/dev/null 2>&1; then break; fi
+    if fail2ban-client ping >/dev/null 2>&1; then ping_ok=1; break; fi
     sleep 1
   done
+  if [ "$ping_ok" -ne 1 ]; then
+    local rollback_ok=1
+    fail2ban_transaction_restore "$txn_dir" "$was_active" "$was_enabled" || rollback_ok=0
+    if [ "$rollback_ok" -eq 1 ]; then
+      echo -e "${R}fail2ban socket 未就绪，已恢复旧配置与服务状态${N}"
+    else
+      echo -e "${R}fail2ban socket 未就绪，且回滚未完全成功，请立即检查服务状态${N}"
+    fi
+    pause_screen
+    return 1
+  fi
+  if ! rm -rf -- "$txn_dir"; then
+    echo -e "${Y}fail2ban 已生效，但事务临时目录清理失败：${txn_dir}${N}" >&2
+  fi
 
   echo ""
   echo -e "${G}fail2ban 已配置并启动${N}"
@@ -3997,7 +5169,7 @@ show_client_link(){
 modify_reality_params(){
   local new_port="" new_sni="" new_uuid="" regen_keypair="n"
   local new_pri="" new_pub="" keypair="" new_short_id=""
-  local cur_port cur_sni cur_uuid backup_path="" confirm
+  local cur_port cur_sni cur_uuid backup_path="" confirm txn=""
 
   if ! require_root; then return 1; fi
   if ! require_singbox_installed; then return 1; fi
@@ -4025,7 +5197,18 @@ modify_reality_params(){
   while true; do
     read -p "  端口 (${cur_port:-当前未知}): " new_port
     new_port="${new_port:-$cur_port}"
-    if validate_port "$new_port"; then break; fi
+    if validate_port "$new_port"; then
+      new_port=$((10#$new_port))
+      if [ "$new_port" != "$cur_port" ] && check_port_in_use "$new_port" tcp; then
+        local force_port=""
+        echo -e "${R}端口 ${new_port} 已被其他 TCP 服务占用${N}"
+        read -p "  仍然使用此端口？(y/N): " force_port
+        if [ "$force_port" != "y" ] && [ "$force_port" != "Y" ]; then
+          continue
+        fi
+      fi
+      break
+    fi
     echo -e "${R}端口必须是 1-65535 的数字${N}"
   done
 
@@ -4084,14 +5267,16 @@ modify_reality_params(){
     return 0
   fi
 
+  ensure_jq || { pause_screen; return 1; }
+  txn=$(node_transaction_begin reality) || { echo -e "${R}节点事务快照失败${N}"; pause_screen; return 1; }
+
   backup_path="${CONFIG_PATH}.bak.$(date +%Y%m%d%H%M%S)"
   if ! cp "$CONFIG_PATH" "$backup_path"; then
+    node_transaction_rollback "$txn"
     echo -e "${R}配置备份失败${N}"
     pause_screen
     return 1
   fi
-
-  ensure_jq || { pause_screen; return 1; }
 
   local jq_filter='(.inbounds[] | select(.tag == "reality-in"))
     |= ( .listen_port = ($port | tonumber)
@@ -4109,35 +5294,61 @@ modify_reality_params(){
        --arg pri "${new_pri:-}" --arg sid "${new_short_id:-}" \
        "$jq_filter" "$CONFIG_PATH" > "$tmp_file"; then
     rm -f "$tmp_file"
-    cp "$backup_path" "$CONFIG_PATH" 2>/dev/null || true
-    echo -e "${R}配置写入失败，已恢复备份${N}"
+    node_transaction_rollback "$txn"
+    echo -e "${R}配置写入失败，已完整回滚${N}"
     pause_screen
     return 1
   fi
-  mv "$tmp_file" "$CONFIG_PATH"
-
-  if ! sing-box check -c "$CONFIG_PATH"; then
-    cp "$backup_path" "$CONFIG_PATH" 2>/dev/null || true
-    echo ""
-    echo -e "${R}配置校验失败，已恢复备份${N}"
-    pause_screen
-    return 1
-  fi
-  if ! systemctl restart sing-box; then
-    cp "$backup_path" "$CONFIG_PATH" 2>/dev/null || true
-    echo ""
-    echo -e "${R}服务重启失败，已恢复备份${N}"
+  if ! mv "$tmp_file" "$CONFIG_PATH"; then
+    node_transaction_rollback "$txn"
+    echo -e "${R}配置替换失败，已完整回滚${N}"
     pause_screen
     return 1
   fi
 
-  set_node_value reality Port "$new_port"
-  set_node_value reality SNI "$new_sni"
-  set_node_value reality UUID "$new_uuid"
+  if ! config_check_and_restart "$new_port" tcp; then
+    node_transaction_rollback "$txn"
+    echo ""
+    echo -e "${R}配置校验或服务健康检查失败，已完整回滚${N}"
+    pause_screen
+    return 1
+  fi
+
+  if [ -n "$new_port" ] && [ "$new_port" != "$cur_port" ]; then
+    local rt_mode_now
+    rt_mode_now=$(get_node_value reality Mode 2>/dev/null || echo ipv4)
+    if [ -n "$cur_port" ] && ! node_revoke_firewall_for_mode "$cur_port" tcp "$rt_mode_now"; then
+      node_transaction_rollback "$txn"
+      echo -e "${R}旧防火墙端口清理失败，已完整回滚${N}"
+      pause_screen
+      return 1
+    fi
+    if ! node_apply_firewall_for_mode "$new_port" tcp "$rt_mode_now"; then
+      node_transaction_rollback "$txn"
+      echo -e "${R}防火墙端口切换失败，已完整回滚${N}"
+      pause_screen
+      return 1
+    fi
+    print_firewall_hint "$new_port" tcp "Reality 节点新端口"
+  fi
+
+  if ! set_node_value reality Port "$new_port" \
+     || ! set_node_value reality SNI "$new_sni" \
+     || ! set_node_value reality UUID "$new_uuid"; then
+    node_transaction_rollback "$txn"
+    echo -e "${R}节点信息保存失败，已完整回滚${N}"
+    pause_screen
+    return 1
+  fi
   if [ -n "$new_pub" ]; then
-    set_node_value reality PublicKey "$new_pub"
-    set_node_value reality PrivateKey "$new_pri"
-    set_node_value reality ShortID "$new_short_id"
+    if ! set_node_value reality PublicKey "$new_pub" \
+       || ! set_node_value reality PrivateKey "$new_pri" \
+       || ! set_node_value reality ShortID "$new_short_id"; then
+      node_transaction_rollback "$txn"
+      echo -e "${R}Reality 密钥信息保存失败，已完整回滚${N}"
+      pause_screen
+      return 1
+    fi
   fi
 
   local cur_ip cur_tag final_pub final_sid new_link ipv6_new_link
@@ -4147,15 +5358,13 @@ modify_reality_params(){
   final_sid="${new_short_id:-$(get_node_value reality ShortID 2>/dev/null || true)}"
   new_link=$(build_reality_link "$new_uuid" "$cur_ip" "$new_port" "$new_sni" "$final_pub" "$final_sid" "${cur_tag:-reality}" 2>/dev/null || true)
   ipv6_new_link=$(build_dualstack_ipv6_link_for_node reality 2>/dev/null || true)
-  [ -n "$new_link" ] && set_node_value reality Link "$new_link"
-  if [ -n "$new_port" ] && [ "$new_port" != "$cur_port" ]; then
-    local rt_mode_now
-    rt_mode_now=$(get_node_value reality Mode 2>/dev/null || echo ipv4)
-    # 旧端口先撤、新端口再开（双栈/v6 模式同时处理 v4/v6）
-    [ -n "$cur_port" ] && node_revoke_firewall_for_mode "$cur_port" tcp "$rt_mode_now"
-    node_apply_firewall_for_mode "$new_port" tcp "$rt_mode_now"
-    print_firewall_hint "$new_port" tcp "Reality 节点新端口"
+  if [ -n "$new_link" ] && ! set_node_value reality Link "$new_link"; then
+    node_transaction_rollback "$txn"
+    echo -e "${R}客户端链接保存失败，已完整回滚${N}"
+    pause_screen
+    return 1
   fi
+  node_transaction_commit "$txn"
   cleanup_old_backups "${CONFIG_PATH}.bak.*" 5
 
   echo ""
@@ -4233,19 +5442,69 @@ print_qrcode(){
   echo ""
   qrencode -t ANSIUTF8 "$link"
 }
-
 # ═══ source: 40-network-tuning.sh ═══
 # TCP 调优唯一入口是智能调参向导（实测 RTT × 带宽算 BDP），buffer_max 由向导
 # 计算后传入。固定地区档（hk/jp/us-west/us-west-100m/eu × 内存档查表）已随
 # 菜单一并移除；各内存档封顶值保留在 _tcp_autotune_ceiling（= 历史档位最大值），
 # 老机器上 region=hk 等存量 marker 仅在状态页 / 首页卡片保留展示映射。
+capture_live_qdisc(){
+  local state_file="$1" iface qdisc
+  [ -e "$state_file" ] && return 0
+  command -v tc >/dev/null 2>&1 || return 0
+  iface=$(ip route show default 2>/dev/null | awk '/^default/ {print $5; exit}')
+  [ -n "$iface" ] || return 0
+  qdisc=$(tc qdisc show dev "$iface" 2>/dev/null | awk 'NR==1 {print $2; exit}')
+  [ -n "$qdisc" ] || return 0
+  ensure_leyili_state_dir || return 1
+  printf 'iface=%s\nqdisc=%s\n' "$iface" "$qdisc" > "$state_file" || return 1
+  chmod 600 "$state_file" 2>/dev/null || { rm -f -- "$state_file"; return 1; }
+}
+
+restore_live_qdisc(){
+  local state_file="$1" remove_after="${2:-0}" iface qdisc rc=0
+  [ -r "$state_file" ] || return 0
+  iface=$(awk -F= '$1 == "iface" {print $2; exit}' "$state_file")
+  qdisc=$(awk -F= '$1 == "qdisc" {print $2; exit}' "$state_file")
+  if [ -n "$iface" ] && [ -n "$qdisc" ] && command -v tc >/dev/null 2>&1; then
+    tc qdisc replace dev "$iface" root "$qdisc" >/dev/null 2>&1 || rc=1
+  elif [ -n "$iface" ] && [ -n "$qdisc" ]; then
+    rc=1
+  fi
+  if [ "$remove_after" = "1" ] && [ "$rc" -eq 0 ]; then
+    rm -f -- "$state_file" || rc=1
+  fi
+  [ "$rc" -eq 0 ] || echo -e "${R}qdisc 恢复失败，状态快照已保留：${state_file}${N}" >&2
+  return "$rc"
+}
+
+tcp_tuning_abort(){
+  local file_txn="$1" runtime_state="$2" runtime_qdisc="$3"
+  local tcp_state_created="${4:-0}" qdisc_state_created="${5:-0}" rc=0
+
+  [ -n "$runtime_state" ] && sysctl_state_restore "$runtime_state" || {
+    [ -z "$runtime_state" ] || rc=1
+  }
+  [ -n "$runtime_qdisc" ] && restore_live_qdisc "$runtime_qdisc" 1 || {
+    [ -z "$runtime_qdisc" ] || rc=1
+  }
+  managed_file_transaction_rollback "$TCP_TUNING_PATH" "$file_txn" || rc=1
+  if [ "$rc" -eq 0 ]; then
+    [ "$tcp_state_created" -eq 0 ] || rm -f -- "$TCP_TUNING_STATE" || rc=1
+    [ "$qdisc_state_created" -eq 0 ] || rm -f -- "$TCP_QDISC_STATE" || rc=1
+    rm -f -- "$runtime_state" "$runtime_qdisc" 2>/dev/null || rc=1
+  fi
+  [ "$rc" -eq 0 ] || echo -e "${R}TCP 调优回滚未完全成功，运行时/事务快照已尽量保留${N}" >&2
+  return "$rc"
+}
+
 apply_tcp_tuning(){
   local mem_tier="${1:-2g}"
   local buffer_max="${2:-}"   # 按实测 BDP 算出的 buffer_max（字节）
   local rtt_ms="${3:-}"       # 实测 RTT（ms，决定 fin_timeout 分档并写入 marker）
   local bw_mbps="${4:-}"      # 有效带宽（Mbps，写入 marker 供状态页展示）
   local notsent_lowat fin_timeout mem_label
-  local cc_algo qdisc_algo iface _q
+  local cc_algo qdisc_algo iface _q file_txn tmp_tuning runtime_state="" runtime_qdisc=""
+  local tcp_state_created=0 qdisc_state_created=0
 
   if ! require_root; then return 1; fi
 
@@ -4295,6 +5554,66 @@ apply_tcp_tuning(){
     *)   mem_label="$mem_tier" ;;
   esac
 
+  file_txn=$(managed_file_transaction_begin "$TCP_TUNING_PATH" 'Managed by Leyili|leyili-profile') || {
+    echo -e "${R}无法安全接管 ${TCP_TUNING_PATH}${N}"
+    return 1
+  }
+  runtime_state=$(mktemp "${TMPDIR:-/tmp}/leyili-tcp-runtime.XXXXXX") || {
+    managed_file_transaction_rollback "$TCP_TUNING_PATH" "$file_txn" || :
+    return 1
+  }
+  rm -f -- "$runtime_state"
+  runtime_qdisc=$(mktemp "${TMPDIR:-/tmp}/leyili-qdisc-runtime.XXXXXX") || {
+    tcp_tuning_abort "$file_txn" "$runtime_state" "" 0 0 || :
+    return 1
+  }
+  rm -f -- "$runtime_qdisc"
+  sysctl_state_capture "$runtime_state" \
+    net.core.default_qdisc net.ipv4.tcp_congestion_control net.ipv4.tcp_fastopen \
+    net.core.rmem_max net.core.wmem_max net.core.rmem_default net.core.wmem_default \
+    net.ipv4.tcp_rmem net.ipv4.tcp_wmem net.ipv4.tcp_adv_win_scale \
+    net.ipv4.tcp_notsent_lowat net.ipv4.tcp_slow_start_after_idle \
+    net.ipv4.tcp_window_scaling net.ipv4.tcp_timestamps net.ipv4.tcp_sack \
+    net.ipv4.tcp_mtu_probing net.ipv4.ip_no_pmtu_disc net.ipv4.tcp_tw_reuse \
+    net.ipv4.tcp_fin_timeout net.ipv4.tcp_max_tw_buckets net.core.somaxconn \
+    net.core.netdev_max_backlog net.ipv4.tcp_max_syn_backlog net.ipv4.tcp_syncookies \
+    net.ipv4.tcp_max_orphans net.ipv4.tcp_keepalive_time net.ipv4.tcp_keepalive_intvl \
+    net.ipv4.tcp_keepalive_probes net.ipv4.tcp_no_metrics_save net.ipv4.tcp_ecn \
+    net.ipv4.tcp_rfc1337 net.ipv4.tcp_retries2 net.ipv4.tcp_synack_retries \
+    net.ipv4.tcp_orphan_retries net.ipv4.ip_local_port_range || {
+      tcp_tuning_abort "$file_txn" "$runtime_state" "$runtime_qdisc" 0 0 || :
+      return 1
+    }
+  if [ ! -f "$TCP_TUNING_STATE" ]; then
+    cp -a -- "$runtime_state" "$TCP_TUNING_STATE" || {
+      managed_file_transaction_rollback "$TCP_TUNING_PATH" "$file_txn"
+      rm -f -- "$runtime_state" "$runtime_qdisc"
+      return 1
+    }
+    tcp_state_created=1
+  fi
+  if ! capture_live_qdisc "$runtime_qdisc"; then
+    tcp_tuning_abort "$file_txn" "$runtime_state" "$runtime_qdisc" \
+      "$tcp_state_created" 0 || :
+    echo -e "${R}qdisc 运行时快照失败，已中止 TCP 调优${N}" >&2
+    return 1
+  fi
+  if [ ! -f "$TCP_QDISC_STATE" ]; then
+    if ! capture_live_qdisc "$TCP_QDISC_STATE"; then
+      tcp_tuning_abort "$file_txn" "$runtime_state" "$runtime_qdisc" \
+        "$tcp_state_created" 0 || :
+      echo -e "${R}qdisc 持久快照失败，已中止 TCP 调优${N}" >&2
+      return 1
+    fi
+    [ -f "$TCP_QDISC_STATE" ] && qdisc_state_created=1
+  fi
+  if [ ! -r "$runtime_state" ]; then
+    tcp_tuning_abort "$file_txn" "$runtime_state" "$runtime_qdisc" \
+      "$tcp_state_created" "$qdisc_state_created" || :
+    echo -e "${R}qdisc 状态快照失败，已中止 TCP 调优${N}" >&2
+    return 1
+  fi
+
   # --- 拥塞控制探测：BBR 不是所有内核都编译进去（精简内核 / 老 OpenVZ）---
   # 写死 bbr 会让 sysctl -p 在那一行静默报错后回落 cubic，用户以为开了 BBR。
   # 先尝试加载模块，再查 tcp_available_congestion_control，不可用时明确降级并告警。
@@ -4322,7 +5641,13 @@ apply_tcp_tuning(){
   echo ""
   echo -e "${Y}==> 写入 智能调参/${mem_label} TCP 参数优化配置 (上限 $((buffer_max/1024/1024))M)...${N}"
 
-  cat > "$TCP_TUNING_PATH" <<EOF
+  tmp_tuning=$(mktemp "${TCP_TUNING_PATH}.tmp.XXXXXX") || {
+    tcp_tuning_abort "$file_txn" "$runtime_state" "$runtime_qdisc" \
+      "$tcp_state_created" "$qdisc_state_created" || :
+    return 1
+  }
+  if ! cat > "$tmp_tuning" <<EOF
+# Managed by Leyili
 # leyili-profile: region=custom mem_tier=${mem_tier}${rtt_ms:+ rtt=${rtt_ms}}${bw_mbps:+ bw=${bw_mbps}}
 # 由 leyili.sh 智能 TCP 调参生成 (自动实测 / ${mem_label})
 # 偏好：交互流（网页 / 社交 / 流媒体），非吞吐党
@@ -4395,10 +5720,26 @@ net.ipv4.tcp_orphan_retries = 3
 # --- 临时端口范围 (避开常用服务端口) ---
 net.ipv4.ip_local_port_range = 10000 65535
 EOF
+  then
+    rm -f -- "$tmp_tuning"
+    tcp_tuning_abort "$file_txn" "$runtime_state" "$runtime_qdisc" \
+      "$tcp_state_created" "$qdisc_state_created" || :
+    return 1
+  fi
+
+  if ! chmod 600 "$tmp_tuning" 2>/dev/null \
+     || ! mv -f -- "$tmp_tuning" "$TCP_TUNING_PATH"; then
+    rm -f -- "$tmp_tuning"
+    tcp_tuning_abort "$file_txn" "$runtime_state" "$runtime_qdisc" \
+      "$tcp_state_created" "$qdisc_state_created" || :
+    return 1
+  fi
 
   echo -e "${Y}==> 应用 sysctl 配置...${N}"
   if ! sysctl -p "$TCP_TUNING_PATH"; then
     echo -e "${R}TCP 参数应用失败，请检查内核兼容性或 sysctl 输出${N}"
+    tcp_tuning_abort "$file_txn" "$runtime_state" "$runtime_qdisc" \
+      "$tcp_state_created" "$qdisc_state_created" || :
     return 1
   fi
 
@@ -4417,12 +5758,14 @@ EOF
     fi
   fi
 
+  rm -f -- "$runtime_state" "$runtime_qdisc"
+  managed_file_transaction_commit "$file_txn"
+
   return 0
 }
 
 remove_tcp_tuning(){
-  local confirm=""
-  local service_name route_line route_spec iface
+  local confirm="" rc=0
 
   if ! require_root; then
     return 1
@@ -4433,6 +5776,13 @@ remove_tcp_tuning(){
     echo -e "${Y}未检测到 TCP 优化配置，无需移除${N}"
     pause_screen
     return 0
+  fi
+  if ! grep -Eq 'Managed by Leyili|leyili-profile' "$TCP_TUNING_PATH" 2>/dev/null \
+     && [ ! -e "${TCP_TUNING_PATH}.leyili-original" ] \
+     && [ ! -f "$TCP_TUNING_STATE" ]; then
+    echo -e "${R}${TCP_TUNING_PATH} 不是脚本托管文件，拒绝删除。${N}"
+    pause_screen
+    return 1
   fi
 
   echo ""
@@ -4445,52 +5795,41 @@ remove_tcp_tuning(){
     return 0
   fi
 
-  rm -f "$TCP_TUNING_PATH"
-
-  sysctl -w net.core.default_qdisc=pfifo_fast >/dev/null 2>&1 || true
-  sysctl -w net.ipv4.tcp_congestion_control=cubic >/dev/null 2>&1 || true
-  sysctl --system >/dev/null 2>&1 || true
-
-  # 与 apply 对称：default_qdisc 改回默认值不会动现有网卡，需对 live 网卡显式复位。
-  # 回退到 pfifo_fast（内核传统默认），失败仅忽略（可能内核无此 qdisc 或无 tc）
-  if command -v tc >/dev/null 2>&1; then
-    iface=$(ip route show default 2>/dev/null | awk '/^default/ {print $5; exit}')
-    [ -n "$iface" ] && tc qdisc replace dev "$iface" root pfifo_fast >/dev/null 2>&1 || true
-  fi
-
-  # 配套撤销 initcwnd（apply_network_optimization 是把 TCP+initcwnd 当一组应用的，对称地撤）
-  service_name=$(basename "$INITCWND_SERVICE_PATH")
-  if [ -f "$INITCWND_SERVICE_PATH" ] || systemctl cat "$service_name" >/dev/null 2>&1; then
-    systemctl disable --now "$service_name" >/dev/null 2>&1 || true
-    rm -f "$INITCWND_SERVICE_PATH"
-    systemctl daemon-reload >/dev/null 2>&1 || true
-    if command -v ip >/dev/null 2>&1; then
-      route_line=$(ip route show default 2>/dev/null | head -1)
-      if [ -n "$route_line" ]; then
-        route_spec=$(printf '%s\n' "$route_line" | awk '{
-          sep=""
-          for (i = 1; i <= NF; i++) {
-            if ($i == "initcwnd" || $i == "initrwnd") { i++; next }
-            printf "%s%s", sep, $i
-            sep=" "
-          }
-        }')
-        # shellcheck disable=SC2086
-        ip route replace $route_spec >/dev/null 2>&1 || true
-      fi
-    fi
-    echo -e "  ${D}initcwnd 持久化服务已移除${N}"
-  fi
+  managed_file_restore "$TCP_TUNING_PATH" || rc=1
+  sysctl --system >/dev/null 2>&1 || rc=1
+  sysctl_state_restore "$TCP_TUNING_STATE" || rc=1
+  restore_live_qdisc "$TCP_QDISC_STATE" 1 || rc=1
+  remove_initcwnd_managed 1 || rc=1
 
   echo ""
-  echo -e "${G}TCP 优化已移除（部分参数重启后完全复位）${N}"
+  if [ "$rc" -eq 0 ]; then
+    echo -e "${G}TCP 优化已移除（部分参数重启后完全复位）${N}"
+  else
+    echo -e "${R}TCP 优化移除未完全成功，相关状态快照已尽量保留，请检查上方警告${N}"
+  fi
   pause_screen
+  return "$rc"
+}
+
+quic_tuning_abort(){
+  local file_txn="$1" runtime_state="$2" state_created="${3:-0}" rc=0
+  [ -n "$runtime_state" ] && sysctl_state_restore "$runtime_state" || {
+    [ -z "$runtime_state" ] || rc=1
+  }
+  managed_file_transaction_rollback "$QUIC_TUNING_PATH" "$file_txn" || rc=1
+  if [ "$rc" -eq 0 ]; then
+    [ "$state_created" -eq 0 ] || rm -f -- "$QUIC_TUNING_STATE" || rc=1
+    [ -z "$runtime_state" ] || rm -f -- "$runtime_state" 2>/dev/null || rc=1
+  fi
+  [ "$rc" -eq 0 ] || echo -e "${R}QUIC 调优回滚未完全成功，运行时/事务快照已尽量保留${N}" >&2
+  return "$rc"
 }
 
 apply_quic_tuning(){
   local region="${1:-us-west}"
   local mem_tier="${2:-2g}"
-  local region_label mem_label
+  local region_label mem_label conntrack_max file_txn tmp_quic runtime_state=""
+  local quic_state_created=0
 
   if ! require_root; then return 1; fi
 
@@ -4506,18 +5845,45 @@ apply_quic_tuning(){
   esac
 
   case "$mem_tier" in
-    512m) mem_label="512MB" ;;
-    1g)  mem_label="1GB"  ;;
-    2g)  mem_label="2GB"  ;;
-    4g)  mem_label="4GB"  ;;
-    8g)  mem_label="8GB+" ;;
-    *)   mem_label="$mem_tier" ;;
+    512m) mem_label="512MB"; conntrack_max=65536 ;;
+    1g)  mem_label="1GB";   conntrack_max=65536 ;;
+    2g)  mem_label="2GB";   conntrack_max=131072 ;;
+    4g)  mem_label="4GB";   conntrack_max=262144 ;;
+    8g)  mem_label="8GB+";  conntrack_max=524288 ;;
+    *)   mem_label="$mem_tier"; conntrack_max=131072 ;;
   esac
+
+  file_txn=$(managed_file_transaction_begin "$QUIC_TUNING_PATH" 'Managed by Leyili|leyili-quic-profile') || return 1
+  runtime_state=$(mktemp "${TMPDIR:-/tmp}/leyili-quic-runtime.XXXXXX") || {
+    managed_file_transaction_rollback "$QUIC_TUNING_PATH" "$file_txn" || :
+    return 1
+  }
+  rm -f -- "$runtime_state"
+  sysctl_state_capture "$runtime_state" \
+    net.netfilter.nf_conntrack_max \
+    net.netfilter.nf_conntrack_udp_timeout \
+    net.netfilter.nf_conntrack_udp_timeout_stream || {
+      quic_tuning_abort "$file_txn" "$runtime_state" 0 || :
+      return 1
+    }
+  if [ ! -f "$QUIC_TUNING_STATE" ]; then
+    cp -a -- "$runtime_state" "$QUIC_TUNING_STATE" || {
+      managed_file_transaction_rollback "$QUIC_TUNING_PATH" "$file_txn"
+      rm -f -- "$runtime_state"
+      return 1
+    }
+    quic_state_created=1
+  fi
 
   echo ""
   echo -e "${Y}==> 写入 ${region_label}/${mem_label} QUIC/UDP 参数优化配置 (仅 conntrack)...${N}"
 
-  cat > "$QUIC_TUNING_PATH" <<EOF
+  tmp_quic=$(mktemp "${QUIC_TUNING_PATH}.tmp.XXXXXX") || {
+    quic_tuning_abort "$file_txn" "$runtime_state" "$quic_state_created" || :
+    return 1
+  }
+  if ! cat > "$tmp_quic" <<EOF
+# Managed by Leyili
 # leyili-quic-profile: region=${region} mem_tier=${mem_tier}
 # 由 leyili.sh QUIC/UDP 协议优化生成 (${region_label} / ${mem_label})
 # 用户偏好：Reality TCP 主用、UDP 仅备用 → 本文件不写 net.core.* 通用键，
@@ -4526,26 +5892,40 @@ apply_quic_tuning(){
 # increase receive buffer size" 警告，再考虑单独提升 TCP 那份的 rmem_max。
 # 不跑 TUIC / Hysteria2 时无需此文件，可在菜单 "移除 QUIC 调优" 删除
 
-# --- conntrack (NAT 环境下 UDP 流易爆表，1M 条目 ≈ 200MB 内存) ---
+# --- conntrack（按内存档限制，避免小内存机器被固定 1M 条目拖垮）---
 # 容器/LXC 内可能写不进去，sysctl -p 失败时由上层提示
-net.netfilter.nf_conntrack_max = 1048576
+net.netfilter.nf_conntrack_max = ${conntrack_max}
 net.netfilter.nf_conntrack_udp_timeout = 60
 net.netfilter.nf_conntrack_udp_timeout_stream = 180
 EOF
+  then
+    rm -f -- "$tmp_quic"
+    quic_tuning_abort "$file_txn" "$runtime_state" "$quic_state_created" || :
+    return 1
+  fi
+
+  if ! chmod 600 "$tmp_quic" 2>/dev/null \
+     || ! mv -f -- "$tmp_quic" "$QUIC_TUNING_PATH"; then
+    rm -f -- "$tmp_quic"
+    quic_tuning_abort "$file_txn" "$runtime_state" "$quic_state_created" || :
+    return 1
+  fi
 
   echo -e "${Y}==> 应用 sysctl 配置...${N}"
-  # conntrack 写不进去多为「nf_conntrack 模块未加载」或容器受限；配置文件已落地，
-  # 加载 NAT 规则（如装节点开端口跳跃）或重启后即生效。只警告，不报整体失败。
   if ! sysctl -p "$QUIC_TUNING_PATH" 2>/dev/null; then
-    echo -e "${Y}部分 conntrack 参数当前未能应用（容器/LXC 或 nf_conntrack 模块未加载）${N}"
-    echo -e "${D}配置已写入 ${QUIC_TUNING_PATH}，加载 NAT 规则或重启后生效，不影响节点使用${N}"
+    echo -e "${R}conntrack 参数未能完整应用，已恢复应用前状态${N}"
+    quic_tuning_abort "$file_txn" "$runtime_state" "$quic_state_created" || :
+    return 1
   fi
+
+  rm -f -- "$runtime_state"
+  managed_file_transaction_commit "$file_txn"
 
   return 0
 }
 
 remove_quic_tuning(){
-  local confirm=""
+  local confirm="" rc=0
 
   if ! require_root; then
     return 1
@@ -4557,6 +5937,13 @@ remove_quic_tuning(){
     pause_screen
     return 0
   fi
+  if ! grep -Eq 'Managed by Leyili|leyili-quic-profile' "$QUIC_TUNING_PATH" 2>/dev/null \
+     && [ ! -e "${QUIC_TUNING_PATH}.leyili-original" ] \
+     && [ ! -f "$QUIC_TUNING_STATE" ]; then
+    echo -e "${R}${QUIC_TUNING_PATH} 不是脚本托管文件，拒绝删除。${N}"
+    pause_screen
+    return 1
+  fi
 
   echo ""
   echo -e "${Y}==> 即将移除 ${C}$QUIC_TUNING_PATH${N}${Y}，并通过 sysctl --system 复位参数${N}"
@@ -4567,13 +5954,18 @@ remove_quic_tuning(){
     return 0
   fi
 
-  rm -f "$QUIC_TUNING_PATH"
-
-  sysctl --system >/dev/null 2>&1 || true
+  managed_file_restore "$QUIC_TUNING_PATH" || rc=1
+  sysctl --system >/dev/null 2>&1 || rc=1
+  sysctl_state_restore "$QUIC_TUNING_STATE" || rc=1
 
   echo ""
-  echo -e "${G}QUIC 优化已移除（UDP 缓冲区将回落至 99-proxy-optimized.conf 或内核默认值）${N}"
+  if [ "$rc" -eq 0 ]; then
+    echo -e "${G}QUIC 优化已移除（UDP 缓冲区将回落至 99-proxy-optimized.conf 或内核默认值）${N}"
+  else
+    echo -e "${R}QUIC 优化移除未完全成功，状态快照已尽量保留，请检查上方警告${N}"
+  fi
   pause_screen
+  return "$rc"
 }
 
 apply_quic_optimization(){
@@ -4626,11 +6018,40 @@ apply_quic_optimization(){
   pause_screen
 }
 
+initcwnd_apply_rollback(){
+  local route_line="$1" service_name="$2" helper_txn="$3" service_txn="$4"
+  local was_enabled="$5" was_active="$6" state_created="$7" stop_service="${8:-0}"
+  local rc=0
+
+  if [ "$stop_service" = "1" ] \
+     && { systemctl is-active --quiet "$service_name" 2>/dev/null \
+          || systemctl is-enabled --quiet "$service_name" 2>/dev/null; }; then
+    systemctl disable --now "$service_name" >/dev/null 2>&1 || rc=1
+  fi
+  if [ -n "$route_line" ]; then
+    # shellcheck disable=SC2086
+    ip route replace $route_line >/dev/null 2>&1 || rc=1
+  fi
+  managed_file_transaction_rollback "$INITCWND_HELPER_PATH" "$helper_txn" || rc=1
+  managed_file_transaction_rollback "$INITCWND_SERVICE_PATH" "$service_txn" || rc=1
+  if [ "$stop_service" = "1" ]; then
+    systemctl daemon-reload >/dev/null 2>&1 || rc=1
+    if [ "$was_enabled" -eq 1 ]; then systemctl enable "$service_name" >/dev/null 2>&1 || rc=1; fi
+    if [ "$was_active" -eq 1 ]; then systemctl start "$service_name" >/dev/null 2>&1 || rc=1; fi
+  fi
+  if [ "$state_created" -eq 1 ] && [ "$rc" -eq 0 ]; then
+    rm -f -- "$INITCWND_STATE_PATH" || rc=1
+  fi
+  [ "$rc" -eq 0 ] || echo -e "${R}initcwnd 回滚未完全成功，状态文件/事务快照已保留，请立即检查路由与服务${N}" >&2
+  return "$rc"
+}
+
 apply_initcwnd_optimization(){
-  local route_line route_spec ip_bin current_route
+  local route_line route_spec current_route service_name
   local initcwnd_value="${1:-$INITCWND_VALUE}"
   local quiet="${2:-0}"
-
+  local service_txn helper_txn tmp_service tmp_helper
+  local was_active=0 was_enabled=0 state_created=0
 
   if ! require_root; then return 1; fi
 
@@ -4649,6 +6070,12 @@ apply_initcwnd_optimization(){
     return 1
   fi
 
+  case "$initcwnd_value" in ''|*[!0-9]*) return 1 ;; esac
+  if [ "$initcwnd_value" -lt 2 ] || [ "$initcwnd_value" -gt 128 ]; then
+    echo -e "${R}initcwnd 必须在 2-128 之间${N}"
+    return 1
+  fi
+
   route_spec=$(printf '%s\n' "$route_line" | awk '{
     sep=""
     for (i = 1; i <= NF; i++) {
@@ -4661,18 +6088,90 @@ apply_initcwnd_optimization(){
     }
     printf "\n"
   }')
-  ip_bin=$(command -v ip 2>/dev/null || echo /sbin/ip)
+  service_name=$(basename "$INITCWND_SERVICE_PATH")
+  systemctl is-active --quiet "$service_name" 2>/dev/null && was_active=1
+  systemctl is-enabled --quiet "$service_name" 2>/dev/null && was_enabled=1
+
+  ensure_leyili_state_dir || return 1
+  if [ ! -f "$INITCWND_STATE_PATH" ]; then
+    {
+      printf 'original_active=%s\n' "$was_active"
+      printf 'original_enabled=%s\n' "$was_enabled"
+    } > "$INITCWND_STATE_PATH" || return 1
+    chmod 600 "$INITCWND_STATE_PATH" 2>/dev/null \
+      || { rm -f -- "$INITCWND_STATE_PATH"; return 1; }
+    state_created=1
+  fi
+
+  service_txn=$(managed_file_transaction_begin "$INITCWND_SERVICE_PATH" 'Managed by Leyili|Description=Set TCP initcwnd/initrwnd') || return 1
+  helper_txn=$(managed_file_transaction_begin "$INITCWND_HELPER_PATH" 'Managed by Leyili') || {
+    if managed_file_transaction_rollback "$INITCWND_SERVICE_PATH" "$service_txn"; then
+      [ "$state_created" -eq 1 ] && rm -f -- "$INITCWND_STATE_PATH"
+    fi
+    return 1
+  }
 
   echo -e "${Y}==> 当前默认路由:${N} ${C}$route_line${N}"
   echo -e "${Y}==> 应用 initcwnd/initrwnd ${initcwnd_value}...${N}"
   if ! ip route replace $route_spec initcwnd $initcwnd_value initrwnd $initcwnd_value; then
     echo -e "${R}默认路由优化失败，请检查路由权限或当前网络环境${N}"
     [ "$quiet" != "1" ] && pause_screen
+    initcwnd_apply_rollback "$route_line" "$service_name" "$helper_txn" "$service_txn" \
+      "$was_enabled" "$was_active" "$state_created" 0 || :
     return 1
   fi
 
-  echo -e "${Y}==> 写入 systemd 持久化服务...${N}"
-  cat > "$INITCWND_SERVICE_PATH" << EOF
+  echo -e "${Y}==> 写入动态路由 helper 与 systemd 持久化服务...${N}"
+  if ! mkdir -p "$(dirname -- "$INITCWND_HELPER_PATH")"; then
+    initcwnd_apply_rollback "$route_line" "$service_name" "$helper_txn" "$service_txn" \
+      "$was_enabled" "$was_active" "$state_created" 0 || :
+    return 1
+  fi
+  tmp_helper=$(mktemp "${INITCWND_HELPER_PATH}.tmp.XXXXXX") || {
+    initcwnd_apply_rollback "$route_line" "$service_name" "$helper_txn" "$service_txn" \
+      "$was_enabled" "$was_active" "$state_created" 0 || :
+    return 1
+  }
+  if ! cat > "$tmp_helper" <<'EOF'
+#!/bin/bash
+# Managed by Leyili. 每次启动读取当前默认路由，避免固化旧网关/网卡。
+set -euo pipefail
+value="${1:?missing initcwnd value}"
+ip_bin=$(command -v ip)
+route_line=$($ip_bin route show default | head -n 1)
+[ -n "$route_line" ]
+route_spec=$(printf '%s\n' "$route_line" | awk '{
+  sep=""
+  for (i = 1; i <= NF; i++) {
+    if ($i == "initcwnd" || $i == "initrwnd") { i++; next }
+    printf "%s%s", sep, $i
+    sep=" "
+  }
+}')
+# shellcheck disable=SC2086
+$ip_bin route replace $route_spec initcwnd "$value" initrwnd "$value"
+EOF
+  then
+    rm -f -- "$tmp_helper"
+    initcwnd_apply_rollback "$route_line" "$service_name" "$helper_txn" "$service_txn" \
+      "$was_enabled" "$was_active" "$state_created" 0 || :
+    return 1
+  fi
+  if ! chmod 755 "$tmp_helper" \
+     || ! mv -f -- "$tmp_helper" "$INITCWND_HELPER_PATH"; then
+    rm -f -- "$tmp_helper"
+    initcwnd_apply_rollback "$route_line" "$service_name" "$helper_txn" "$service_txn" \
+      "$was_enabled" "$was_active" "$state_created" 0 || :
+    return 1
+  fi
+
+  tmp_service=$(mktemp "${INITCWND_SERVICE_PATH}.tmp.XXXXXX") || {
+    initcwnd_apply_rollback "$route_line" "$service_name" "$helper_txn" "$service_txn" \
+      "$was_enabled" "$was_active" "$state_created" 0 || :
+    return 1
+  }
+  if ! cat > "$tmp_service" << EOF
+# Managed by Leyili
 [Unit]
 Description=Set TCP initcwnd/initrwnd
 After=network-online.target
@@ -4680,30 +6179,56 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
-ExecStart=$ip_bin route replace $route_spec initcwnd $initcwnd_value initrwnd $initcwnd_value
+ExecStart=$INITCWND_HELPER_PATH $initcwnd_value
 RemainAfterExit=yes
 
 [Install]
 WantedBy=multi-user.target
 EOF
+  then
+    rm -f -- "$tmp_service"
+    initcwnd_apply_rollback "$route_line" "$service_name" "$helper_txn" "$service_txn" \
+      "$was_enabled" "$was_active" "$state_created" 0 || :
+    return 1
+  fi
+  if ! chmod 644 "$tmp_service" 2>/dev/null \
+     || ! mv -f -- "$tmp_service" "$INITCWND_SERVICE_PATH"; then
+    rm -f -- "$tmp_service"
+    initcwnd_apply_rollback "$route_line" "$service_name" "$helper_txn" "$service_txn" \
+      "$was_enabled" "$was_active" "$state_created" 0 || :
+    return 1
+  fi
 
-  if ! systemctl daemon-reload; then
-    echo -e "${R}systemd 重新加载失败${N}"
+  if ! systemctl daemon-reload \
+     || ! systemctl enable --now "$service_name"; then
+    if initcwnd_apply_rollback "$route_line" "$service_name" "$helper_txn" "$service_txn" \
+         "$was_enabled" "$was_active" "$state_created" 1; then
+      echo -e "${R}initcwnd 持久化服务启用失败，已恢复原文件、路由与服务状态${N}"
+    else
+      echo -e "${R}initcwnd 持久化服务启用失败，且回滚未完全成功${N}"
+    fi
     [ "$quiet" != "1" ] && pause_screen
     return 1
   fi
 
-  if ! systemctl enable --now "$(basename "$INITCWND_SERVICE_PATH")"; then
-    echo -e "${R}initcwnd 持久化服务启用失败${N}"
-    [ "$quiet" != "1" ] && pause_screen
+  current_route=$(ip route show default 2>/dev/null | head -1)
+  if ! printf '%s\n' "$current_route" | grep -Eq "(^| )initcwnd ${initcwnd_value}( |$)"; then
+    if initcwnd_apply_rollback "$route_line" "$service_name" "$helper_txn" "$service_txn" \
+         "$was_enabled" "$was_active" "$state_created" 1; then
+      echo -e "${R}initcwnd 健康检查失败，已恢复原状态${N}"
+    else
+      echo -e "${R}initcwnd 健康检查失败，且回滚未完全成功${N}"
+    fi
     return 1
   fi
+
+  managed_file_transaction_commit "$helper_txn"
+  managed_file_transaction_commit "$service_txn"
 
   if [ "$quiet" = "1" ]; then
     return 0
   fi
 
-  current_route=$(ip route show default 2>/dev/null | head -1)
   echo ""
   echo -e "${G}initcwnd 优化已生效${N}"
   echo -e "  当前默认路由: ${C}$current_route${N}"
@@ -4717,34 +6242,31 @@ EOF
   pause_screen
 }
 
-remove_initcwnd_optimization(){
-  local confirm=""
-  local service_name
+remove_initcwnd_managed(){
+  local quiet="${1:-0}" service_name
   local route_line route_spec
-
-  if ! require_root; then
-    return 1
-  fi
+  local original_active=0 original_enabled=0 managed=0 rc=0
 
   service_name=$(basename "$INITCWND_SERVICE_PATH")
-  if [ ! -f "$INITCWND_SERVICE_PATH" ] && ! systemctl cat "$service_name" >/dev/null 2>&1; then
-    echo ""
-    echo -e "${Y}未检测到 initcwnd 持久化服务，无需移除${N}"
-    pause_screen
-    return 0
+  if grep -Fq 'Managed by Leyili' "$INITCWND_SERVICE_PATH" 2>/dev/null \
+     || [ -e "${INITCWND_SERVICE_PATH}.leyili-original" ] \
+     || [ -f "$INITCWND_STATE_PATH" ]; then
+    managed=1
   fi
+  [ "$managed" -eq 1 ] || return 0
 
-  echo ""
-  read -p "  确认移除 initcwnd 持久化服务并恢复默认路由？(y/N): " confirm
-  if [ "$confirm" != "y" ] && [ "$confirm" != "Y" ]; then
-    echo -e "  已取消"
-    sleep 1
-    return 0
+  original_active=$(awk -F= '$1 == "original_active" {print $2; exit}' "$INITCWND_STATE_PATH" 2>/dev/null)
+  original_enabled=$(awk -F= '$1 == "original_enabled" {print $2; exit}' "$INITCWND_STATE_PATH" 2>/dev/null)
+  if systemctl is-active --quiet "$service_name" 2>/dev/null \
+     || systemctl is-enabled --quiet "$service_name" 2>/dev/null; then
+    systemctl disable --now "$service_name" >/dev/null 2>&1 || rc=1
   fi
+  managed_file_restore "$INITCWND_SERVICE_PATH" || rc=1
+  managed_file_restore "$INITCWND_HELPER_PATH" || rc=1
+  systemctl daemon-reload >/dev/null 2>&1 || rc=1
 
-  systemctl disable --now "$service_name" >/dev/null 2>&1 || true
-  rm -f "$INITCWND_SERVICE_PATH"
-  systemctl daemon-reload >/dev/null 2>&1 || true
+  if [ "$original_enabled" = "1" ]; then systemctl enable "$service_name" >/dev/null 2>&1 || rc=1; fi
+  if [ "$original_active" = "1" ]; then systemctl start "$service_name" >/dev/null 2>&1 || rc=1; fi
 
   if command -v ip >/dev/null 2>&1; then
     route_line=$(ip route show default 2>/dev/null | head -1)
@@ -4761,12 +6283,48 @@ remove_initcwnd_optimization(){
         }
       }')
       # shellcheck disable=SC2086
-      ip route replace $route_spec >/dev/null 2>&1 || true
+      ip route replace $route_spec >/dev/null 2>&1 || rc=1
     fi
   fi
 
+  if [ "$rc" -eq 0 ]; then
+    rm -f -- "$INITCWND_STATE_PATH" || rc=1
+  fi
+  if [ "$rc" -eq 0 ]; then
+    [ "$quiet" = "1" ] || echo -e "  ${G}initcwnd 优化已移除${N}"
+  else
+    echo -e "${R}initcwnd 移除/恢复未完全成功，状态文件已保留：${INITCWND_STATE_PATH}${N}" >&2
+  fi
+  return "$rc"
+}
+
+remove_initcwnd_optimization(){
+  local confirm=""
+
+  if ! require_root; then return 1; fi
+  if ! grep -Fq 'Managed by Leyili' "$INITCWND_SERVICE_PATH" 2>/dev/null \
+     && [ ! -e "${INITCWND_SERVICE_PATH}.leyili-original" ] \
+     && [ ! -f "$INITCWND_STATE_PATH" ]; then
+    echo ""
+    echo -e "${Y}未检测到脚本管理的 initcwnd 服务，无需移除${N}"
+    pause_screen
+    return 0
+  fi
+
   echo ""
-  echo -e "${G}initcwnd 优化已移除${N}"
+  read -p "  确认移除 initcwnd 持久化服务并恢复原文件/当前路由？(y/N): " confirm
+  if [ "$confirm" != "y" ] && [ "$confirm" != "Y" ]; then
+    echo -e "  已取消"
+    sleep 1
+    return 0
+  fi
+
+  if ! remove_initcwnd_managed 0; then
+    pause_screen
+    return 1
+  fi
+
+  echo ""
   pause_screen
 }
 
@@ -4779,6 +6337,7 @@ apply_network_optimization(){
   local mem_label
   local notsent_lowat fin_timeout
   local live_cc live_iface live_qdisc
+  local rollback_rc=0
 
   if ! require_root; then return 1; fi
 
@@ -4802,7 +6361,15 @@ apply_network_optimization(){
   fi
 
   if ! apply_initcwnd_optimization "$initcwnd_value" 1; then
-    echo -e "${R}initcwnd 优化失败（TCP 调优已生效，但 initcwnd 未应用）${N}"
+    managed_file_restore "$TCP_TUNING_PATH" || rollback_rc=1
+    sysctl --system >/dev/null 2>&1 || rollback_rc=1
+    sysctl_state_restore "$TCP_TUNING_STATE" || rollback_rc=1
+    restore_live_qdisc "$TCP_QDISC_STATE" 1 || rollback_rc=1
+    if [ "$rollback_rc" -eq 0 ]; then
+      echo -e "${R}initcwnd 优化失败，TCP 调优也已回滚，避免留下半套配置${N}"
+    else
+      echo -e "${R}initcwnd 优化失败，且 TCP 调优回滚未完全成功，请检查上方快照提示${N}"
+    fi
     pause_screen
     return 1
   fi
@@ -5383,10 +6950,43 @@ show_network_optimization_status(){
   pause_screen
 }
 
+swap_transaction_rollback(){
+  local created_this_run="${1:-0}"
+  local fstab_backup="${2:-}"
+  local sysctl_txn="${3:-}"
+  local rc=0
+
+  if [ -n "$sysctl_txn" ] && [ -d "$sysctl_txn" ]; then
+    managed_file_transaction_rollback "$SWAP_SYSCTL_PATH" "$sysctl_txn" || rc=1
+  fi
+  if [ -n "$fstab_backup" ] && [ -f "$fstab_backup" ]; then
+    restore_file_snapshot "$fstab_backup" /etc/fstab || rc=1
+  fi
+  if [ "$created_this_run" = "1" ]; then
+    if awk -v p="$SWAPFILE_PATH" 'NR > 1 && $1 == p {found=1} END {exit !found}' /proc/swaps 2>/dev/null; then
+      swapoff "$SWAPFILE_PATH" >/dev/null 2>&1 || rc=1
+    fi
+    if ! awk -v p="$SWAPFILE_PATH" 'NR > 1 && $1 == p {found=1} END {exit !found}' /proc/swaps 2>/dev/null; then
+      rm -f -- "$SWAPFILE_PATH" || rc=1
+    else
+      rc=1
+    fi
+  fi
+  sysctl --system >/dev/null 2>&1 || rc=1
+  if [ "$rc" -eq 0 ]; then
+    [ -z "$fstab_backup" ] || rm -f -- "$fstab_backup" || rc=1
+  else
+    echo -e "${R}SWAP 事务回滚未完全成功${fstab_backup:+，fstab 快照保留在 ${fstab_backup}}${N}" >&2
+  fi
+  return "$rc"
+}
+
 configure_swap(){
   local swap_size_mb="${1:-2048}"
   local size_label="${2:-${swap_size_mb} MB}"
   local swap_active="false"
+  local state_created_file=0 adopted=0 fstab_added=0 created_this_run=0
+  local swap_tmp="" fstab_backup="" fstab_tmp="" sysctl_txn="" tmp_sysctl="" tmp_state="" adopt_choice=""
 
   if ! require_root; then return 1; fi
 
@@ -5400,60 +7000,140 @@ configure_swap(){
   fi
 
   if [ "$swap_active" = "true" ]; then
-    echo -e "${Y}==> 检测到 ${SWAPFILE_PATH} 已启用，跳过创建${N}"
-    echo -e "${D}    如需更换大小，请先在 shell 执行：swapoff ${SWAPFILE_PATH} && rm -f ${SWAPFILE_PATH}${N}"
+    if [ ! -f "$SWAP_STATE_PATH" ]; then
+      echo -e "${Y}检测到已启用但无法确认由本脚本创建的 ${SWAPFILE_PATH}${N}"
+      echo -e "${D}默认不会接管、格式化或删除该文件。输入 ADOPT 仅接管 swappiness；文件与既有 fstab 行仍归用户。${N}"
+      read -p "  输入 ADOPT 接管设置，其它输入取消: " adopt_choice
+      if [ "$adopt_choice" != "ADOPT" ]; then
+        echo -e "  已取消，现有 SWAP 未作任何修改"
+        pause_screen
+        return 0
+      fi
+      adopted=1
+    else
+      adopted=$(awk -F= '$1 == "adopted" {print $2; exit}' "$SWAP_STATE_PATH" 2>/dev/null)
+      state_created_file=$(awk -F= '$1 == "created_file" {print $2; exit}' "$SWAP_STATE_PATH" 2>/dev/null)
+      fstab_added=$(awk -F= '$1 == "fstab_added" {print $2; exit}' "$SWAP_STATE_PATH" 2>/dev/null)
+    fi
+    echo -e "${Y}==> ${SWAPFILE_PATH} 已启用，不重新格式化${N}"
   else
     if [ -f "$SWAPFILE_PATH" ]; then
-      echo -e "${Y}==> 检测到已有 ${SWAPFILE_PATH}，继续复用（不重建）${N}"
-      echo -e "${D}    如需更换大小，请先 rm -f ${SWAPFILE_PATH} 后重新运行此项${N}"
-    else
-      echo -e "${Y}==> 创建 ${size_label} SWAP 文件...${N}"
-      if ! fallocate -l "${swap_size_mb}M" "$SWAPFILE_PATH"; then
-        echo -e "${Y}==> fallocate 失败（可能文件系统不支持，如 tmpfs/zfs），改用 dd 创建...${N}"
-        dd if=/dev/zero of="$SWAPFILE_PATH" bs=1M count="$swap_size_mb" status=progress || {
-          echo -e "${R}SWAP 文件创建失败${N}"
-          rm -f "$SWAPFILE_PATH"
-          pause_screen
-          return 1
-        }
+      echo -e "${R}检测到未启用的现有文件 ${SWAPFILE_PATH}，拒绝执行 mkswap（会破坏原内容）。${N}"
+      echo -e "${Y}请先人工确认并移动/删除该文件，再重新运行。${N}"
+      pause_screen
+      return 1
+    fi
+
+    echo -e "${Y}==> 创建 ${size_label} SWAP 文件...${N}"
+    swap_tmp=$(mktemp "${SWAPFILE_PATH}.leyili.XXXXXX") || return 1
+    if ! fallocate -l "${swap_size_mb}M" "$swap_tmp"; then
+      echo -e "${Y}==> fallocate 失败，改用 dd 创建...${N}"
+      if ! dd if=/dev/zero of="$swap_tmp" bs=1M count="$swap_size_mb" status=progress; then
+        rm -f -- "$swap_tmp"
+        echo -e "${R}SWAP 文件创建失败${N}"
+        pause_screen
+        return 1
       fi
     fi
-
-    echo -e "${Y}==> 设置 SWAP 文件权限...${N}"
-    chmod 600 "$SWAPFILE_PATH"
-
-    echo -e "${Y}==> 格式化 SWAP...${N}"
-    if ! mkswap "$SWAPFILE_PATH"; then
-      echo -e "${R}mkswap 失败${N}"
-      rm -f "$SWAPFILE_PATH"
+    chmod 600 "$swap_tmp" || { rm -f -- "$swap_tmp"; return 1; }
+    if ! mkswap "$swap_tmp" >/dev/null \
+       || ! mv -f -- "$swap_tmp" "$SWAPFILE_PATH" \
+       || ! swapon "$SWAPFILE_PATH"; then
+      rm -f -- "$swap_tmp" "$SWAPFILE_PATH"
+      echo -e "${R}SWAP 格式化或启用失败，已删除本次新建文件${N}"
       pause_screen
       return 1
     fi
-
-    echo -e "${Y}==> 启用 SWAP...${N}"
-    if ! swapon "$SWAPFILE_PATH"; then
-      echo -e "${R}swapon 失败${N}"
-      rm -f "$SWAPFILE_PATH"
-      pause_screen
-      return 1
-    fi
+    created_this_run=1
+    state_created_file=1
   fi
 
-  echo -e "${Y}==> 写入开机自动挂载...${N}"
-  if ! grep -Eq '^[[:space:]]*/swapfile[[:space:]]+none[[:space:]]+swap[[:space:]]+sw[[:space:]]+0[[:space:]]+0([[:space:]]|$)' /etc/fstab; then
-    echo "$SWAPFILE_PATH none swap sw 0 0" >> /etc/fstab
+  fstab_backup=$(mktemp "${TMPDIR:-/tmp}/leyili-fstab.XXXXXX") || {
+    swap_transaction_rollback "$created_this_run" "" ""
+    return 1
+  }
+  cp -a -- /etc/fstab "$fstab_backup" || {
+    swap_transaction_rollback "$created_this_run" "$fstab_backup" ""
+    return 1
+  }
+  if ! awk -v p="$SWAPFILE_PATH" '$1 == p && $3 == "swap" {found=1} END {exit !found}' /etc/fstab; then
+    fstab_tmp=$(mktemp /etc/fstab.tmp.XXXXXX) || {
+      swap_transaction_rollback "$created_this_run" "$fstab_backup" ""
+      return 1
+    }
+    if ! { cat /etc/fstab; printf '\n# Managed by Leyili SWAP\n%s none swap sw 0 0\n' "$SWAPFILE_PATH"; } > "$fstab_tmp"; then
+      rm -f -- "$fstab_tmp"
+      swap_transaction_rollback "$created_this_run" "$fstab_backup" ""
+      return 1
+    fi
+    if ! chmod --reference=/etc/fstab "$fstab_tmp" 2>/dev/null \
+       || ! chown --reference=/etc/fstab "$fstab_tmp" 2>/dev/null \
+       || ! mv -f -- "$fstab_tmp" /etc/fstab; then
+      rm -f -- "$fstab_tmp"
+      swap_transaction_rollback "$created_this_run" "$fstab_backup" ""
+      return 1
+    fi
+    fstab_added=1
   fi
 
   echo -e "${Y}==> 设置 swappiness = ${SWAPPINESS_VALUE}...${N}"
-  cat > "$SWAP_SYSCTL_PATH" << EOF
+  sysctl_txn=$(managed_file_transaction_begin "$SWAP_SYSCTL_PATH" 'Managed by Leyili') || {
+    swap_transaction_rollback "$created_this_run" "$fstab_backup" ""
+    return 1
+  }
+  tmp_sysctl=$(mktemp "${SWAP_SYSCTL_PATH}.tmp.XXXXXX") || {
+    swap_transaction_rollback "$created_this_run" "$fstab_backup" "$sysctl_txn"
+    return 1
+  }
+  if ! cat > "$tmp_sysctl" << EOF
+# Managed by Leyili
 vm.swappiness = $SWAPPINESS_VALUE
 EOF
-
-  # swappiness 只是可选优化；SWAP 主体（swapon + fstab）此前已成功。
-  # 容器/精简内核 vm.swappiness 不可写时只警告，不报整体失败（否则误导用户去删正在用的 swapfile）
-  if ! sysctl -p "$SWAP_SYSCTL_PATH" 2>/dev/null; then
-    echo -e "${Y}swappiness 当前未能应用（容器/精简内核可能不可写）；SWAP 已启用，配置已写入，重启后生效${N}"
+  then
+    rm -f -- "$tmp_sysctl"
+    swap_transaction_rollback "$created_this_run" "$fstab_backup" "$sysctl_txn"
+    return 1
   fi
+  if ! chmod 600 "$tmp_sysctl" 2>/dev/null \
+     || ! mv -f -- "$tmp_sysctl" "$SWAP_SYSCTL_PATH"; then
+    rm -f -- "$tmp_sysctl"
+    swap_transaction_rollback "$created_this_run" "$fstab_backup" "$sysctl_txn"
+    return 1
+  fi
+
+  if ! sysctl -p "$SWAP_SYSCTL_PATH" 2>/dev/null; then
+    swap_transaction_rollback "$created_this_run" "$fstab_backup" "$sysctl_txn"
+    echo -e "${R}swappiness 应用失败，已恢复 fstab、sysctl 与本次新建 SWAP${N}"
+    pause_screen
+    return 1
+  fi
+
+  if ! ensure_leyili_state_dir; then
+    swap_transaction_rollback "$created_this_run" "$fstab_backup" "$sysctl_txn"
+    return 1
+  fi
+  tmp_state=$(mktemp "${SWAP_STATE_PATH}.tmp.XXXXXX") || {
+    swap_transaction_rollback "$created_this_run" "$fstab_backup" "$sysctl_txn"
+    return 1
+  }
+  {
+    printf 'path=%s\n' "$SWAPFILE_PATH"
+    printf 'created_file=%s\n' "${state_created_file:-0}"
+    printf 'adopted=%s\n' "${adopted:-0}"
+    printf 'fstab_added=%s\n' "${fstab_added:-0}"
+  } > "$tmp_state" || {
+    rm -f -- "$tmp_state"
+    swap_transaction_rollback "$created_this_run" "$fstab_backup" "$sysctl_txn"
+    return 1
+  }
+  if ! chmod 600 "$tmp_state" 2>/dev/null \
+     || ! mv -f -- "$tmp_state" "$SWAP_STATE_PATH"; then
+    rm -f -- "$tmp_state"
+    swap_transaction_rollback "$created_this_run" "$fstab_backup" "$sysctl_txn"
+    return 1
+  fi
+  managed_file_transaction_commit "$sysctl_txn"
+  rm -f -- "$fstab_backup"
 
   echo ""
   echo -e "${G}SWAP 配置完成${N}"
@@ -5492,8 +7172,12 @@ show_swap_picker(){
     existing_size_mb=$(stat -c%s "$SWAPFILE_PATH" 2>/dev/null)
     if [ -n "$existing_size_mb" ] && [ "$existing_size_mb" -gt 0 ] 2>/dev/null; then
       existing_size_mb=$((existing_size_mb / 1024 / 1024))
-      echo -e "  ${Y}⚠ 检测到已存在 ${SWAPFILE_PATH}（约 ${existing_size_mb} MB），后续步骤会复用、不重建${N}"
-      echo -e "  ${D}  如需更换大小：先 ${C}swapoff ${SWAPFILE_PATH} && rm -f ${SWAPFILE_PATH}${D}，再回此菜单${N}"
+      if swapon --show=NAME --noheadings 2>/dev/null | grep -Fxq "$SWAPFILE_PATH"; then
+        echo -e "  ${Y}⚠ 检测到已启用 ${SWAPFILE_PATH}（约 ${existing_size_mb} MB），不会重新格式化${N}"
+        [ -f "$SWAP_STATE_PATH" ] || echo -e "  ${D}  因缺少所有权记录，后续仅在输入 ADOPT 后接管 swappiness，不会接管或删除文件${N}"
+      else
+        echo -e "  ${R}⚠ 检测到未启用的现有 ${SWAPFILE_PATH}（约 ${existing_size_mb} MB），脚本会拒绝 mkswap 以保护原内容${N}"
+      fi
       echo ""
     fi
   fi
@@ -5542,22 +7226,32 @@ show_swap_picker(){
 
 remove_swap(){
   local confirm=""
-  local tmp_file=""
+  local tmp_file="" fstab_backup="" sysctl_txn=""
+  local created_file=0 adopted=0 fstab_added=0
+  local was_active=0 rollback_ok=1 rc=0
 
   if ! require_root; then
     return 1
   fi
 
-  if [ ! -f "$SWAPFILE_PATH" ] && [ ! -f "$SWAP_SYSCTL_PATH" ] \
-     && ! grep -Eq "^[[:space:]]*${SWAPFILE_PATH}[[:space:]]" /etc/fstab 2>/dev/null; then
+  if [ ! -f "$SWAP_STATE_PATH" ]; then
     echo ""
-    echo -e "${Y}未检测到脚本创建的 SWAP，无需移除${N}"
+    echo -e "${Y}没有找到 ${SWAP_STATE_PATH}，无法证明 ${SWAPFILE_PATH} 归脚本所有。${N}"
+    echo -e "${D}为避免删除用户文件，本菜单不会关闭、删除或改写现有 SWAP/fstab。${N}"
     pause_screen
     return 0
   fi
 
+  created_file=$(awk -F= '$1 == "created_file" {print $2; exit}' "$SWAP_STATE_PATH" 2>/dev/null)
+  adopted=$(awk -F= '$1 == "adopted" {print $2; exit}' "$SWAP_STATE_PATH" 2>/dev/null)
+  fstab_added=$(awk -F= '$1 == "fstab_added" {print $2; exit}' "$SWAP_STATE_PATH" 2>/dev/null)
+
   echo ""
-  echo -e "${Y}==> 即将关闭并删除 ${C}$SWAPFILE_PATH${N}${Y}，并移除 swappiness 配置${N}"
+  if [ "$created_file" = "1" ]; then
+    echo -e "${Y}==> 即将关闭并删除脚本创建的 ${C}$SWAPFILE_PATH${N}${Y}，并恢复原 swappiness 文件${N}"
+  else
+    echo -e "${Y}==> 此 SWAP 为显式接管项：仅恢复脚本设置，保留文件、启用状态和既有 fstab 行${N}"
+  fi
   read -p "  确认继续？(y/N): " confirm
   if [ "$confirm" != "y" ] && [ "$confirm" != "Y" ]; then
     echo -e "  已取消"
@@ -5565,33 +7259,88 @@ remove_swap(){
     return 0
   fi
 
-  if swapon --show=NAME --noheadings 2>/dev/null | grep -Fxq "$SWAPFILE_PATH"; then
+  fstab_backup=$(mktemp "${TMPDIR:-/tmp}/leyili-fstab-remove.XXXXXX") || return 1
+  cp -a -- /etc/fstab "$fstab_backup" || { rm -f -- "$fstab_backup"; return 1; }
+  if [ "$fstab_added" = "1" ]; then
+    tmp_file=$(mktemp /etc/fstab.tmp.XXXXXX) || { rm -f -- "$fstab_backup"; return 1; }
+    if ! awk -v p="$SWAPFILE_PATH" '
+      /^# Managed by Leyili SWAP$/ {pending=1; next}
+      pending && $1 == p && $3 == "swap" {pending=0; next}
+      {if (pending) {print "# Managed by Leyili SWAP"; pending=0} print}
+      END {if (pending) print "# Managed by Leyili SWAP"}
+    ' /etc/fstab > "$tmp_file"; then
+      rm -f -- "$tmp_file" "$fstab_backup"
+      return 1
+    fi
+    if ! chmod --reference=/etc/fstab "$tmp_file" 2>/dev/null \
+       || ! chown --reference=/etc/fstab "$tmp_file" 2>/dev/null \
+       || ! mv -f -- "$tmp_file" /etc/fstab; then
+      rm -f -- "$tmp_file" "$fstab_backup"
+      return 1
+    fi
+  fi
+
+  sysctl_txn=$(managed_file_transaction_begin "$SWAP_SYSCTL_PATH" 'Managed by Leyili') || {
+    if restore_file_snapshot "$fstab_backup" /etc/fstab; then
+      rm -f -- "$fstab_backup"
+    else
+      echo -e "${R}SWAP sysctl 快照失败，且 fstab 恢复失败；快照保留在 ${fstab_backup}${N}" >&2
+    fi
+    return 1
+  }
+  if ! managed_file_restore "$SWAP_SYSCTL_PATH" \
+     || ! sysctl --system >/dev/null 2>&1; then
+    managed_file_transaction_rollback "$SWAP_SYSCTL_PATH" "$sysctl_txn" || rollback_ok=0
+    restore_file_snapshot "$fstab_backup" /etc/fstab || rollback_ok=0
+    [ "$rollback_ok" -eq 1 ] && rm -f -- "$fstab_backup"
+    echo -e "${R}恢复原 swappiness 失败，已尝试回滚，SWAP 文件未删除${N}"
+    pause_screen
+    return 1
+  fi
+
+  if [ "$created_file" = "1" ] \
+     && awk -v p="$SWAPFILE_PATH" 'NR > 1 && $1 == p {found=1} END {exit !found}' /proc/swaps 2>/dev/null; then
+    was_active=1
     echo -e "${Y}==> 关闭 SWAP...${N}"
     if ! swapoff "$SWAPFILE_PATH"; then
-      echo -e "${R}关闭 SWAP 失败，可能存在占用${N}"
+      managed_file_transaction_rollback "$SWAP_SYSCTL_PATH" "$sysctl_txn" || rollback_ok=0
+      restore_file_snapshot "$fstab_backup" /etc/fstab || rollback_ok=0
+      [ "$rollback_ok" -eq 1 ] && rm -f -- "$fstab_backup"
+      echo -e "${R}关闭 SWAP 失败，已尝试恢复 fstab 与 swappiness，文件未删除${N}"
       pause_screen
       return 1
     fi
   fi
 
-  if [ -f "$SWAPFILE_PATH" ]; then
-    rm -f "$SWAPFILE_PATH"
+  if [ "$created_file" = "1" ] && [ -f "$SWAPFILE_PATH" ]; then
+    if ! rm -f -- "$SWAPFILE_PATH"; then
+      [ "$was_active" -eq 1 ] && swapon "$SWAPFILE_PATH" >/dev/null 2>&1 || {
+        [ "$was_active" -eq 0 ] || rollback_ok=0
+      }
+      managed_file_transaction_rollback "$SWAP_SYSCTL_PATH" "$sysctl_txn" || rollback_ok=0
+      restore_file_snapshot "$fstab_backup" /etc/fstab || rollback_ok=0
+      [ "$rollback_ok" -eq 1 ] && rm -f -- "$fstab_backup"
+      echo -e "${R}删除 SWAP 文件失败，已尝试恢复启用状态、fstab 与 swappiness${N}"
+      pause_screen
+      return 1
+    fi
   fi
 
-  if grep -Eq "^[[:space:]]*${SWAPFILE_PATH}[[:space:]]" /etc/fstab 2>/dev/null; then
-    tmp_file=$(mktemp)
-    awk -v p="$SWAPFILE_PATH" '$1 != p {print}' /etc/fstab > "$tmp_file" && mv "$tmp_file" /etc/fstab
-  fi
-
-  if [ -f "$SWAP_SYSCTL_PATH" ]; then
-    rm -f "$SWAP_SYSCTL_PATH"
-    sysctl --system >/dev/null 2>&1 || true
-  fi
+  managed_file_transaction_commit "$sysctl_txn" || rc=1
+  rm -f -- "$SWAP_STATE_PATH" || rc=1
+  rm -f -- "$fstab_backup" || rc=1
 
   echo ""
-  echo -e "${G}SWAP 已移除${N}"
+  if [ "$rc" -ne 0 ]; then
+    echo -e "${R}SWAP 已按确认执行，但状态/临时文件清理不完整，请检查 ${SWAP_STATE_PATH}${N}"
+  elif [ "$created_file" = "1" ]; then
+    echo -e "${G}脚本创建的 SWAP 已删除（不可恢复）；原 swappiness 文件已恢复${N}"
+  else
+    echo -e "${G}脚本的 SWAP 设置已移除；接管前的 SWAP 文件与挂载保持不变${N}"
+  fi
   free -h
   pause_screen
+  return "$rc"
 }
 
 # ─── 脚本自更新 / 配置管理 ────────────────────────────
@@ -5607,8 +7356,15 @@ get_latest_singbox_version(){
 # 命中且未过期 → 直接读缓存；过期/不存在 → 拉一次并写回。
 # 拉取失败时写空内容作为「负缓存」，短 TTL 内不再重试，避免每次刷新都卡 5 秒。
 get_latest_singbox_version_cached(){
-  local now mtime age content ttl ver
-  if [ -f "$SINGBOX_LATEST_CACHE" ]; then
+  local now mtime age content ttl ver cache_ok=0 tmp_cache
+  if [ ! -L "$LEYILI_CACHE_DIR" ] && ! [ -L "$SINGBOX_LATEST_CACHE" ]; then
+    if [ "$(id -u)" -eq 0 ]; then
+      ensure_private_dir "$LEYILI_CACHE_DIR" 700 >/dev/null 2>&1 && cache_ok=1
+    elif [ -d "$LEYILI_CACHE_DIR" ] && [ -r "$SINGBOX_LATEST_CACHE" ]; then
+      cache_ok=1
+    fi
+  fi
+  if [ "$cache_ok" = "1" ] && [ -f "$SINGBOX_LATEST_CACHE" ]; then
     now=$(date +%s 2>/dev/null || echo 0)
     mtime=$(stat -c %Y "$SINGBOX_LATEST_CACHE" 2>/dev/null || echo 0)
     age=$((now - mtime))
@@ -5620,7 +7376,15 @@ get_latest_singbox_version_cached(){
     fi
   fi
   ver=$(get_latest_singbox_version)
-  printf '%s' "$ver" > "$SINGBOX_LATEST_CACHE" 2>/dev/null || true
+  if [ "$cache_ok" = "1" ] && [ -w "$LEYILI_CACHE_DIR" ]; then
+    tmp_cache=$(mktemp "${SINGBOX_LATEST_CACHE}.tmp.XXXXXX" 2>/dev/null || true)
+    if [ -n "$tmp_cache" ]; then
+      printf '%s' "$ver" > "$tmp_cache" 2>/dev/null \
+        && chmod 600 "$tmp_cache" 2>/dev/null \
+        && mv -f -- "$tmp_cache" "$SINGBOX_LATEST_CACHE" 2>/dev/null \
+        || rm -f -- "$tmp_cache"
+    fi
+  fi
   printf '%s' "$ver"
 }
 
@@ -5661,6 +7425,7 @@ sb_version_at_least(){
 update_self_script(){
   local tmp_file=""
   local confirm=""
+  local actual_sha="" size="" stage_file="" backup_path=""
 
   if ! require_root; then
     return 1
@@ -5677,9 +7442,33 @@ update_self_script(){
   echo -e "${Y}==> 下载最新脚本...${N}"
   tmp_file=$(mktemp)
   trap 'rm -f "$tmp_file"' RETURN
-  if ! curl -fsSL --max-time 15 "$SELF_INSTALL_URL" -o "$tmp_file"; then
+  case "$SELF_INSTALL_URL" in
+    https://*) ;;
+    *)
+      echo -e "${R}自更新地址必须使用 HTTPS：$SELF_INSTALL_URL${N}"
+      pause_screen
+      return 1
+      ;;
+  esac
+  if ! curl --proto '=https' --tlsv1.2 -fsSL --max-time 30 "$SELF_INSTALL_URL" -o "$tmp_file"; then
     rm -f "$tmp_file"
     echo -e "${R}下载失败，请检查网络或 SELF_INSTALL_URL${N}"
+    pause_screen
+    return 1
+  fi
+
+  size=$(wc -c < "$tmp_file" 2>/dev/null | tr -d ' ')
+  if [ -z "$size" ] || [ "$size" -lt 50000 ] || [ "$size" -gt 2097152 ]; then
+    echo -e "${R}新脚本大小异常（${size:-未知} 字节），已放弃更新${N}"
+    pause_screen
+    return 1
+  fi
+
+  if ! head -n 1 "$tmp_file" | grep -Eq '^#!/(usr/)?bin/(env )?bash' \
+     || ! grep -Fq 'APP_NAME="Leyili"' "$tmp_file" \
+     || ! grep -Fq 'show_menu' "$tmp_file" \
+     || ! grep -Fq 'acquire_global_lock' "$tmp_file"; then
+    echo -e "${R}下载内容缺少 Leyili 脚本结构标记，已放弃更新${N}"
     pause_screen
     return 1
   fi
@@ -5691,6 +7480,17 @@ update_self_script(){
     return 1
   fi
 
+  actual_sha=$(sha256sum "$tmp_file" 2>/dev/null | awk '{print $1}')
+  if [ -n "$SELF_INSTALL_SHA256" ]; then
+    if [ "$(printf '%s' "$actual_sha" | tr 'A-F' 'a-f')" != "$(printf '%s' "$SELF_INSTALL_SHA256" | tr 'A-F' 'a-f')" ]; then
+      echo -e "${R}新脚本 SHA-256 不匹配，已放弃更新${N}"
+      echo -e "  预期: ${C}${SELF_INSTALL_SHA256}${N}"
+      echo -e "  实际: ${C}${actual_sha:-无法计算}${N}"
+      pause_screen
+      return 1
+    fi
+  fi
+
   if [ -f "$SCRIPT_PATH" ] && cmp -s "$tmp_file" "$SCRIPT_PATH"; then
     rm -f "$tmp_file"
     echo -e "${G}当前已是最新版本${N}"
@@ -5699,22 +7499,59 @@ update_self_script(){
   fi
 
   echo -e "  来源: ${C}$SELF_INSTALL_URL${N}"
-  read -p "  确认覆盖 ${SCRIPT_PATH}？(y/N): " confirm
-  if [ "$confirm" != "y" ] && [ "$confirm" != "Y" ]; then
+  echo -e "  SHA-256: ${C}${actual_sha:-无法计算}${N}"
+  if [ -z "$SELF_INSTALL_SHA256" ]; then
+    echo -e "  ${Y}未配置 SELF_INSTALL_SHA256，来源身份无法做固定哈希校验。${N}"
+    read -p "  如已人工核对上方哈希，输入 UNVERIFIED 继续: " confirm
+    if [ "$confirm" != "UNVERIFIED" ]; then
+      echo -e "  已取消"
+      sleep 1
+      return 0
+    fi
+  else
+    read -p "  哈希校验通过，确认覆盖 ${SCRIPT_PATH}？(y/N): " confirm
+    if [ "$confirm" != "y" ] && [ "$confirm" != "Y" ]; then
+      echo -e "  已取消"
+      sleep 1
+      return 0
+    fi
+  fi
+  if [ -z "$confirm" ]; then
     rm -f "$tmp_file"
     echo -e "  已取消"
     sleep 1
     return 0
   fi
 
+  if [ -L "$SCRIPT_PATH" ]; then
+    echo -e "${R}拒绝覆盖符号链接脚本入口：${SCRIPT_PATH}${N}"
+    pause_screen
+    return 1
+  fi
+  mkdir -p -- "$(dirname -- "$SCRIPT_PATH")" || return 1
+  stage_file=$(mktemp "${SCRIPT_PATH}.new.XXXXXX") || return 1
+  if ! install -m 0755 "$tmp_file" "$stage_file"; then
+    rm -f -- "$stage_file"
+    echo -e "${R}准备新脚本失败${N}"
+    pause_screen
+    return 1
+  fi
   if [ -f "$SCRIPT_PATH" ]; then
-    cp "$SCRIPT_PATH" "${SCRIPT_PATH}.bak.$(date +%Y%m%d%H%M%S)" 2>/dev/null || true
-    cleanup_old_backups "${SCRIPT_PATH}.bak.*" 3
+    backup_path="${SCRIPT_PATH}.bak.$(date +%Y%m%d%H%M%S)"
+    if ! cp -a -- "$SCRIPT_PATH" "$backup_path"; then
+      rm -f -- "$stage_file"
+      echo -e "${R}旧脚本备份失败，已取消覆盖${N}"
+      pause_screen
+      return 1
+    fi
+    cleanup_old_backups "${SCRIPT_PATH}.bak.*" 3 \
+      || echo -e "${Y}旧脚本备份轮转失败，新版本仍会继续安装${N}" >&2
   fi
 
-  if ! install -m 0755 "$tmp_file" "$SCRIPT_PATH"; then
+  if ! mv -f -- "$stage_file" "$SCRIPT_PATH"; then
+    rm -f -- "$stage_file"
     rm -f "$tmp_file"
-    echo -e "${R}写入 $SCRIPT_PATH 失败${N}"
+    echo -e "${R}原子替换 $SCRIPT_PATH 失败，旧入口保持不变${N}"
     pause_screen
     return 1
   fi
@@ -5752,6 +7589,7 @@ view_singbox_config(){
 edit_singbox_config(){
   local editor_bin=""
   local backup_path=""
+  local txn="" rollback="" rollback_ok=1 editor_rc=0
 
   if ! require_root; then
     return 1
@@ -5790,15 +7628,29 @@ edit_singbox_config(){
     return 1
   fi
 
-  "$editor_bin" "$CONFIG_PATH"
+  txn=$(config_transaction_begin manual-edit) || {
+    echo -e "${R}配置事务快照失败${N}"
+    pause_screen
+    return 1
+  }
+
+  "$editor_bin" "$CONFIG_PATH" || editor_rc=$?
+  if [ "$editor_rc" -ne 0 ]; then
+    echo -e "${Y}编辑器退出码为 ${editor_rc}，继续以配置校验结果为准${N}"
+  fi
 
   if ! sing-box check -c "$CONFIG_PATH"; then
     echo ""
     read -p "  配置校验失败，是否回滚到编辑前备份？(Y/n): " rollback
     if [ "$rollback" != "n" ] && [ "$rollback" != "N" ]; then
-      cp "$backup_path" "$CONFIG_PATH"
-      echo -e "${G}已回滚${N}"
+      config_transaction_rollback "$txn" || rollback_ok=0
+      if [ "$rollback_ok" -eq 1 ]; then
+        echo -e "${G}已回滚配置与服务状态${N}"
+      else
+        echo -e "${R}回滚未完全成功，请立即检查；事务快照已保留${N}"
+      fi
     else
+      config_transaction_commit "$txn"
       echo -e "${Y}已保留有问题的配置（备份：$backup_path）${N}"
     fi
     pause_screen
@@ -5806,14 +7658,20 @@ edit_singbox_config(){
   fi
 
   if ! systemctl restart sing-box; then
-    cp "$backup_path" "$CONFIG_PATH" 2>/dev/null || true
-    systemctl restart sing-box >/dev/null 2>&1 || true
-    echo -e "${R}服务重启失败，已回滚${N}"
+    config_transaction_rollback "$txn" || rollback_ok=0
+    if [ "$rollback_ok" -eq 1 ]; then
+      echo -e "${R}服务重启失败，已回滚配置与服务状态${N}"
+    else
+      echo -e "${R}服务重启失败，且回滚未完全成功，请立即检查 sing-box${N}"
+    fi
     pause_screen
     return 1
   fi
 
-  cleanup_old_backups "${CONFIG_PATH}.bak.*" 5
+  config_transaction_commit "$txn"
+
+  cleanup_old_backups "${CONFIG_PATH}.bak.*" 5 \
+    || echo -e "${Y}旧配置备份轮转失败，本次配置已正常生效${N}" >&2
 
   echo ""
   echo -e "${G}配置已更新并重启服务${N}"
@@ -5830,12 +7688,16 @@ cleanup_config_backups(){
   fi
 
   count=$(ls -1 "${CONFIG_PATH}".bak.* 2>/dev/null | wc -l)
+  count=$((count + $(ls -1 "${CONFIG_PATH}".*.bak 2>/dev/null | wc -l)))
   count=$((count + $(ls -1 "${SSHD_CONFIG_PATH}".bak.* 2>/dev/null | wc -l)))
+  count=$((count + $(ls -1 "${FAIL2BAN_JAIL_PATH}".bak.* 2>/dev/null | wc -l)))
   count=$((count + $(ls -1 "${SCRIPT_PATH}".bak.* 2>/dev/null | wc -l)))
 
   echo ""
   echo -e "  ${B}当前备份文件${N}"
-  ls -1 "${CONFIG_PATH}".bak.* "${SSHD_CONFIG_PATH}".bak.* "${SCRIPT_PATH}".bak.* 2>/dev/null || true
+  ls -1 "${CONFIG_PATH}".bak.* "${CONFIG_PATH}".*.bak \
+        "${SSHD_CONFIG_PATH}".bak.* "${FAIL2BAN_JAIL_PATH}".bak.* \
+        "${SCRIPT_PATH}".bak.* 2>/dev/null || true
   echo ""
   if [ "$count" -eq 0 ]; then
     echo -e "${Y}无需清理${N}"
@@ -5860,9 +7722,15 @@ cleanup_config_backups(){
     return 0
   fi
 
-  cleanup_old_backups "${CONFIG_PATH}.bak.*" "$keep"
-  cleanup_old_backups "${SSHD_CONFIG_PATH}.bak.*" "$keep"
-  cleanup_old_backups "${SCRIPT_PATH}.bak.*" "$keep"
+  if ! cleanup_old_backups "${CONFIG_PATH}.bak.*" "$keep" \
+     || ! cleanup_old_backups "${CONFIG_PATH}.*.bak" "$keep" \
+     || ! cleanup_old_backups "${SSHD_CONFIG_PATH}.bak.*" "$keep" \
+     || ! cleanup_old_backups "${FAIL2BAN_JAIL_PATH}.bak.*" "$keep" \
+     || ! cleanup_old_backups "${SCRIPT_PATH}.bak.*" "$keep"; then
+    echo -e "${R}部分备份删除失败，请检查文件权限${N}"
+    pause_screen
+    return 1
+  fi
 
   echo ""
   echo -e "${G}备份已清理${N}"
@@ -5882,7 +7750,11 @@ NETBENCH_REPORT_PREFIX="/root/netbench-report"
 NETBENCH_IPERF_PORT_DEFAULT="15201"
 # 用带 -leyili 后缀的独立文件名：卸载时只删自己下载的，不动用户自装的 nexttrace
 NETBENCH_NEXTTRACE_BIN="/usr/local/bin/nexttrace-leyili"
-NETBENCH_NEXTTRACE_BASE="https://github.com/nxtrace/NTrace-core/releases/latest/download"
+NETBENCH_NEXTTRACE_VERSION="v1.7.1"
+NETBENCH_NEXTTRACE_BASE="https://github.com/nxtrace/NTrace-core/releases/download/${NETBENCH_NEXTTRACE_VERSION}"
+NETBENCH_NEXTTRACE_SHA256_AMD64="1f4c559cbdf6f667a1a9e050567c9cf1fc11741e8cc1e50f5fdcaf2dbb247232"
+NETBENCH_NEXTTRACE_SHA256_ARM64="9c2f1b79e7d0e37f59ebe685aec1d5c41fb8f3407f54e17b34656712eaa66fd9"
+NETBENCH_NEXTTRACE_SHA256_ARMV7="1eb8be9394b2ac40a991d4fa3e651960e107bc8c6757a35c5f4720c0ab8eb71d"
 
 # 追加一行纯文本到报告（报告不带 ANSI 色与缩进，方便整段复制给 AI）
 _nb_report(){
@@ -5942,8 +7814,15 @@ _nb_load_target(){
 }
 
 _nb_save_target(){
-  mkdir -p "$(dirname "$NETBENCH_ENV_PATH")" 2>/dev/null || true
-  printf 'NETBENCH_TARGET_IP=%s\n' "$1" > "$NETBENCH_ENV_PATH" 2>/dev/null || true
+  local tmp
+  ensure_private_dir "$(dirname -- "$NETBENCH_ENV_PATH")" 700 || return 1
+  tmp=$(mktemp "${NETBENCH_ENV_PATH}.tmp.XXXXXX") || return 1
+  if ! printf 'NETBENCH_TARGET_IP=%s\n' "$1" > "$tmp" \
+     || ! chmod 600 "$tmp" \
+     || ! mv -f -- "$tmp" "$NETBENCH_ENV_PATH"; then
+    rm -f -- "$tmp"
+    return 1
+  fi
 }
 
 _nb_latest_report(){
@@ -5977,31 +7856,45 @@ _nb_ensure_tools(){
 # 163 / CN2 / 4837 / 9929 / CMIN2 哪条线 —— AI 判断线路质量的关键输入。
 # 下载失败不致命，回落到只看 mtr 的 IP 段。
 _nb_ensure_nexttrace(){
-  local arch tmp
+  local arch tmp expected_sha actual_sha
   command -v nexttrace >/dev/null 2>&1 && return 0
-  [ -x "$NETBENCH_NEXTTRACE_BIN" ] && return 0
 
   case "$(uname -m)" in
-    x86_64|amd64)  arch="amd64" ;;
-    aarch64|arm64) arch="arm64" ;;
-    armv7l)        arch="armv7" ;;
+    x86_64|amd64)  arch="amd64"; expected_sha="$NETBENCH_NEXTTRACE_SHA256_AMD64" ;;
+    aarch64|arm64) arch="arm64"; expected_sha="$NETBENCH_NEXTTRACE_SHA256_ARM64" ;;
+    armv7l)        arch="armv7"; expected_sha="$NETBENCH_NEXTTRACE_SHA256_ARMV7" ;;
     *)
       echo -e "${Y}    未适配的架构 $(uname -m)，跳过 nexttrace（仅用 mtr 看路由）${N}"
       return 1
       ;;
   esac
 
-  echo -e "${Y}==> 下载 nexttrace（回程线路识别，仅首次）...${N}"
-  tmp=$(mktemp)
-  # dd 取 magic 校验是 ELF：GitHub 故障时可能拿到 HTML 报错页，不能直接 chmod 上岗
-  if curl -fsSL --max-time 90 "${NETBENCH_NEXTTRACE_BASE}/nexttrace_linux_${arch}" -o "$tmp" \
-     && [ "$(dd if="$tmp" bs=1 skip=1 count=3 2>/dev/null)" = "ELF" ]; then
-    chmod +x "$tmp"
-    if mv "$tmp" "$NETBENCH_NEXTTRACE_BIN"; then
+  if [ -x "$NETBENCH_NEXTTRACE_BIN" ]; then
+    actual_sha=$(sha256sum "$NETBENCH_NEXTTRACE_BIN" 2>/dev/null | awk '{print $1}')
+    if [ "$actual_sha" = "$expected_sha" ]; then
       return 0
     fi
+    mv -f -- "$NETBENCH_NEXTTRACE_BIN" "${NETBENCH_NEXTTRACE_BIN}.rejected.$(date +%Y%m%d%H%M%S)" 2>/dev/null || return 1
+    echo -e "${Y}    已隔离校验不通过的旧 nexttrace-leyili${N}"
   fi
-  rm -f "$tmp"
+
+  echo -e "${Y}==> 下载 nexttrace（回程线路识别，仅首次）...${N}"
+  tmp=$(mktemp)
+  if curl --proto '=https' --tlsv1.2 -fsSL --max-time 90 \
+       "${NETBENCH_NEXTTRACE_BASE}/nexttrace_linux_${arch}" -o "$tmp"; then
+    actual_sha=$(sha256sum "$tmp" 2>/dev/null | awk '{print $1}')
+    if [ "$actual_sha" = "$expected_sha" ] \
+       && [ "$(dd if="$tmp" bs=1 skip=1 count=3 2>/dev/null)" = "ELF" ]; then
+      if install -m 0755 "$tmp" "$NETBENCH_NEXTTRACE_BIN"; then
+        rm -f -- "$tmp"
+        echo -e "  ${D}nexttrace ${NETBENCH_NEXTTRACE_VERSION} SHA-256 校验通过${N}"
+        return 0
+      fi
+    else
+      echo -e "${Y}    nexttrace SHA-256 校验失败，拒绝执行${N}"
+    fi
+  fi
+  rm -f -- "$tmp"
   echo -e "${Y}    nexttrace 下载失败，回程线路将只有 mtr 数据${N}"
   return 1
 }
@@ -6692,7 +8585,8 @@ run_netbench(){
     target="$input"
     break
   done
-  _nb_save_target "$target"
+  _nb_save_target "$target" \
+    || echo -e "  ${Y}目标 IP 本次可用，但未能保存到 ${NETBENCH_ENV_PATH}${N}" >&2
 
   echo ""
   _nb_ensure_tools || true
@@ -6789,7 +8683,6 @@ show_netbench_menu(){
     esac
   done
 }
-
 # ═══ source: 50-node-reality.sh ═══
 install_reality_node(){
   local port_input="" sni_input=""
@@ -6798,6 +8691,7 @@ install_reality_node(){
   local public_ipv4="" public_ipv6=""
   local install_mode="ipv4" mode_label=""
   local PORT SNI TAG LISTEN_CHOICE LISTEN_ADDR UUID SHORT_ID confirm
+  local txn="" old_port="" old_mode="ipv4"
 
   if ! require_root; then return 1; fi
 
@@ -6812,6 +8706,8 @@ install_reality_node(){
       echo -e "  已取消"
       return 0
     fi
+    old_port=$(get_node_value reality Port 2>/dev/null || true)
+    old_mode=$(get_node_value reality Mode 2>/dev/null || echo ipv4)
   fi
 
   while true; do
@@ -6822,7 +8718,7 @@ install_reality_node(){
       continue
     fi
     PORT=$((10#$PORT))
-    if check_port_in_use "$PORT"; then
+    if [ "$PORT" != "$old_port" ] && check_port_in_use "$PORT" tcp; then
       echo -e "${R}端口 ${PORT} 已被其他服务占用${N}"
       local force_port=""
       read -p "  仍然使用此端口？(y/N): " force_port
@@ -6934,6 +8830,7 @@ install_reality_node(){
 
   echo -e "${Y}==> 写入配置...${N}"
   ensure_jq || { pause_screen; return 1; }
+  txn=$(node_transaction_begin reality) || { echo -e "${R}节点事务快照失败${N}"; pause_screen; return 1; }
 
   local inbound_json
   inbound_json=$(jq -n \
@@ -6961,20 +8858,27 @@ install_reality_node(){
     }')
 
   if ! config_add_inbound "$inbound_json"; then
+    node_transaction_rollback "$txn"
     echo -e "${R}写入 inbound 失败${N}"
     pause_screen
     return 1
   fi
 
   echo -e "${Y}==> 校验并启动...${N}"
-  if ! config_check_and_restart; then
+  if ! config_check_and_restart "$PORT" tcp; then
+    node_transaction_rollback "$txn"
     echo ""
     echo -e "${R}sing-box 校验或重启失败${N}"
     pause_screen
     return 1
   fi
 
-  node_apply_firewall_for_mode "$PORT" tcp "$install_mode"
+  if ! node_apply_firewall_for_mode "$PORT" tcp "$install_mode"; then
+    node_transaction_rollback "$txn"
+    echo -e "${R}防火墙放行失败，节点配置已回滚${N}"
+    pause_screen
+    return 1
+  fi
   print_firewall_hint "$PORT" tcp "Reality 节点入站"
 
   link=$(build_reality_link "$UUID" "$access_ip" "$PORT" "$SNI" "$public_key" "$SHORT_ID" "$TAG" 2>/dev/null || true)
@@ -6982,8 +8886,7 @@ install_reality_node(){
     ipv6_link=$(build_reality_link "$UUID" "$public_ipv6" "$PORT" "$SNI" "$public_key" "$SHORT_ID" "${TAG}-ipv6" 2>/dev/null || true)
   fi
 
-  ensure_nodes_dir
-  cat > "$(node_info_path reality)" <<EOF
+  if ! write_node_info_file reality <<EOF
 Type=reality
 Tag=$TAG
 Mode=$install_mode
@@ -6997,6 +8900,22 @@ ShortID=$SHORT_ID
 IP=$access_ip
 Link=$link
 EOF
+  then
+    node_transaction_rollback "$txn"
+    echo -e "${R}节点信息保存失败，已完整回滚${N}"
+    pause_screen
+    return 1
+  fi
+
+  if [ -n "$old_port" ] && [ "$old_port" != "$PORT" ]; then
+    if ! node_revoke_firewall_for_mode "$old_port" tcp "$old_mode"; then
+      node_transaction_rollback "$txn"
+      echo -e "${R}旧端口防火墙清理失败，已完整回滚${N}"
+      pause_screen
+      return 1
+    fi
+  fi
+  node_transaction_commit "$txn"
 
   register_sb_command || true
 
@@ -7030,13 +8949,12 @@ EOF
 config_inbound_count(){
   if [ ! -f "$CONFIG_PATH" ]; then
     printf '0'
-    return
+    return 0
   fi
   if ! command -v jq >/dev/null 2>&1; then
-    printf '0'
-    return
+    return 1
   fi
-  jq '(.inbounds // []) | length' "$CONFIG_PATH" 2>/dev/null || printf '0'
+  jq -er '(.inbounds // []) | length' "$CONFIG_PATH" 2>/dev/null
 }
 
 # 卸载某节点后调用：剩 0 个 inbound 则停服务，否则校验+重启
@@ -7048,16 +8966,61 @@ post_uninstall_service_step(){
     return 0
   fi
   local remain
-  remain=$(config_inbound_count)
+  remain=$(config_inbound_count) || return 1
+  [[ "$remain" =~ ^[0-9]+$ ]] || return 1
   if [ "${remain:-0}" -eq 0 ]; then
     echo -e "${Y}==> 已无任何节点，停止 sing-box 服务...${N}"
-    systemctl stop sing-box >/dev/null 2>&1 || true
-    systemctl disable sing-box >/dev/null 2>&1 || true
+    systemctl stop sing-box >/dev/null 2>&1 || return 1
+    if systemctl is-enabled --quiet sing-box 2>/dev/null; then
+      systemctl disable sing-box >/dev/null 2>&1 || return 1
+    fi
+    systemctl is-active --quiet sing-box 2>/dev/null && return 1
     return 0
   fi
-  if sing-box check -c "$CONFIG_PATH" >/dev/null 2>&1; then
-    systemctl restart sing-box >/dev/null 2>&1 || true
+  config_check_and_restart
+}
+
+uninstall_node_transaction(){
+  local type="$1" inbound_tag="$2" proto="$3"
+  local txn port mode hop_enabled hop_start hop_end
+
+  port=$(get_node_value "$type" Port 2>/dev/null || true)
+  mode=$(get_node_value "$type" Mode 2>/dev/null || echo ipv4)
+  txn=$(node_transaction_begin "$type") || return 1
+
+  if [ "$type" = "hy2" ]; then
+    hop_enabled=$(get_node_value hy2 PortHop 2>/dev/null || echo 0)
+    hop_start=$(get_node_value hy2 PortHopStart 2>/dev/null || true)
+    hop_end=$(get_node_value hy2 PortHopEnd 2>/dev/null || true)
+    if [ "$hop_enabled" = "1" ] && [ -n "$hop_start" ] && [ -n "$hop_end" ]; then
+      if ! port_hop_remove "$hop_start" "$hop_end" "$mode"; then
+        node_transaction_rollback "$txn"
+        return 1
+      fi
+    fi
   fi
+
+  if [ -n "$port" ] && ! node_revoke_firewall_for_mode "$port" "$proto" "$mode"; then
+    node_transaction_rollback "$txn"
+    return 1
+  fi
+  if ! config_remove_inbound_by_tag "$inbound_tag" || ! remove_node_info "$type"; then
+    node_transaction_rollback "$txn"
+    return 1
+  fi
+  case "$type" in
+    hy2|tuic)
+      if ! rm -f -- "$CERTS_DIR/${type}.crt" "$CERTS_DIR/${type}.key"; then
+        node_transaction_rollback "$txn"
+        return 1
+      fi
+      ;;
+  esac
+  if ! post_uninstall_service_step; then
+    node_transaction_rollback "$txn"
+    return 1
+  fi
+  node_transaction_commit "$txn"
 }
 
 uninstall_reality_node(){
@@ -7075,17 +9038,11 @@ uninstall_reality_node(){
     return 0
   fi
 
-  # 必须在 remove_node_info 之前撤防火墙规则，否则读不到 Mode/Port
-  local rt_port rt_mode
-  rt_port=$(get_node_value reality Port 2>/dev/null || true)
-  rt_mode=$(get_node_value reality Mode 2>/dev/null || echo ipv4)
-  if [ -n "$rt_port" ]; then
-    node_revoke_firewall_for_mode "$rt_port" tcp "$rt_mode"
+  if ! uninstall_node_transaction reality reality-in tcp; then
+    echo -e "${R}Reality 节点卸载失败，已恢复原配置${N}"
+    pause_screen
+    return 1
   fi
-
-  config_remove_inbound_by_tag "reality-in" || true
-  remove_node_info reality
-  post_uninstall_service_step
   echo -e "${G}Reality 节点已卸载${N}"
   pause_screen
 }
@@ -7144,20 +9101,19 @@ port_hop_list_conflicts(){
 
 port_hop_apply_v4(){
   local port="$1" start="$2" end="$3" listen="$4"
-  iptables -t nat -N "$PORT_HOP_NAT_CHAIN" 2>/dev/null || true
-  iptables -t nat -F "$PORT_HOP_NAT_CHAIN"
+  command -v iptables >/dev/null 2>&1 || return 1
+  iptables -t nat -nL "$PORT_HOP_NAT_CHAIN" >/dev/null 2>&1 \
+    || iptables -t nat -N "$PORT_HOP_NAT_CHAIN" || return 1
+  iptables -t nat -F "$PORT_HOP_NAT_CHAIN" || return 1
   if [ -z "$listen" ] || [ "$listen" = "0.0.0.0" ]; then
     iptables -t nat -A "$PORT_HOP_NAT_CHAIN" -p udp \
-      --dport "${start}:${end}" -j REDIRECT --to-ports "$port"
+      --dport "${start}:${end}" -j REDIRECT --to-ports "$port" || return 1
   else
     iptables -t nat -A "$PORT_HOP_NAT_CHAIN" -p udp \
-      --dport "${start}:${end}" -j DNAT --to-destination "${listen}:${port}"
+      --dport "${start}:${end}" -j DNAT --to-destination "${listen}:${port}" || return 1
   fi
   iptables -t nat -C PREROUTING -j "$PORT_HOP_NAT_CHAIN" 2>/dev/null \
-    || iptables -t nat -I PREROUTING 1 -j "$PORT_HOP_NAT_CHAIN"
-  # filter 表 INPUT 看到的是 DNAT/REDIRECT 之后的 dport（主端口），所以放行主端口而非 hop 范围
-  iptables -C INPUT -p udp --dport "$port" -j ACCEPT 2>/dev/null \
-    || iptables -A INPUT -p udp --dport "$port" -j ACCEPT
+    || iptables -t nat -I PREROUTING 1 -j "$PORT_HOP_NAT_CHAIN" || return 1
 }
 
 port_hop_apply_v6(){
@@ -7165,39 +9121,42 @@ port_hop_apply_v6(){
   if ! command -v ip6tables >/dev/null 2>&1; then
     return 0
   fi
-  ip6tables -t nat -N "$PORT_HOP_NAT_CHAIN" 2>/dev/null || true
-  ip6tables -t nat -F "$PORT_HOP_NAT_CHAIN"
+  ip6tables -t nat -nL "$PORT_HOP_NAT_CHAIN" >/dev/null 2>&1 \
+    || ip6tables -t nat -N "$PORT_HOP_NAT_CHAIN" || return 1
+  ip6tables -t nat -F "$PORT_HOP_NAT_CHAIN" || return 1
   if [ -z "$listen" ] || [ "$listen" = "::" ]; then
     ip6tables -t nat -A "$PORT_HOP_NAT_CHAIN" -p udp \
-      --dport "${start}:${end}" -j REDIRECT --to-ports "$port"
+      --dport "${start}:${end}" -j REDIRECT --to-ports "$port" || return 1
   else
     ip6tables -t nat -A "$PORT_HOP_NAT_CHAIN" -p udp \
-      --dport "${start}:${end}" -j DNAT --to-destination "[${listen}]:${port}"
+      --dport "${start}:${end}" -j DNAT --to-destination "[${listen}]:${port}" || return 1
   fi
   ip6tables -t nat -C PREROUTING -j "$PORT_HOP_NAT_CHAIN" 2>/dev/null \
-    || ip6tables -t nat -I PREROUTING 1 -j "$PORT_HOP_NAT_CHAIN"
-  # filter 表 INPUT 看到的是 DNAT/REDIRECT 之后的 dport（主端口），所以放行主端口而非 hop 范围
-  ip6tables -C INPUT -p udp --dport "$port" -j ACCEPT 2>/dev/null \
-    || ip6tables -A INPUT -p udp --dport "$port" -j ACCEPT
+    || ip6tables -t nat -I PREROUTING 1 -j "$PORT_HOP_NAT_CHAIN" || return 1
 }
 
 port_hop_remove_v4(){
-  local start="$1" end="$2"
-  iptables -t nat -F "$PORT_HOP_NAT_CHAIN" 2>/dev/null || true
-  iptables -t nat -D PREROUTING -j "$PORT_HOP_NAT_CHAIN" 2>/dev/null || true
-  iptables -t nat -X "$PORT_HOP_NAT_CHAIN" 2>/dev/null || true
+  command -v iptables >/dev/null 2>&1 || return 0
+  iptables -t nat -nL "$PORT_HOP_NAT_CHAIN" >/dev/null 2>&1 || return 0
+  while iptables -t nat -C PREROUTING -j "$PORT_HOP_NAT_CHAIN" >/dev/null 2>&1; do
+    iptables -t nat -D PREROUTING -j "$PORT_HOP_NAT_CHAIN" || return 1
+  done
+  iptables -t nat -F "$PORT_HOP_NAT_CHAIN" || return 1
+  iptables -t nat -X "$PORT_HOP_NAT_CHAIN" || return 1
   # 注意：不在此删除 INPUT 链主端口 ACCEPT，因为节点本身可能仍需要它；
   # 节点真正卸载时由 node_revoke_firewall_for_mode 统一清理。
 }
 
 port_hop_remove_v6(){
-  local start="$1" end="$2"
   if ! command -v ip6tables >/dev/null 2>&1; then
     return 0
   fi
-  ip6tables -t nat -F "$PORT_HOP_NAT_CHAIN" 2>/dev/null || true
-  ip6tables -t nat -D PREROUTING -j "$PORT_HOP_NAT_CHAIN" 2>/dev/null || true
-  ip6tables -t nat -X "$PORT_HOP_NAT_CHAIN" 2>/dev/null || true
+  ip6tables -t nat -nL "$PORT_HOP_NAT_CHAIN" >/dev/null 2>&1 || return 0
+  while ip6tables -t nat -C PREROUTING -j "$PORT_HOP_NAT_CHAIN" >/dev/null 2>&1; do
+    ip6tables -t nat -D PREROUTING -j "$PORT_HOP_NAT_CHAIN" || return 1
+  done
+  ip6tables -t nat -F "$PORT_HOP_NAT_CHAIN" || return 1
+  ip6tables -t nat -X "$PORT_HOP_NAT_CHAIN" || return 1
   # 同上，不在此清 INPUT 主端口规则
 }
 
@@ -7206,56 +9165,61 @@ port_hop_apply(){
   local listen_v4="$5" listen_v6="$6"
   case "$mode" in
     ipv4)              port_hop_apply_v4 "$port" "$start" "$end" "$listen_v4" ;;
-    dualstack)         port_hop_apply_v4 "$port" "$start" "$end" "$listen_v4"
-                       port_hop_apply_v6 "$port" "$start" "$end" "$listen_v6" ;;
+    dualstack)         port_hop_apply_v4 "$port" "$start" "$end" "$listen_v4" \
+                         && port_hop_apply_v6 "$port" "$start" "$end" "$listen_v6" ;;
     ipv6-in-ipv4-out)  port_hop_apply_v6 "$port" "$start" "$end" "$listen_v6" ;;
+    *) return 1 ;;
   esac
-  # ufw / firewalld：DNAT 后 dport 是主端口，放行 hop 范围本身没用，
-  # 但用户阅读规则列表时能看到该范围被显式标记，且不会与节点主端口规则冲突。
-  # 主端口本身由 node_apply_firewall_for_mode 在 install/modify 时放行。
-  case "$(detect_firewall_backend)" in
-    ufw)
-      ufw allow "${start}:${end}/udp" >/dev/null 2>&1 || true
-      ;;
-    firewalld)
-      firewall-cmd --permanent --add-port="${start}-${end}/udp" >/dev/null 2>&1 || true
-      firewall-cmd --reload >/dev/null 2>&1 || true
-      ;;
+  local rc=$?
+  [ "$rc" -eq 0 ] || return "$rc"
+  case "$mode" in
+    ipv4|dualstack) ip4_save_rules >/dev/null 2>&1 || return 1 ;;
   esac
-  ip4_save_rules >/dev/null 2>&1 || true
-  ip6_save_rules >/dev/null 2>&1 || true
+  case "$mode" in
+    dualstack|ipv6-in-ipv4-out) ip6_save_rules >/dev/null 2>&1 || return 1 ;;
+  esac
 }
 
 port_hop_remove(){
   local start="$1" end="$2" mode="$3"
   case "$mode" in
-    ipv4|dualstack)              port_hop_remove_v4 "$start" "$end" ;;
+    ipv4|dualstack)              port_hop_remove_v4 "$start" "$end" || return 1 ;;
   esac
   case "$mode" in
-    dualstack|ipv6-in-ipv4-out)  port_hop_remove_v6 "$start" "$end" ;;
+    dualstack|ipv6-in-ipv4-out)  port_hop_remove_v6 "$start" "$end" || return 1 ;;
   esac
-  case "$(detect_firewall_backend)" in
-    ufw)
-      ufw delete allow "${start}:${end}/udp" >/dev/null 2>&1 || true
-      ;;
-    firewalld)
-      firewall-cmd --permanent --remove-port="${start}-${end}/udp" >/dev/null 2>&1 || true
-      firewall-cmd --reload >/dev/null 2>&1 || true
-      ;;
+  case "$mode" in
+    ipv4|dualstack) ip4_save_rules >/dev/null 2>&1 || return 1 ;;
   esac
-  ip4_save_rules >/dev/null 2>&1 || true
-  ip6_save_rules >/dev/null 2>&1 || true
+  case "$mode" in
+    dualstack|ipv6-in-ipv4-out) ip6_save_rules >/dev/null 2>&1 || return 1 ;;
+  esac
 }
 
 port_hop_cleanup_all(){
-  iptables -t nat -F "$PORT_HOP_NAT_CHAIN" 2>/dev/null || true
-  iptables -t nat -D PREROUTING -j "$PORT_HOP_NAT_CHAIN" 2>/dev/null || true
-  iptables -t nat -X "$PORT_HOP_NAT_CHAIN" 2>/dev/null || true
-  if command -v ip6tables >/dev/null 2>&1; then
-    ip6tables -t nat -F "$PORT_HOP_NAT_CHAIN" 2>/dev/null || true
-    ip6tables -t nat -D PREROUTING -j "$PORT_HOP_NAT_CHAIN" 2>/dev/null || true
-    ip6tables -t nat -X "$PORT_HOP_NAT_CHAIN" 2>/dev/null || true
+  local rc=0
+  if command -v iptables >/dev/null 2>&1 \
+     && iptables -t nat -nL "$PORT_HOP_NAT_CHAIN" >/dev/null 2>&1; then
+    while iptables -t nat -C PREROUTING -j "$PORT_HOP_NAT_CHAIN" >/dev/null 2>&1; do
+      iptables -t nat -D PREROUTING -j "$PORT_HOP_NAT_CHAIN" || rc=1
+      [ "$rc" -eq 0 ] || break
+    done
+    iptables -t nat -F "$PORT_HOP_NAT_CHAIN" || rc=1
+    iptables -t nat -X "$PORT_HOP_NAT_CHAIN" || rc=1
+    ip4_save_rules >/dev/null 2>&1 || rc=1
   fi
+  if command -v ip6tables >/dev/null 2>&1; then
+    if ip6tables -t nat -nL "$PORT_HOP_NAT_CHAIN" >/dev/null 2>&1; then
+      while ip6tables -t nat -C PREROUTING -j "$PORT_HOP_NAT_CHAIN" >/dev/null 2>&1; do
+        ip6tables -t nat -D PREROUTING -j "$PORT_HOP_NAT_CHAIN" || rc=1
+        [ "$rc" -eq 0 ] || break
+      done
+      ip6tables -t nat -F "$PORT_HOP_NAT_CHAIN" || rc=1
+      ip6tables -t nat -X "$PORT_HOP_NAT_CHAIN" || rc=1
+      ip6_save_rules >/dev/null 2>&1 || rc=1
+    fi
+  fi
+  return "$rc"
 }
 
 # 根据 install_mode 推导端口跳跃所需的 v4 / v6 监听地址
@@ -7276,7 +9240,7 @@ generate_hy2_random_port(){
   local p attempts=0
   while [ $attempts -lt 30 ]; do
     p=$(( (RANDOM << 15 | RANDOM) % 45535 + 20000 ))
-    if ! check_port_in_use "$p"; then
+    if ! check_port_in_use "$p" udp; then
       printf '%s' "$p"
       return 0
     fi
@@ -7307,52 +9271,69 @@ generate_anytls_random_port(){
   printf '%s' "$p"
 }
 
-generate_self_signed_cert_for_hy2(){
-  local sni="$1"
-  ensure_nodes_dir
-  local crt="$CERTS_DIR/hy2.crt"
-  local key="$CERTS_DIR/hy2.key"
+generate_self_signed_cert(){
+  local type="$1" sni="$2"
+  local crt="$CERTS_DIR/${type}.crt"
+  local key="$CERTS_DIR/${type}.key"
+  local workdir new_crt new_key
+
+  ensure_nodes_dir || return 1
   if ! command -v openssl >/dev/null 2>&1; then
     echo -e "${R}未找到 openssl${N}"
     return 1
   fi
-  if ! openssl ecparam -genkey -name prime256v1 -out "$key" 2>/dev/null; then
-    if ! openssl genrsa -out "$key" 2048 >/dev/null 2>&1; then
+  workdir=$(mktemp -d "$CERTS_DIR/.${type}.XXXXXX") || return 1
+  chmod 700 "$workdir" 2>/dev/null || { rm -rf -- "$workdir"; return 1; }
+  new_crt="$workdir/${type}.crt"
+  new_key="$workdir/${type}.key"
+  if ! openssl ecparam -genkey -name prime256v1 -out "$new_key" 2>/dev/null; then
+    if ! openssl genrsa -out "$new_key" 2048 >/dev/null 2>&1; then
       echo -e "${R}私钥生成失败${N}"
+      rm -rf -- "$workdir"
       return 1
     fi
   fi
-  if ! openssl req -new -x509 -days 3650 -key "$key" -out "$crt" \
+  if ! openssl req -new -x509 -days 3650 -key "$new_key" -out "$new_crt" \
        -subj "/CN=${sni}" >/dev/null 2>&1; then
     echo -e "${R}自签证书生成失败${N}"
+    rm -rf -- "$workdir"
     return 1
   fi
-  chmod 600 "$key"
+  chmod 600 "$new_key" "$new_crt" 2>/dev/null || { rm -rf -- "$workdir"; return 1; }
+  if [ -f "$key" ] && ! cp -a -- "$key" "$workdir/old.key"; then
+    rm -rf -- "$workdir"
+    return 1
+  fi
+  if [ -f "$crt" ] && ! cp -a -- "$crt" "$workdir/old.crt"; then
+    rm -rf -- "$workdir"
+    return 1
+  fi
+  if ! mv -f -- "$new_key" "$key" || ! mv -f -- "$new_crt" "$crt"; then
+    local restore_ok=1
+    if [ -f "$workdir/old.key" ]; then
+      cp -a -- "$workdir/old.key" "$key" 2>/dev/null || restore_ok=0
+    else
+      rm -f -- "$key" || restore_ok=0
+    fi
+    if [ -f "$workdir/old.crt" ]; then
+      cp -a -- "$workdir/old.crt" "$crt" 2>/dev/null || restore_ok=0
+    else
+      rm -f -- "$crt" || restore_ok=0
+    fi
+    rm -rf -- "$workdir"
+    [ "$restore_ok" -eq 1 ] || echo -e "${R}证书替换失败且旧证书恢复不完整${N}" >&2
+    return 1
+  fi
+  rm -rf -- "$workdir"
   printf '%s\n%s' "$crt" "$key"
 }
 
+generate_self_signed_cert_for_hy2(){
+  generate_self_signed_cert hy2 "$1"
+}
+
 generate_self_signed_cert_for_tuic(){
-  local sni="$1"
-  ensure_nodes_dir
-  local crt="$CERTS_DIR/tuic.crt"
-  local key="$CERTS_DIR/tuic.key"
-  if ! command -v openssl >/dev/null 2>&1; then
-    echo -e "${R}未找到 openssl${N}"
-    return 1
-  fi
-  if ! openssl ecparam -genkey -name prime256v1 -out "$key" 2>/dev/null; then
-    if ! openssl genrsa -out "$key" 2048 >/dev/null 2>&1; then
-      echo -e "${R}私钥生成失败${N}"
-      return 1
-    fi
-  fi
-  if ! openssl req -new -x509 -days 3650 -key "$key" -out "$crt" \
-       -subj "/CN=${sni}" >/dev/null 2>&1; then
-    echo -e "${R}自签证书生成失败${N}"
-    return 1
-  fi
-  chmod 600 "$key"
-  printf '%s\n%s' "$crt" "$key"
+  generate_self_signed_cert tuic "$1"
 }
 
 install_hy2_node(){
@@ -7367,6 +9348,7 @@ install_hy2_node(){
   local hop_choice HOP_ENABLE=0 HOP_MODE="" HOP_START="" HOP_END=""
   local range_input confirm_hop confirm_small force_hop
   local listen_v4="" listen_v6=""
+  local txn="" old_port="" old_mode="ipv4" old_hop="0" old_hop_start="" old_hop_end=""
 
   if ! require_root; then return 1; fi
 
@@ -7381,6 +9363,11 @@ install_hy2_node(){
       echo -e "  已取消"
       return 0
     fi
+    old_port=$(get_node_value hy2 Port 2>/dev/null || true)
+    old_mode=$(get_node_value hy2 Mode 2>/dev/null || echo ipv4)
+    old_hop=$(get_node_value hy2 PortHop 2>/dev/null || echo 0)
+    old_hop_start=$(get_node_value hy2 PortHopStart 2>/dev/null || true)
+    old_hop_end=$(get_node_value hy2 PortHopEnd 2>/dev/null || true)
   fi
 
   # 端口（默认随机高位 UDP）
@@ -7391,6 +9378,14 @@ install_hy2_node(){
     PORT="${port_input:-$default_port}"
     if validate_port "$PORT"; then
       PORT=$((10#$PORT))
+      if [ "$PORT" != "$old_port" ] && check_port_in_use "$PORT" udp; then
+        echo -e "${R}UDP 端口 ${PORT} 已被其他服务占用${N}"
+        local force_port=""
+        read -p "  仍然使用此端口？(y/N): " force_port
+        if [ "$force_port" != "y" ] && [ "$force_port" != "Y" ]; then
+          continue
+        fi
+      fi
       break
     fi
     echo -e "${R}端口必须是 1-65535 的数字${N}"
@@ -7590,46 +9585,69 @@ install_hy2_node(){
 
   mode_label=$(describe_install_mode "$install_mode")
 
+  echo -e "${Y}==> 建立节点事务快照...${N}"
+  ensure_jq || { pause_screen; return 1; }
+  txn=$(node_transaction_begin hy2) || { echo -e "${R}节点事务快照失败${N}"; pause_screen; return 1; }
+
   # 准备证书
   if [ "$cert_source" = "self" ]; then
     echo -e "${Y}==> 生成自签证书...${N}"
-    cert_paths=$(generate_self_signed_cert_for_hy2 "$SNI") || { pause_screen; return 1; }
+    if ! cert_paths=$(generate_self_signed_cert_for_hy2 "$SNI"); then
+      node_transaction_rollback "$txn"
+      pause_screen
+      return 1
+    fi
     cert_path=$(echo "$cert_paths" | sed -n '1p')
     key_path=$(echo "$cert_paths" | sed -n '2p')
   fi
 
   echo -e "${Y}==> 写入配置...${N}"
-  ensure_jq || { pause_screen; return 1; }
 
   local tls_json
   if [ "$cert_source" = "acme" ]; then
-    tls_json=$(jq -n --arg sni "$SNI" --arg email "$acme_email" '{
+    if ! tls_json=$(jq -n --arg sni "$SNI" --arg email "$acme_email" '{
       enabled: true,
       server_name: $sni,
       alpn: ["h3"],
       acme: {domain: [$sni], email: $email}
-    }')
+    }'); then
+      node_transaction_rollback "$txn"
+      pause_screen
+      return 1
+    fi
   else
-    tls_json=$(jq -n --arg sni "$SNI" --arg crt "$cert_path" --arg key "$key_path" '{
+    if ! tls_json=$(jq -n --arg sni "$SNI" --arg crt "$cert_path" --arg key "$key_path" '{
       enabled: true,
       server_name: $sni,
       alpn: ["h3"],
       certificate_path: $crt,
       key_path: $key
-    }')
+    }'); then
+      node_transaction_rollback "$txn"
+      pause_screen
+      return 1
+    fi
   fi
 
   local obfs_json="null"
   if [ "$obfs_enable" = "1" ]; then
-    obfs_json=$(jq -n --arg pw "$obfs_password" '{type: "salamander", password: $pw}')
+    if ! obfs_json=$(jq -n --arg pw "$obfs_password" '{type: "salamander", password: $pw}'); then
+      node_transaction_rollback "$txn"
+      pause_screen
+      return 1
+    fi
   fi
 
   # 构造 user 对象（Hysteria2 的 user 仅含 password；带宽限制 up_mbps/down_mbps 是 inbound 顶层字段）
   local user_obj
-  user_obj=$(jq -n --arg pw "$password" '{password: $pw}')
+  if ! user_obj=$(jq -n --arg pw "$password" '{password: $pw}'); then
+    node_transaction_rollback "$txn"
+    pause_screen
+    return 1
+  fi
 
   local inbound_json
-  inbound_json=$(jq -n \
+  if ! inbound_json=$(jq -n \
     --arg listen "$LISTEN_ADDR" \
     --argjson port "$PORT" \
     --argjson user "$user_obj" \
@@ -7646,20 +9664,36 @@ install_hy2_node(){
       tls: $tls
     }
     + (if $obfs == null then {} else {obfs: $obfs} end)
-    + (if $up > 0 and $down > 0 then {up_mbps: $up, down_mbps: $down} else {} end)')
+    + (if $up > 0 and $down > 0 then {up_mbps: $up, down_mbps: $down} else {} end)'); then
+    node_transaction_rollback "$txn"
+    pause_screen
+    return 1
+  fi
 
   if ! config_add_inbound "$inbound_json"; then
+    node_transaction_rollback "$txn"
     echo -e "${R}写入 inbound 失败${N}"
     pause_screen
     return 1
   fi
 
   echo -e "${Y}==> 校验并启动...${N}"
-  if ! config_check_and_restart; then
+  if ! config_check_and_restart "$PORT" udp; then
+    node_transaction_rollback "$txn"
     echo ""
     echo -e "${R}sing-box 校验或重启失败${N}"
     pause_screen
     return 1
+  fi
+
+  # 先撤掉旧节点的跳跃规则；后续任一步失败由节点事务恢复。
+  if [ "$old_hop" = "1" ] && [ -n "$old_hop_start" ] && [ -n "$old_hop_end" ]; then
+    if ! port_hop_remove "$old_hop_start" "$old_hop_end" "$old_mode"; then
+      node_transaction_rollback "$txn"
+      echo -e "${R}旧端口跳跃规则清理失败，已完整回滚${N}"
+      pause_screen
+      return 1
+    fi
   fi
 
   # 应用端口跳跃规则（启用时）
@@ -7679,12 +9713,30 @@ install_hy2_node(){
       addrs_pair=$(port_hop_listen_addrs_for_mode "$install_mode" "$public_ipv6")
       listen_v4="${addrs_pair%|*}"
       listen_v6="${addrs_pair#*|}"
-      port_hop_apply "$PORT" "$HOP_START" "$HOP_END" "$install_mode" "$listen_v4" "$listen_v6"
+      if ! port_hop_apply "$PORT" "$HOP_START" "$HOP_END" "$install_mode" "$listen_v4" "$listen_v6"; then
+        node_transaction_rollback "$txn"
+        echo -e "${R}端口跳跃规则应用失败，已完整回滚${N}"
+        pause_screen
+        return 1
+      fi
       echo -e "  ${G}端口跳跃已启用：${HOP_START}-${HOP_END} (UDP)${N}"
     fi
   fi
 
-  node_apply_firewall_for_mode "$PORT" udp "$install_mode"
+  if [ -n "$old_port" ] && { [ "$old_port" != "$PORT" ] || [ "$old_mode" != "$install_mode" ]; }; then
+    if ! node_revoke_firewall_for_mode "$old_port" udp "$old_mode"; then
+      node_transaction_rollback "$txn"
+      echo -e "${R}旧端口防火墙清理失败，已完整回滚${N}"
+      pause_screen
+      return 1
+    fi
+  fi
+  if ! node_apply_firewall_for_mode "$PORT" udp "$install_mode"; then
+    node_transaction_rollback "$txn"
+    echo -e "${R}防火墙放行失败，已完整回滚${N}"
+    pause_screen
+    return 1
+  fi
   print_firewall_hint "$PORT" udp "Hysteria2 节点入站"
   if [ "$HOP_ENABLE" = "1" ]; then
     echo -e "  ${D}端口跳跃 DNAT 已配置：${HOP_START}-${HOP_END}/udp → 主端口 ${PORT}/udp${N}"
@@ -7703,9 +9755,7 @@ install_hy2_node(){
     ipv6_link=$(build_hy2_link "$password" "$public_ipv6" "$PORT" "$SNI" "$insecure" "$link_obfs_type" "${obfs_password:-}" "${TAG}-ipv6" "$HOP_START" "$HOP_END" 2>/dev/null || true)
   fi
 
-  ensure_nodes_dir
-  {
-    cat <<EOF
+  if ! write_node_info_file hy2 <<EOF
 Type=hy2
 Tag=$TAG
 Mode=$install_mode
@@ -7721,19 +9771,30 @@ Obfs=${link_obfs_type:-none}
 ObfsPassword=${obfs_password:-}
 Insecure=$insecure
 IP=$access_ip
+UpMbps=$([ "$up_mbps" -gt 0 ] && printf '%s' "$up_mbps")
+DownMbps=$([ "$down_mbps" -gt 0 ] && printf '%s' "$down_mbps")
+PortHop=$HOP_ENABLE
+PortHopMode=$HOP_MODE
+PortHopStart=$HOP_START
+PortHopEnd=$HOP_END
+Link=$link
 EOF
-    if [ "$up_mbps" -gt 0 ] && [ "$down_mbps" -gt 0 ]; then
-      echo "UpMbps=$up_mbps"
-      echo "DownMbps=$down_mbps"
+  then
+    node_transaction_rollback "$txn"
+    echo -e "${R}节点信息保存失败，已完整回滚${N}"
+    pause_screen
+    return 1
+  fi
+
+  if [ "$cert_source" = "acme" ]; then
+    if ! rm -f -- "$CERTS_DIR/hy2.crt" "$CERTS_DIR/hy2.key"; then
+      node_transaction_rollback "$txn"
+      echo -e "${R}旧自签证书清理失败，已完整回滚${N}"
+      pause_screen
+      return 1
     fi
-    if [ "$HOP_ENABLE" = "1" ]; then
-      echo "PortHop=1"
-      echo "PortHopMode=$HOP_MODE"
-      echo "PortHopStart=$HOP_START"
-      echo "PortHopEnd=$HOP_END"
-    fi
-    echo "Link=$link"
-  } > "$(node_info_path hy2)"
+  fi
+  node_transaction_commit "$txn"
 
   register_sb_command || true
 
@@ -7791,29 +9852,11 @@ uninstall_hy2_node(){
     return 0
   fi
 
-  # 清理端口跳跃规则（必须在 remove_node_info 之前，否则读不到 info）
-  local hop_enabled hop_start hop_end mode hy2_port
-  hop_enabled=$(get_node_value hy2 PortHop 2>/dev/null || echo 0)
-  hy2_port=$(get_node_value hy2 Port 2>/dev/null || true)
-  mode=$(get_node_value hy2 Mode 2>/dev/null || echo ipv4)
-  if [ "$hop_enabled" = "1" ]; then
-    hop_start=$(get_node_value hy2 PortHopStart 2>/dev/null || true)
-    hop_end=$(get_node_value hy2 PortHopEnd 2>/dev/null || true)
-    if [ -n "$hop_start" ] && [ -n "$hop_end" ]; then
-      port_hop_remove "$hop_start" "$hop_end" "$mode"
-      echo -e "  ${D}端口跳跃规则已清理 (${hop_start}-${hop_end})${N}"
-    fi
+  if ! uninstall_node_transaction hy2 hy2-in udp; then
+    echo -e "${R}Hysteria2 节点卸载失败，已恢复原配置${N}"
+    pause_screen
+    return 1
   fi
-
-  # 撤销主端口防火墙规则
-  if [ -n "$hy2_port" ]; then
-    node_revoke_firewall_for_mode "$hy2_port" udp "$mode"
-  fi
-
-  config_remove_inbound_by_tag "hy2-in" || true
-  remove_node_info hy2
-  rm -f "$CERTS_DIR/hy2.crt" "$CERTS_DIR/hy2.key" 2>/dev/null || true
-  post_uninstall_service_step
   echo -e "${G}Hysteria2 节点已卸载${N}"
   pause_screen
 }
@@ -7827,6 +9870,7 @@ modify_hy2_params(){
   local bw_choice bw_action="keep" new_up=0 new_down=0
   local hop_choice new_hop=0 new_hop_mode="" new_hop_start="" new_hop_end=""
   local range_input confirm_small
+  local txn=""
 
   if ! require_root; then return 1; fi
   if ! require_singbox_installed; then return 1; fi
@@ -7865,7 +9909,18 @@ modify_hy2_params(){
   while true; do
     read -p "  端口 (${cur_port:-当前未知}): " new_port
     new_port="${new_port:-$cur_port}"
-    if validate_port "$new_port"; then break; fi
+    if validate_port "$new_port"; then
+      new_port=$((10#$new_port))
+      if [ "$new_port" != "$cur_port" ] && check_port_in_use "$new_port" udp; then
+        local force_port=""
+        echo -e "${R}端口 ${new_port} 已被其他 UDP 服务占用${N}"
+        read -p "  仍然使用此端口？(y/N): " force_port
+        if [ "$force_port" != "y" ] && [ "$force_port" != "Y" ]; then
+          continue
+        fi
+      fi
+      break
+    fi
     echo -e "${R}端口必须是 1-65535 的数字${N}"
   done
 
@@ -8032,20 +10087,23 @@ modify_hy2_params(){
     return 0
   fi
 
+  ensure_jq || { pause_screen; return 1; }
+  txn=$(node_transaction_begin hy2) || { echo -e "${R}节点事务快照失败${N}"; pause_screen; return 1; }
+
   backup_path="${CONFIG_PATH}.bak.$(date +%Y%m%d%H%M%S)"
   if ! cp "$CONFIG_PATH" "$backup_path"; then
+    node_transaction_rollback "$txn"
     echo -e "${R}配置备份失败${N}"
     pause_screen
     return 1
   fi
 
-  ensure_jq || { pause_screen; return 1; }
-
   # 自签时若 SNI 改变，重签证书
   if [ "$cur_cert_src" = "self" ] && [ "$new_sni" != "$cur_sni" ]; then
     echo -e "${Y}==> SNI 变更，重新生成自签证书...${N}"
     if ! generate_self_signed_cert_for_hy2 "$new_sni" >/dev/null; then
-      echo -e "${R}自签证书生成失败${N}"
+      node_transaction_rollback "$txn"
+      echo -e "${R}自签证书生成失败，已完整回滚${N}"
       pause_screen
       return 1
     fi
@@ -8072,24 +10130,22 @@ modify_hy2_params(){
        --arg bw_action "$bw_action" --arg up "$new_up" --arg down "$new_down" \
        "$jq_filter" "$CONFIG_PATH" > "$tmp_file"; then
     rm -f "$tmp_file"
-    cp "$backup_path" "$CONFIG_PATH" 2>/dev/null || true
-    echo -e "${R}配置写入失败，已恢复备份${N}"
+    node_transaction_rollback "$txn"
+    echo -e "${R}配置写入失败，已完整回滚${N}"
     pause_screen
     return 1
   fi
-  mv "$tmp_file" "$CONFIG_PATH"
+  if ! mv "$tmp_file" "$CONFIG_PATH"; then
+    node_transaction_rollback "$txn"
+    echo -e "${R}配置替换失败，已完整回滚${N}"
+    pause_screen
+    return 1
+  fi
 
-  if ! sing-box check -c "$CONFIG_PATH"; then
-    cp "$backup_path" "$CONFIG_PATH" 2>/dev/null || true
+  if ! config_check_and_restart "$new_port" udp; then
+    node_transaction_rollback "$txn"
     echo ""
-    echo -e "${R}配置校验失败，已恢复备份${N}"
-    pause_screen
-    return 1
-  fi
-  if ! systemctl restart sing-box; then
-    cp "$backup_path" "$CONFIG_PATH" 2>/dev/null || true
-    echo ""
-    echo -e "${R}服务重启失败，已恢复备份${N}"
+    echo -e "${R}配置校验或服务健康检查失败，已完整回滚${N}"
     pause_screen
     return 1
   fi
@@ -8106,7 +10162,12 @@ modify_hy2_params(){
     fi
   fi
   if [ "$need_remove_hop" = "1" ]; then
-    port_hop_remove "$cur_hop_start" "$cur_hop_end" "$cur_mode"
+    if ! port_hop_remove "$cur_hop_start" "$cur_hop_end" "$cur_mode"; then
+      node_transaction_rollback "$txn"
+      echo -e "${R}旧端口跳跃规则清理失败，已完整回滚${N}"
+      pause_screen
+      return 1
+    fi
     echo -e "  ${D}旧端口跳跃规则已清理${N}"
   fi
   if [ "$new_hop" = "1" ] && [ -n "$new_hop_start" ] && [ -n "$new_hop_end" ]; then
@@ -8115,36 +10176,89 @@ modify_hy2_params(){
     addrs_pair=$(port_hop_listen_addrs_for_mode "$cur_mode" "$public_ipv6_now")
     listen_v4="${addrs_pair%|*}"
     listen_v6="${addrs_pair#*|}"
-    port_hop_apply "$new_port" "$new_hop_start" "$new_hop_end" "$cur_mode" "$listen_v4" "$listen_v6"
+    if ! port_hop_apply "$new_port" "$new_hop_start" "$new_hop_end" "$cur_mode" "$listen_v4" "$listen_v6"; then
+      node_transaction_rollback "$txn"
+      echo -e "${R}新端口跳跃规则应用失败，已完整回滚${N}"
+      pause_screen
+      return 1
+    fi
     echo -e "  ${G}新端口跳跃规则已应用：${new_hop_start}-${new_hop_end}${N}"
   fi
 
+  if [ -n "$new_port" ] && [ "$new_port" != "$cur_port" ]; then
+    if [ -n "$cur_port" ] && ! node_revoke_firewall_for_mode "$cur_port" udp "$cur_mode"; then
+      node_transaction_rollback "$txn"
+      echo -e "${R}旧防火墙端口清理失败，已完整回滚${N}"
+      pause_screen
+      return 1
+    fi
+    if ! node_apply_firewall_for_mode "$new_port" udp "$cur_mode"; then
+      node_transaction_rollback "$txn"
+      echo -e "${R}防火墙端口切换失败，已完整回滚${N}"
+      pause_screen
+      return 1
+    fi
+    print_firewall_hint "$new_port" udp "Hysteria2 节点新端口"
+  fi
+
   # 写回 hy2.info
-  set_node_value hy2 Port "$new_port"
-  set_node_value hy2 SNI  "$new_sni"
-  [ -n "$new_pw" ] && set_node_value hy2 Password "$new_pw"
-  [ -n "$new_obfs_pw" ] && set_node_value hy2 ObfsPassword "$new_obfs_pw"
+  if ! set_node_value hy2 Port "$new_port" || ! set_node_value hy2 SNI "$new_sni"; then
+    node_transaction_rollback "$txn"
+    echo -e "${R}节点信息保存失败，已完整回滚${N}"
+    pause_screen
+    return 1
+  fi
+  if [ -n "$new_pw" ] && ! set_node_value hy2 Password "$new_pw"; then
+    node_transaction_rollback "$txn"
+    echo -e "${R}节点密码保存失败，已完整回滚${N}"
+    pause_screen
+    return 1
+  fi
+  if [ -n "$new_obfs_pw" ] && ! set_node_value hy2 ObfsPassword "$new_obfs_pw"; then
+    node_transaction_rollback "$txn"
+    echo -e "${R}混淆密码保存失败，已完整回滚${N}"
+    pause_screen
+    return 1
+  fi
   case "$bw_action" in
     set)
-      set_node_value hy2 UpMbps "$new_up"
-      set_node_value hy2 DownMbps "$new_down"
+      if ! set_node_value hy2 UpMbps "$new_up" || ! set_node_value hy2 DownMbps "$new_down"; then
+        node_transaction_rollback "$txn"
+        echo -e "${R}带宽参数保存失败，已完整回滚${N}"
+        pause_screen
+        return 1
+      fi
       ;;
     unset)
       # 清空（以空字符串覆盖；后续读取会判空）
-      set_node_value hy2 UpMbps ""
-      set_node_value hy2 DownMbps ""
+      if ! set_node_value hy2 UpMbps "" || ! set_node_value hy2 DownMbps ""; then
+        node_transaction_rollback "$txn"
+        echo -e "${R}带宽参数保存失败，已完整回滚${N}"
+        pause_screen
+        return 1
+      fi
       ;;
   esac
   if [ "$new_hop" = "1" ]; then
-    set_node_value hy2 PortHop "1"
-    set_node_value hy2 PortHopMode "$new_hop_mode"
-    set_node_value hy2 PortHopStart "$new_hop_start"
-    set_node_value hy2 PortHopEnd "$new_hop_end"
+    if ! set_node_value hy2 PortHop "1" \
+       || ! set_node_value hy2 PortHopMode "$new_hop_mode" \
+       || ! set_node_value hy2 PortHopStart "$new_hop_start" \
+       || ! set_node_value hy2 PortHopEnd "$new_hop_end"; then
+      node_transaction_rollback "$txn"
+      echo -e "${R}端口跳跃信息保存失败，已完整回滚${N}"
+      pause_screen
+      return 1
+    fi
   else
-    set_node_value hy2 PortHop "0"
-    set_node_value hy2 PortHopMode ""
-    set_node_value hy2 PortHopStart ""
-    set_node_value hy2 PortHopEnd ""
+    if ! set_node_value hy2 PortHop "0" \
+       || ! set_node_value hy2 PortHopMode "" \
+       || ! set_node_value hy2 PortHopStart "" \
+       || ! set_node_value hy2 PortHopEnd ""; then
+      node_transaction_rollback "$txn"
+      echo -e "${R}端口跳跃信息保存失败，已完整回滚${N}"
+      pause_screen
+      return 1
+    fi
   fi
 
   local cur_ip cur_tag insecure obfs_type final_pw final_obfs_pw new_link ipv6_new_link
@@ -8162,15 +10276,13 @@ modify_hy2_params(){
   fi
   new_link=$(build_hy2_link "$final_pw" "$cur_ip" "$new_port" "$new_sni" "$insecure" "$obfs_type" "$final_obfs_pw" "${cur_tag:-hy2}" "$link_hop_start" "$link_hop_end" 2>/dev/null || true)
   ipv6_new_link=$(build_dualstack_ipv6_link_for_node hy2 2>/dev/null || true)
-  [ -n "$new_link" ] && set_node_value hy2 Link "$new_link"
-  if [ -n "$new_port" ] && [ "$new_port" != "$cur_port" ]; then
-    local hy2_mode_now
-    hy2_mode_now=$(get_node_value hy2 Mode 2>/dev/null || echo ipv4)
-    # 旧端口先撤、新端口再开（双栈/v6 模式同时处理 v4/v6）
-    [ -n "$cur_port" ] && node_revoke_firewall_for_mode "$cur_port" udp "$hy2_mode_now"
-    node_apply_firewall_for_mode "$new_port" udp "$hy2_mode_now"
-    print_firewall_hint "$new_port" udp "Hysteria2 节点新端口"
+  if [ -n "$new_link" ] && ! set_node_value hy2 Link "$new_link"; then
+    node_transaction_rollback "$txn"
+    echo -e "${R}客户端链接保存失败，已完整回滚${N}"
+    pause_screen
+    return 1
   fi
+  node_transaction_commit "$txn"
   cleanup_old_backups "${CONFIG_PATH}.bak.*" 5
 
   echo ""
@@ -8206,6 +10318,7 @@ install_anytls_node(){
   local install_mode="ipv4" mode_label=""
   local PORT SNI TAG LISTEN_CHOICE LISTEN_ADDR PASSWORD confirm
   local default_port default_sni keypair private_key public_key short_id
+  local txn="" old_port="" old_mode="ipv4"
 
   if ! require_root; then return 1; fi
 
@@ -8242,6 +10355,8 @@ install_anytls_node(){
       echo -e "  已取消"
       return 0
     fi
+    old_port=$(get_node_value anytls Port 2>/dev/null || true)
+    old_mode=$(get_node_value anytls Mode 2>/dev/null || echo ipv4)
   fi
 
   # ── 端口（默认随机，避开 reality 端口与已占端口）
@@ -8260,7 +10375,7 @@ install_anytls_node(){
       echo -e "${R}端口与 Reality 节点冲突（Reality 已使用 ${reality_port}）${N}"
       continue
     fi
-    if check_port_in_use "$PORT"; then
+    if [ "$PORT" != "$old_port" ] && check_port_in_use "$PORT" tcp; then
       echo -e "${R}端口 ${PORT} 已被其他服务占用${N}"
       local force_port=""
       read -p "  仍然使用此端口？(y/N): " force_port
@@ -8366,6 +10481,7 @@ install_anytls_node(){
 
   echo -e "${Y}==> 写入配置...${N}"
   ensure_jq || { pause_screen; return 1; }
+  txn=$(node_transaction_begin anytls) || { echo -e "${R}节点事务快照失败${N}"; pause_screen; return 1; }
 
   local inbound_json
   inbound_json=$(jq -n \
@@ -8393,20 +10509,27 @@ install_anytls_node(){
     }')
 
   if ! config_add_inbound "$inbound_json"; then
+    node_transaction_rollback "$txn"
     echo -e "${R}写入 inbound 失败${N}"
     pause_screen
     return 1
   fi
 
   echo -e "${Y}==> 校验并启动...${N}"
-  if ! config_check_and_restart; then
+  if ! config_check_and_restart "$PORT" tcp; then
+    node_transaction_rollback "$txn"
     echo ""
     echo -e "${R}sing-box 校验或重启失败${N}"
     pause_screen
     return 1
   fi
 
-  node_apply_firewall_for_mode "$PORT" tcp "$install_mode"
+  if ! node_apply_firewall_for_mode "$PORT" tcp "$install_mode"; then
+    node_transaction_rollback "$txn"
+    echo -e "${R}防火墙放行失败，节点配置已回滚${N}"
+    pause_screen
+    return 1
+  fi
   print_firewall_hint "$PORT" tcp "AnyTLS 节点入站"
 
   link=$(build_anytls_link "$PASSWORD" "$access_ip" "$PORT" "$SNI" "$public_key" "$short_id" "$TAG" 2>/dev/null || true)
@@ -8414,8 +10537,7 @@ install_anytls_node(){
     ipv6_link=$(build_anytls_link "$PASSWORD" "$public_ipv6" "$PORT" "$SNI" "$public_key" "$short_id" "${TAG}-ipv6" 2>/dev/null || true)
   fi
 
-  ensure_nodes_dir
-  cat > "$(node_info_path anytls)" <<EOF
+  if ! write_node_info_file anytls <<EOF
 Type=anytls
 Tag=$TAG
 Mode=$install_mode
@@ -8429,6 +10551,22 @@ ShortID=$short_id
 IP=$access_ip
 Link=$link
 EOF
+  then
+    node_transaction_rollback "$txn"
+    echo -e "${R}节点信息保存失败，已完整回滚${N}"
+    pause_screen
+    return 1
+  fi
+
+  if [ -n "$old_port" ] && [ "$old_port" != "$PORT" ]; then
+    if ! node_revoke_firewall_for_mode "$old_port" tcp "$old_mode"; then
+      node_transaction_rollback "$txn"
+      echo -e "${R}旧端口防火墙清理失败，已完整回滚${N}"
+      pause_screen
+      return 1
+    fi
+  fi
+  node_transaction_commit "$txn"
 
   register_sb_command || true
 
@@ -8469,6 +10607,7 @@ install_tuic_node(){
   local public_ipv4="" public_ipv6="" access_ip=""
   local link="" ipv6_link="" mode_label="" confirm
   local cert_paths cert_path key_path
+  local txn="" old_port="" old_mode="ipv4"
 
   if ! require_root; then return 1; fi
 
@@ -8483,6 +10622,8 @@ install_tuic_node(){
       echo -e "  已取消"
       return 0
     fi
+    old_port=$(get_node_value tuic Port 2>/dev/null || true)
+    old_mode=$(get_node_value tuic Mode 2>/dev/null || echo ipv4)
   fi
 
   # 端口（默认随机高位 UDP，复用 hy2 的端口生成器）
@@ -8493,6 +10634,14 @@ install_tuic_node(){
     PORT="${port_input:-$default_port}"
     if validate_port "$PORT"; then
       PORT=$((10#$PORT))
+      if [ "$PORT" != "$old_port" ] && check_port_in_use "$PORT" udp; then
+        echo -e "${R}UDP 端口 ${PORT} 已被其他服务占用${N}"
+        local force_port=""
+        read -p "  仍然使用此端口？(y/N): " force_port
+        if [ "$force_port" != "y" ] && [ "$force_port" != "Y" ]; then
+          continue
+        fi
+      fi
       break
     fi
     echo -e "${R}端口必须是 1-65535 的数字${N}"
@@ -8617,40 +10766,59 @@ install_tuic_node(){
 
   mode_label=$(describe_install_mode "$install_mode")
 
+  echo -e "${Y}==> 建立节点事务快照...${N}"
+  ensure_jq || { pause_screen; return 1; }
+  txn=$(node_transaction_begin tuic) || { echo -e "${R}节点事务快照失败${N}"; pause_screen; return 1; }
+
   # 准备证书
   if [ "$cert_source" = "self" ]; then
     echo -e "${Y}==> 生成自签证书...${N}"
-    cert_paths=$(generate_self_signed_cert_for_tuic "$SNI") || { pause_screen; return 1; }
+    if ! cert_paths=$(generate_self_signed_cert_for_tuic "$SNI"); then
+      node_transaction_rollback "$txn"
+      pause_screen
+      return 1
+    fi
     cert_path=$(echo "$cert_paths" | sed -n '1p')
     key_path=$(echo "$cert_paths" | sed -n '2p')
   fi
 
   echo -e "${Y}==> 写入配置...${N}"
-  ensure_jq || { pause_screen; return 1; }
 
   local tls_json
   if [ "$cert_source" = "acme" ]; then
-    tls_json=$(jq -n --arg sni "$SNI" --arg email "$acme_email" '{
+    if ! tls_json=$(jq -n --arg sni "$SNI" --arg email "$acme_email" '{
       enabled: true,
       server_name: $sni,
       alpn: ["h3"],
       acme: {domain: [$sni], email: $email}
-    }')
+    }'); then
+      node_transaction_rollback "$txn"
+      pause_screen
+      return 1
+    fi
   else
-    tls_json=$(jq -n --arg sni "$SNI" --arg crt "$cert_path" --arg key "$key_path" '{
+    if ! tls_json=$(jq -n --arg sni "$SNI" --arg crt "$cert_path" --arg key "$key_path" '{
       enabled: true,
       server_name: $sni,
       alpn: ["h3"],
       certificate_path: $crt,
       key_path: $key
-    }')
+    }'); then
+      node_transaction_rollback "$txn"
+      pause_screen
+      return 1
+    fi
   fi
 
   local user_obj
-  user_obj=$(jq -n --arg uuid "$UUID" --arg pw "$PASSWORD" '{uuid: $uuid, password: $pw}')
+  if ! user_obj=$(jq -n --arg uuid "$UUID" --arg pw "$PASSWORD" '{uuid: $uuid, password: $pw}'); then
+    node_transaction_rollback "$txn"
+    pause_screen
+    return 1
+  fi
 
   local inbound_json
-  inbound_json=$(jq -n \
+  if ! inbound_json=$(jq -n \
     --arg listen "$LISTEN_ADDR" \
     --argjson port "$PORT" \
     --argjson user "$user_obj" \
@@ -8667,23 +10835,42 @@ install_tuic_node(){
       zero_rtt_handshake: false,
       heartbeat: "10s",
       tls: $tls
-    }')
+    }'); then
+    node_transaction_rollback "$txn"
+    pause_screen
+    return 1
+  fi
 
   if ! config_add_inbound "$inbound_json"; then
+    node_transaction_rollback "$txn"
     echo -e "${R}写入 inbound 失败${N}"
     pause_screen
     return 1
   fi
 
   echo -e "${Y}==> 校验并启动...${N}"
-  if ! config_check_and_restart; then
+  if ! config_check_and_restart "$PORT" udp; then
+    node_transaction_rollback "$txn"
     echo ""
     echo -e "${R}sing-box 校验或重启失败${N}"
     pause_screen
     return 1
   fi
 
-  node_apply_firewall_for_mode "$PORT" udp "$install_mode"
+  if [ -n "$old_port" ] && { [ "$old_port" != "$PORT" ] || [ "$old_mode" != "$install_mode" ]; }; then
+    if ! node_revoke_firewall_for_mode "$old_port" udp "$old_mode"; then
+      node_transaction_rollback "$txn"
+      echo -e "${R}旧端口防火墙清理失败，已完整回滚${N}"
+      pause_screen
+      return 1
+    fi
+  fi
+  if ! node_apply_firewall_for_mode "$PORT" udp "$install_mode"; then
+    node_transaction_rollback "$txn"
+    echo -e "${R}防火墙放行失败，已完整回滚${N}"
+    pause_screen
+    return 1
+  fi
   print_firewall_hint "$PORT" udp "TUIC v5 节点入站"
   if [ "$cert_source" = "acme" ]; then
     print_firewall_hint 80 tcp "ACME 证书签发与续期，签发期间必须可外部访问"
@@ -8697,8 +10884,7 @@ install_tuic_node(){
     ipv6_link=$(build_tuic_link "$UUID" "$PASSWORD" "$public_ipv6" "$PORT" "$SNI" "$insecure" "$CC" "${TAG}-ipv6" 2>/dev/null || true)
   fi
 
-  ensure_nodes_dir
-  cat > "$(node_info_path tuic)" <<EOF
+  if ! write_node_info_file tuic <<EOF
 Type=tuic
 Tag=$TAG
 Mode=$install_mode
@@ -8716,6 +10902,22 @@ Insecure=$insecure
 IP=$access_ip
 Link=$link
 EOF
+  then
+    node_transaction_rollback "$txn"
+    echo -e "${R}节点信息保存失败，已完整回滚${N}"
+    pause_screen
+    return 1
+  fi
+
+  if [ "$cert_source" = "acme" ]; then
+    if ! rm -f -- "$CERTS_DIR/tuic.crt" "$CERTS_DIR/tuic.key"; then
+      node_transaction_rollback "$txn"
+      echo -e "${R}旧自签证书清理失败，已完整回滚${N}"
+      pause_screen
+      return 1
+    fi
+  fi
+  node_transaction_commit "$txn"
 
   register_sb_command || true
 
@@ -8762,17 +10964,11 @@ uninstall_anytls_node(){
     return 0
   fi
 
-  # 必须在 remove_node_info 之前撤防火墙规则，否则读不到 Mode/Port
-  local at_port at_mode
-  at_port=$(get_node_value anytls Port 2>/dev/null || true)
-  at_mode=$(get_node_value anytls Mode 2>/dev/null || echo ipv4)
-  if [ -n "$at_port" ]; then
-    node_revoke_firewall_for_mode "$at_port" tcp "$at_mode"
+  if ! uninstall_node_transaction anytls anytls-in tcp; then
+    echo -e "${R}AnyTLS 节点卸载失败，已恢复原配置${N}"
+    pause_screen
+    return 1
   fi
-
-  config_remove_inbound_by_tag "anytls-in" || true
-  remove_node_info anytls
-  post_uninstall_service_step
   echo -e "${G}AnyTLS 节点已卸载${N}"
   pause_screen
 }
@@ -8791,25 +10987,17 @@ uninstall_tuic_node(){
     return 0
   fi
 
-  # 必须在 remove_node_info 之前撤防火墙规则，否则读不到 Mode/Port
-  local tuic_port tuic_mode
-  tuic_port=$(get_node_value tuic Port 2>/dev/null || true)
-  tuic_mode=$(get_node_value tuic Mode 2>/dev/null || echo ipv4)
-  if [ -n "$tuic_port" ]; then
-    node_revoke_firewall_for_mode "$tuic_port" udp "$tuic_mode"
+  if ! uninstall_node_transaction tuic tuic-in udp; then
+    echo -e "${R}TUIC 节点卸载失败，已恢复原配置${N}"
+    pause_screen
+    return 1
   fi
-
-  config_remove_inbound_by_tag "tuic-in" || true
-  remove_node_info tuic
-  rm -f "$CERTS_DIR/tuic.crt" "$CERTS_DIR/tuic.key" 2>/dev/null || true
-  post_uninstall_service_step
   echo -e "${G}TUIC 节点已卸载${N}"
   pause_screen
 }
 
 # ─── Shadowsocks-2022 ─────────────────────────────────
 # 抗主动探测能力弱于 Reality / Hysteria2，菜单中标记为 [谨慎]
-
 # ═══ source: 54-node-ss2022.sh ═══
 generate_ss2022_random_port(){
   local p attempts=0
@@ -8848,6 +11036,7 @@ install_ss2022_node(){
   local install_mode="ipv4" mode_label=""
   local PORT TAG LISTEN_CHOICE LISTEN_ADDR METHOD PASSWORD METHOD_CHOICE confirm
   local default_port
+  local txn="" old_port="" old_mode="ipv4"
 
   if ! require_root; then return 1; fi
 
@@ -8865,6 +11054,8 @@ install_ss2022_node(){
       echo -e "  已取消"
       return 0
     fi
+    old_port=$(get_node_value ss2022 Port 2>/dev/null || true)
+    old_mode=$(get_node_value ss2022 Mode 2>/dev/null || echo ipv4)
   fi
 
   default_port=$(generate_ss2022_random_port)
@@ -8876,7 +11067,7 @@ install_ss2022_node(){
       continue
     fi
     PORT=$((10#$PORT))
-    if check_port_in_use "$PORT"; then
+    if [ "$PORT" != "$old_port" ] && check_port_in_use "$PORT" tcp; then
       echo -e "${R}端口 ${PORT} 已被其他服务占用${N}"
       local force_port=""
       read -p "  仍然使用此端口？(y/N): " force_port
@@ -8980,6 +11171,7 @@ install_ss2022_node(){
 
   echo -e "${Y}==> 写入配置...${N}"
   ensure_jq || { pause_screen; return 1; }
+  txn=$(node_transaction_begin ss2022) || { echo -e "${R}节点事务快照失败${N}"; pause_screen; return 1; }
 
   # network=tcp 屏蔽 UDP relay：减小攻击面，单一 TCP 防火墙规则
   local inbound_json
@@ -8998,20 +11190,27 @@ install_ss2022_node(){
     }')
 
   if ! config_add_inbound "$inbound_json"; then
+    node_transaction_rollback "$txn"
     echo -e "${R}写入 inbound 失败${N}"
     pause_screen
     return 1
   fi
 
   echo -e "${Y}==> 校验并启动...${N}"
-  if ! config_check_and_restart; then
+  if ! config_check_and_restart "$PORT" tcp; then
+    node_transaction_rollback "$txn"
     echo ""
     echo -e "${R}sing-box 校验或重启失败${N}"
     pause_screen
     return 1
   fi
 
-  node_apply_firewall_for_mode "$PORT" tcp "$install_mode"
+  if ! node_apply_firewall_for_mode "$PORT" tcp "$install_mode"; then
+    node_transaction_rollback "$txn"
+    echo -e "${R}防火墙放行失败，节点配置已回滚${N}"
+    pause_screen
+    return 1
+  fi
   print_firewall_hint "$PORT" tcp "Shadowsocks-2022 节点入站"
 
   link=$(build_ss2022_link "$METHOD" "$PASSWORD" "$access_ip" "$PORT" "$TAG" 2>/dev/null || true)
@@ -9019,8 +11218,7 @@ install_ss2022_node(){
     ipv6_link=$(build_ss2022_link "$METHOD" "$PASSWORD" "$public_ipv6" "$PORT" "${TAG}-ipv6" 2>/dev/null || true)
   fi
 
-  ensure_nodes_dir
-  cat > "$(node_info_path ss2022)" <<EOF
+  if ! write_node_info_file ss2022 <<EOF
 Type=ss2022
 Tag=$TAG
 Mode=$install_mode
@@ -9031,6 +11229,22 @@ Password=$PASSWORD
 IP=$access_ip
 Link=$link
 EOF
+  then
+    node_transaction_rollback "$txn"
+    echo -e "${R}节点信息保存失败，已完整回滚${N}"
+    pause_screen
+    return 1
+  fi
+
+  if [ -n "$old_port" ] && [ "$old_port" != "$PORT" ]; then
+    if ! node_revoke_firewall_for_mode "$old_port" tcp "$old_mode"; then
+      node_transaction_rollback "$txn"
+      echo -e "${R}旧端口防火墙清理失败，已完整回滚${N}"
+      pause_screen
+      return 1
+    fi
+  fi
+  node_transaction_commit "$txn"
 
   register_sb_command || true
 
@@ -9077,17 +11291,11 @@ uninstall_ss2022_node(){
     return 0
   fi
 
-  # 必须在 remove_node_info 之前撤防火墙规则，否则读不到 Mode/Port
-  local ss_port ss_mode
-  ss_port=$(get_node_value ss2022 Port 2>/dev/null || true)
-  ss_mode=$(get_node_value ss2022 Mode 2>/dev/null || echo ipv4)
-  if [ -n "$ss_port" ]; then
-    node_revoke_firewall_for_mode "$ss_port" tcp "$ss_mode"
+  if ! uninstall_node_transaction ss2022 ss2022-in tcp; then
+    echo -e "${R}Shadowsocks-2022 节点卸载失败，已恢复原配置${N}"
+    pause_screen
+    return 1
   fi
-
-  config_remove_inbound_by_tag "ss2022-in" || true
-  remove_node_info ss2022
-  post_uninstall_service_step
   echo -e "${G}Shadowsocks-2022 节点已卸载${N}"
   pause_screen
 }
@@ -9095,7 +11303,7 @@ uninstall_ss2022_node(){
 modify_ss2022_params(){
   local new_port="" new_method="" new_tag=""
   local cur_port cur_method cur_tag cur_password regen_choice
-  local backup_path="" confirm new_password=""
+  local backup_path="" confirm new_password="" txn=""
 
   if ! require_root; then return 1; fi
   if ! require_singbox_installed; then return 1; fi
@@ -9191,15 +11399,22 @@ modify_ss2022_params(){
     return 0
   fi
 
+  ensure_jq || { pause_screen; return 1; }
+  txn=$(node_transaction_begin ss2022) || { echo -e "${R}节点事务快照失败${N}"; pause_screen; return 1; }
   backup_path="${CONFIG_PATH}.bak.$(date +%Y%m%d-%H%M%S)"
-  cp "$CONFIG_PATH" "$backup_path" 2>/dev/null || true
+  if ! cp "$CONFIG_PATH" "$backup_path"; then
+    node_transaction_rollback "$txn"
+    echo -e "${R}配置备份失败${N}"
+    pause_screen
+    return 1
+  fi
 
   local cur_listen cur_mode
   cur_listen=$(get_node_value ss2022 ListenAddr 2>/dev/null || echo "0.0.0.0")
   cur_mode=$(get_node_value ss2022 Mode 2>/dev/null || echo ipv4)
 
   local inbound_json
-  inbound_json=$(jq -n \
+  if ! inbound_json=$(jq -n \
     --arg listen "$cur_listen" \
     --argjson port "$new_port" \
     --arg method "$new_method" \
@@ -9211,39 +11426,62 @@ modify_ss2022_params(){
       network: "tcp",
       method: $method,
       password: $password
-    }')
-
-  if ! config_add_inbound "$inbound_json"; then
-    echo -e "${R}写入 inbound 失败，已保留备份: $backup_path${N}"
+    }'); then
+    node_transaction_rollback "$txn"
+    echo -e "${R}节点配置生成失败，已完整回滚${N}"
     pause_screen
     return 1
   fi
 
-  if ! config_check_and_restart; then
-    echo -e "${R}sing-box 校验或重启失败，正在回滚...${N}"
-    cp "$backup_path" "$CONFIG_PATH" 2>/dev/null || true
-    systemctl restart sing-box >/dev/null 2>&1 || true
+  if ! config_add_inbound "$inbound_json"; then
+    node_transaction_rollback "$txn"
+    echo -e "${R}写入 inbound 失败，已完整回滚${N}"
+    pause_screen
+    return 1
+  fi
+
+  if ! config_check_and_restart "$new_port" tcp; then
+    node_transaction_rollback "$txn"
+    echo -e "${R}sing-box 校验或健康检查失败，已完整回滚${N}"
     pause_screen
     return 1
   fi
 
   # 端口变化时同步防火墙
   if [ "$new_port" != "$cur_port" ]; then
-    node_revoke_firewall_for_mode "$cur_port" tcp "$cur_mode"
-    node_apply_firewall_for_mode "$new_port" tcp "$cur_mode"
+    if ! node_revoke_firewall_for_mode "$cur_port" tcp "$cur_mode" \
+       || ! node_apply_firewall_for_mode "$new_port" tcp "$cur_mode"; then
+      node_transaction_rollback "$txn"
+      echo -e "${R}防火墙端口切换失败，已完整回滚${N}"
+      pause_screen
+      return 1
+    fi
     print_firewall_hint "$new_port" tcp "Shadowsocks-2022 节点入站"
   fi
 
-  set_node_value ss2022 Port "$new_port"
-  set_node_value ss2022 Method "$new_method"
-  set_node_value ss2022 Tag "$new_tag"
-  set_node_value ss2022 Password "$new_password"
+  if ! set_node_value ss2022 Port "$new_port" \
+     || ! set_node_value ss2022 Method "$new_method" \
+     || ! set_node_value ss2022 Tag "$new_tag" \
+     || ! set_node_value ss2022 Password "$new_password"; then
+    node_transaction_rollback "$txn"
+    echo -e "${R}节点信息保存失败，已完整回滚${N}"
+    pause_screen
+    return 1
+  fi
 
   local cur_ip new_link ipv6_new_link
   cur_ip=$(get_node_value ss2022 IP 2>/dev/null || true)
   new_link=$(build_ss2022_link "$new_method" "$new_password" "$cur_ip" "$new_port" "$new_tag" 2>/dev/null || true)
   ipv6_new_link=$(build_dualstack_ipv6_link_for_node ss2022 2>/dev/null || true)
-  [ -n "$new_link" ] && set_node_value ss2022 Link "$new_link"
+  if [ -n "$new_link" ] && ! set_node_value ss2022 Link "$new_link"; then
+    node_transaction_rollback "$txn"
+    echo -e "${R}客户端链接保存失败，已完整回滚${N}"
+    pause_screen
+    return 1
+  fi
+  node_transaction_commit "$txn"
+  cleanup_old_backups "${CONFIG_PATH}.bak.*" 5 \
+    || echo -e "${Y}旧配置备份自动清理失败，可稍后从备份菜单处理${N}"
 
   echo ""
   echo -e "  ${G}修改完成${N}"
@@ -9266,7 +11504,7 @@ modify_ss2022_params(){
 
 modify_anytls_params(){
   local new_port="" new_sni="" new_pw="" new_tag=""
-  local cur_port cur_sni cur_pw cur_tag backup_path="" confirm
+  local cur_port cur_sni cur_pw cur_tag backup_path="" confirm txn=""
 
   if ! require_root; then return 1; fi
   if ! require_singbox_installed; then return 1; fi
@@ -9301,6 +11539,14 @@ modify_anytls_params(){
       continue
     fi
     new_port=$((10#$new_port))
+    if [ "$new_port" != "$cur_port" ] && check_port_in_use "$new_port" tcp; then
+      local force_port=""
+      echo -e "${R}端口 ${new_port} 已被其他 TCP 服务占用${N}"
+      read -p "  仍然使用此端口？(y/N): " force_port
+      if [ "$force_port" != "y" ] && [ "$force_port" != "Y" ]; then
+        continue
+      fi
+    fi
     break
   done
 
@@ -9349,11 +11595,17 @@ modify_anytls_params(){
     return 0
   fi
 
-  # 备份配置
-  backup_path="${CONFIG_PATH}.$(date +%Y%m%d-%H%M%S).bak"
-  cp "$CONFIG_PATH" "$backup_path" 2>/dev/null || true
-
   ensure_jq || { pause_screen; return 1; }
+  txn=$(node_transaction_begin anytls) || { echo -e "${R}节点事务快照失败${N}"; pause_screen; return 1; }
+
+  # 备份配置
+  backup_path="${CONFIG_PATH}.bak.$(date +%Y%m%d-%H%M%S)"
+  if ! cp "$CONFIG_PATH" "$backup_path"; then
+    node_transaction_rollback "$txn"
+    echo -e "${R}配置备份失败${N}"
+    pause_screen
+    return 1
+  fi
 
   local tmp jq_filter
   tmp=$(mktemp)
@@ -9367,15 +11619,22 @@ modify_anytls_params(){
           --arg sni "$new_sni" \
           --arg pw "$new_pw" \
           "$jq_filter" "$CONFIG_PATH" > "$tmp" 2>/dev/null; then
-    echo -e "${R}配置写入失败（jq 过滤错误）${N}"
+    node_transaction_rollback "$txn"
+    echo -e "${R}配置写入失败，已完整回滚${N}"
     pause_screen
     return 1
   fi
-  mv "$tmp" "$CONFIG_PATH"
+  if ! mv "$tmp" "$CONFIG_PATH"; then
+    node_transaction_rollback "$txn"
+    echo -e "${R}配置替换失败，已完整回滚${N}"
+    pause_screen
+    return 1
+  fi
 
-  if ! config_check_and_restart; then
+  if ! config_check_and_restart "$new_port" tcp; then
+    node_transaction_rollback "$txn"
     echo ""
-    echo -e "${R}sing-box 校验或重启失败，已保留备份：${backup_path}${N}"
+    echo -e "${R}sing-box 校验或健康检查失败，已完整回滚${N}"
     pause_screen
     return 1
   fi
@@ -9384,16 +11643,26 @@ modify_anytls_params(){
   local cur_mode
   cur_mode=$(get_node_value anytls Mode 2>/dev/null || echo ipv4)
   if [ -n "$cur_port" ] && [ "$cur_port" != "$new_port" ]; then
-    node_revoke_firewall_for_mode "$cur_port" tcp "$cur_mode"
-    node_apply_firewall_for_mode "$new_port" tcp "$cur_mode"
+    if ! node_revoke_firewall_for_mode "$cur_port" tcp "$cur_mode" \
+       || ! node_apply_firewall_for_mode "$new_port" tcp "$cur_mode"; then
+      node_transaction_rollback "$txn"
+      echo -e "${R}防火墙端口切换失败，已完整回滚${N}"
+      pause_screen
+      return 1
+    fi
     print_firewall_hint "$new_port" tcp "AnyTLS 节点新端口"
   fi
 
   # 更新 info
-  set_node_value anytls Port "$new_port"
-  set_node_value anytls SNI "$new_sni"
-  set_node_value anytls Password "$new_pw"
-  set_node_value anytls Tag "$new_tag"
+  if ! set_node_value anytls Port "$new_port" \
+     || ! set_node_value anytls SNI "$new_sni" \
+     || ! set_node_value anytls Password "$new_pw" \
+     || ! set_node_value anytls Tag "$new_tag"; then
+    node_transaction_rollback "$txn"
+    echo -e "${R}节点信息保存失败，已完整回滚${N}"
+    pause_screen
+    return 1
+  fi
 
   # 重生成 Link
   local cur_ip pub sid new_link ipv6_new_link
@@ -9402,7 +11671,15 @@ modify_anytls_params(){
   sid=$(get_node_value anytls ShortID 2>/dev/null || true)
   new_link=$(build_anytls_link "$new_pw" "$cur_ip" "$new_port" "$new_sni" "$pub" "$sid" "$new_tag" 2>/dev/null || true)
   ipv6_new_link=$(build_dualstack_ipv6_link_for_node anytls 2>/dev/null || true)
-  [ -n "$new_link" ] && set_node_value anytls Link "$new_link"
+  if [ -n "$new_link" ] && ! set_node_value anytls Link "$new_link"; then
+    node_transaction_rollback "$txn"
+    echo -e "${R}客户端链接保存失败，已完整回滚${N}"
+    pause_screen
+    return 1
+  fi
+  node_transaction_commit "$txn"
+  cleanup_old_backups "${CONFIG_PATH}.bak.*" 5 \
+    || echo -e "${Y}旧配置备份自动清理失败，可稍后从备份菜单处理${N}"
 
   echo ""
   echo -e "${G}AnyTLS 节点参数已更新并重启服务${N}"
@@ -9425,7 +11702,7 @@ modify_tuic_params(){
   local new_port="" new_sni="" new_uuid="" new_pw="" new_cc="" new_tag=""
   local cur_port cur_sni cur_uuid cur_pw cur_cc cur_cert_src cur_email cur_mode cur_insecure cur_tag
   local cur_cert_path cur_key_path
-  local backup_path="" confirm cc_choice regen_uuid regen_pw
+  local backup_path="" confirm cc_choice regen_uuid regen_pw txn=""
 
   if ! require_root; then return 1; fi
   if ! require_singbox_installed; then return 1; fi
@@ -9466,6 +11743,14 @@ modify_tuic_params(){
     new_port="${new_port:-$cur_port}"
     if validate_port "$new_port"; then
       new_port=$((10#$new_port))
+      if [ "$new_port" != "$cur_port" ] && check_port_in_use "$new_port" udp; then
+        local force_port=""
+        echo -e "${R}端口 ${new_port} 已被其他 UDP 服务占用${N}"
+        read -p "  仍然使用此端口？(y/N): " force_port
+        if [ "$force_port" != "y" ] && [ "$force_port" != "Y" ]; then
+          continue
+        fi
+      fi
       break
     fi
     echo -e "${R}端口必须是 1-65535 的数字${N}"
@@ -9559,17 +11844,24 @@ modify_tuic_params(){
     return 0
   fi
 
-  # 备份配置
-  backup_path="${CONFIG_PATH}.$(date +%Y%m%d-%H%M%S).bak"
-  cp "$CONFIG_PATH" "$backup_path" 2>/dev/null || true
-
   ensure_jq || { pause_screen; return 1; }
+  txn=$(node_transaction_begin tuic) || { echo -e "${R}节点事务快照失败${N}"; pause_screen; return 1; }
+
+  # 备份配置
+  backup_path="${CONFIG_PATH}.bak.$(date +%Y%m%d-%H%M%S)"
+  if ! cp "$CONFIG_PATH" "$backup_path"; then
+    node_transaction_rollback "$txn"
+    echo -e "${R}配置备份失败${N}"
+    pause_screen
+    return 1
+  fi
 
   # 自签证书：SNI 变了 → 重新自签
   if [ "$cur_cert_src" = "self" ] && [ "$new_sni" != "$cur_sni" ]; then
     echo -e "${Y}==> SNI 已修改，重新生成自签证书...${N}"
     if ! generate_self_signed_cert_for_tuic "$new_sni" >/dev/null; then
-      echo -e "${R}自签证书生成失败${N}"
+      node_transaction_rollback "$txn"
+      echo -e "${R}自签证书生成失败，已完整回滚${N}"
       pause_screen
       return 1
     fi
@@ -9592,40 +11884,65 @@ modify_tuic_params(){
           --arg pw "$new_pw" \
           --arg cc "$new_cc" \
           "$jq_filter" "$CONFIG_PATH" > "$tmp" 2>/dev/null; then
-    echo -e "${R}配置写入失败（jq 过滤错误）${N}"
+    node_transaction_rollback "$txn"
+    echo -e "${R}配置写入失败，已完整回滚${N}"
     pause_screen
     return 1
   fi
-  mv "$tmp" "$CONFIG_PATH"
+  if ! mv "$tmp" "$CONFIG_PATH"; then
+    node_transaction_rollback "$txn"
+    echo -e "${R}配置替换失败，已完整回滚${N}"
+    pause_screen
+    return 1
+  fi
 
-  if ! config_check_and_restart; then
+  if ! config_check_and_restart "$new_port" udp; then
+    node_transaction_rollback "$txn"
     echo ""
-    echo -e "${R}sing-box 校验或重启失败，已保留备份：${backup_path}${N}"
+    echo -e "${R}sing-box 校验或健康检查失败，已完整回滚${N}"
     pause_screen
     return 1
   fi
 
   # 防火墙：撤旧放新
   if [ -n "$cur_port" ] && [ "$cur_port" != "$new_port" ]; then
-    node_revoke_firewall_for_mode "$cur_port" udp "$cur_mode"
-    node_apply_firewall_for_mode "$new_port" udp "$cur_mode"
+    if ! node_revoke_firewall_for_mode "$cur_port" udp "$cur_mode" \
+       || ! node_apply_firewall_for_mode "$new_port" udp "$cur_mode"; then
+      node_transaction_rollback "$txn"
+      echo -e "${R}防火墙端口切换失败，已完整回滚${N}"
+      pause_screen
+      return 1
+    fi
     print_firewall_hint "$new_port" udp "TUIC 节点新端口"
   fi
 
   # 更新 .info
-  set_node_value tuic Port "$new_port"
-  set_node_value tuic SNI "$new_sni"
-  set_node_value tuic UUID "$new_uuid"
-  set_node_value tuic Password "$new_pw"
-  set_node_value tuic CongestionControl "$new_cc"
-  set_node_value tuic Tag "$new_tag"
+  if ! set_node_value tuic Port "$new_port" \
+     || ! set_node_value tuic SNI "$new_sni" \
+     || ! set_node_value tuic UUID "$new_uuid" \
+     || ! set_node_value tuic Password "$new_pw" \
+     || ! set_node_value tuic CongestionControl "$new_cc" \
+     || ! set_node_value tuic Tag "$new_tag"; then
+    node_transaction_rollback "$txn"
+    echo -e "${R}节点信息保存失败，已完整回滚${N}"
+    pause_screen
+    return 1
+  fi
 
   # 重生成 Link
   local cur_ip new_link ipv6_new_link
   cur_ip=$(get_node_value tuic IP 2>/dev/null || true)
   new_link=$(build_tuic_link "$new_uuid" "$new_pw" "$cur_ip" "$new_port" "$new_sni" "$cur_insecure" "$new_cc" "$new_tag" 2>/dev/null || true)
   ipv6_new_link=$(build_dualstack_ipv6_link_for_node tuic 2>/dev/null || true)
-  [ -n "$new_link" ] && set_node_value tuic Link "$new_link"
+  if [ -n "$new_link" ] && ! set_node_value tuic Link "$new_link"; then
+    node_transaction_rollback "$txn"
+    echo -e "${R}客户端链接保存失败，已完整回滚${N}"
+    pause_screen
+    return 1
+  fi
+  node_transaction_commit "$txn"
+  cleanup_old_backups "${CONFIG_PATH}.bak.*" 5 \
+    || echo -e "${Y}旧配置备份自动清理失败，可稍后从备份菜单处理${N}"
 
   echo ""
   echo -e "${G}TUIC 节点参数已更新并重启服务${N}"
@@ -9645,9 +11962,10 @@ modify_tuic_params(){
 }
 
 # ─── 完整卸载脚本 ─────────────────────────────────────
-# 清理范围：节点 inbound、节点防火墙端口、sing-box 服务与软件包、
-#          /etc/sing-box（含 nodes/、certs/、备份）、
+# 清理范围：脚本固定 tag 的节点 inbound、节点信息/证书/防火墙端口、
+#          WARP 与 sing-box 服务/软件包、脚本生成的配置备份、
 #          legacy /root/proxy-info.txt、/usr/local/bin/sb。
+# 保留：/etc/sing-box 内用户自定义 inbound、DNS、路由、outbound 与其它文件。
 # 不动：SSH 端口/sshd 配置、用户账户、sudoers、自动更新策略、
 #        IPv6 防火墙菜单规则、1Panel、apt 基础工具、
 #        TCP 网络优化、QUIC 协议优化、initcwnd 持久化服务、本脚本创建的 SWAP。
@@ -9657,14 +11975,17 @@ uninstall_script_completely(){
 
   render_section_header "卸载脚本"
   echo ""
-  echo -e "  ${R}此操作将清除以下内容（不可恢复）：${N}"
-  echo -e "    ${L}·${N} 所有 sing-box 节点（Reality / Hysteria2 / AnyTLS）及其防火墙端口"
-  echo -e "    ${L}·${N} sing-box 服务、软件包与 ${C}/etc/sing-box${N} 整个目录"
-  echo -e "    ${L}·${N} 旧版遗留组件（Realm 中转 / Xray 内核 / 流量统计），如存在"
+  echo -e "  ${R}此操作将清除以下脚本托管内容：${N}"
+  echo -e "    ${L}·${N} Reality / Hysteria2 / AnyTLS / TUIC / SS-2022 节点与端口"
+  echo -e "    ${L}·${N} WARP 账号、脚本规则、端口跳跃与专属防火墙链"
+  echo -e "    ${L}·${N} sing-box 服务与软件包（不使用 purge）"
+  echo -e "    ${L}·${N} 可确认属于旧版脚本的 Realm / Xray / 流量统计组件"
   echo -e "    ${L}·${N} ${C}${INFO_PATH}${N} 与 ${C}${SCRIPT_PATH}${N}"
   echo ""
-  echo -e "  ${D}保留：SSH 配置 / 用户账户 / sudoers / 自动更新 / IPv6 防火墙规则 / 1Panel${N}"
+  echo -e "  ${G}会保留：${C}/etc/sing-box${N} 中的用户自定义配置、inbound、DNS、路由和其它文件${N}"
+  echo -e "  ${D}保留：SSH 配置 / 用户账户 / sudoers / 自动更新 / 1Panel${N}"
   echo -e "  ${D}保留：TCP 网络优化 / QUIC 协议优化 / initcwnd 持久化服务 / 本脚本创建的 SWAP${N}"
+  echo -e "  ${Y}脚本专属防火墙链移除前会把 INPUT 默认策略改为 ACCEPT，避免卸载后 SSH 被锁。${N}"
   echo ""
   read -p "  确认卸载？(y/N): " confirm
   if [ "$confirm" != "y" ] && [ "$confirm" != "Y" ]; then
@@ -9673,111 +11994,251 @@ uninstall_script_completely(){
     return 0
   fi
 
-  # 1. 节点防火墙端口（按 nodes/*.info 反查）
+  local node tag proto txn rc=0
+  local warp_cache_added warp_cache_path
+  local fw4_txn="" fw6_txn="" fw_owned_txn="" cleanup_ok=1 rollback_ok=1
+
+  # 1. WARP：先从配置移除，再删除账号。失败立即恢复配置与账号。
   echo ""
-  echo -e "${Y}==> 撤销节点防火墙端口...${N}"
-  local node port type cert_src
-  if [ -d "$NODES_DIR" ]; then
-    while IFS= read -r node; do
-      [ -n "$node" ] || continue
-      type=$(get_node_value "$node" Type 2>/dev/null || echo "$node")
-      port=$(get_node_value "$node" Port 2>/dev/null || true)
-      case "$type" in
-        reality)
-          [ -n "$port" ] && deny_port_in_firewall "$port" tcp
-          ;;
-        anytls)
-          [ -n "$port" ] && deny_port_in_firewall "$port" tcp
-          ;;
-        ss2022)
-          [ -n "$port" ] && deny_port_in_firewall "$port" tcp
-          ;;
-        hy2)
-          [ -n "$port" ] && deny_port_in_firewall "$port" udp
-          cert_src=$(get_node_value "$node" CertSource 2>/dev/null || true)
-          # ACME 模式安装时放行过 80/tcp；但 80 是公共端口（面板 / nginx 等也可能在用），
-          # 不自动撤销以免误伤同机其它 web 服务，仅提示用户按需自行处理
-          if [ "$cert_src" = "acme" ]; then
-            echo -e "  ${D}提示：此前为 ACME 放行过 80/tcp，如确认无其它服务使用可自行关闭${N}"
-          fi
-          # 端口跳跃范围撤销 ufw / firewalld 规则
-          local hop_v hop_start_v hop_end_v
-          hop_v=$(get_node_value "$node" PortHop 2>/dev/null || echo 0)
-          if [ "$hop_v" = "1" ]; then
-            hop_start_v=$(get_node_value "$node" PortHopStart 2>/dev/null || true)
-            hop_end_v=$(get_node_value "$node" PortHopEnd 2>/dev/null || true)
-            if [ -n "$hop_start_v" ] && [ -n "$hop_end_v" ]; then
-              case "$(detect_firewall_backend)" in
-                ufw)
-                  ufw delete allow "${hop_start_v}:${hop_end_v}/udp" >/dev/null 2>&1 || true
-                  ;;
-                firewalld)
-                  firewall-cmd --permanent --remove-port="${hop_start_v}-${hop_end_v}/udp" >/dev/null 2>&1 || true
-                  firewall-cmd --reload >/dev/null 2>&1 || true
-                  ;;
-              esac
-            fi
-          fi
-          ;;
-      esac
-    done < <(list_installed_nodes)
+  echo -e "${Y}==> 清理 WARP 分流与账号...${N}"
+  warp_cache_added=$(warp_managed_state_get CacheFileAdded 2>/dev/null || echo 0)
+  warp_cache_path=$(warp_managed_state_get CachePath 2>/dev/null || true)
+  if [ -f "$CONFIG_PATH" ] && { warp_config_has_outbound || warp_config_has_rule; }; then
+    txn=$(warp_transaction_begin) || { echo -e "${R}WARP 快照失败，卸载已中止${N}"; pause_screen; return 1; }
+    if ! warp_config_remove || ! config_check_and_restart; then
+      warp_transaction_rollback "$txn"
+      echo -e "${R}WARP 配置清理失败，已恢复原状态；卸载已中止${N}"
+      pause_screen
+      return 1
+    fi
+    warp_transaction_commit "$txn"
+  fi
+  if [ "$warp_cache_added" = "1" ] && [ -n "$warp_cache_path" ]; then
+    case "$warp_cache_path" in
+      /var/lib/sing-box/*|/var/cache/leyili/*) rm -f -- "$warp_cache_path" || rc=1 ;;
+    esac
+  fi
+  rm -f -- "$WARP_WGCF_BIN" || rc=1
+  rm -rf -- "$WARP_DIR" || rc=1
+
+  # 2. 逐个移除有状态记录的脚本节点；每个节点自身都是即时回滚事务。
+  echo -e "${Y}==> 清理脚本托管节点...${N}"
+  for node in reality hy2 anytls tuic ss2022; do
+    node_installed "$node" || continue
+    case "$node" in
+      reality) tag="reality-in"; ;;
+      hy2)     tag="hy2-in"; ;;
+      anytls)  tag="anytls-in"; ;;
+      tuic)    tag="tuic-in"; ;;
+      ss2022)  tag="ss2022-in"; ;;
+    esac
+    case "$node" in hy2|tuic) proto="udp" ;; *) proto="tcp" ;; esac
+    if ! uninstall_node_transaction "$node" "$tag" "$proto"; then
+      echo -e "${R}${node} 清理失败并已回滚，完整卸载已中止${N}"
+      pause_screen
+      return 1
+    fi
+  done
+
+  # 旧版可能遗失 .info；只删除脚本固定 tag，不碰其它 inbound。
+  if [ -f "$CONFIG_PATH" ]; then
+    ensure_jq || { pause_screen; return 1; }
+    txn=$(config_transaction_begin uninstall-orphans) \
+      || { echo -e "${R}配置快照失败，卸载已中止${N}"; pause_screen; return 1; }
+    for tag in reality-in hy2-in anytls-in tuic-in ss2022-in; do
+      if ! config_remove_inbound_by_tag "$tag"; then
+        config_transaction_rollback "$txn"
+        echo -e "${R}清理遗留 inbound 失败，已恢复原配置${N}"
+        pause_screen
+        return 1
+      fi
+    done
+    if ! post_uninstall_service_step; then
+      config_transaction_rollback "$txn"
+      echo -e "${R}sing-box 健康检查失败，已恢复原配置${N}"
+      pause_screen
+      return 1
+    fi
+    config_transaction_commit "$txn"
   fi
 
-  # 端口跳跃 iptables 链兜底清理
-  echo -e "${Y}==> 清理端口跳跃 iptables / ip6tables 规则...${N}"
-  port_hop_cleanup_all
-  ip4_save_rules >/dev/null 2>&1 || true
-  ip6_save_rules >/dev/null 2>&1 || true
+  # 3. 端口跳跃、脚本登记的 ufw/firewalld 端口、专属链。
+  # 整段只有操作前快照与失败即时恢复，不创建任何定时自动回滚任务。
+  echo -e "${Y}==> 清理脚本托管防火墙规则...${N}"
+  fw_owned_txn=$(mktemp -d "${TMPDIR:-/tmp}/leyili-fw-owned-uninstall.XXXXXX") \
+    || { echo -e "${R}防火墙所有权快照创建失败${N}"; pause_screen; return 1; }
+  chmod 700 "$fw_owned_txn" 2>/dev/null \
+    || { rm -rf -- "$fw_owned_txn"; echo -e "${R}防火墙所有权快照权限设置失败${N}"; pause_screen; return 1; }
+  if [ -f "$FIREWALL_PORT_STATE" ]; then
+    cp -a -- "$FIREWALL_PORT_STATE" "$fw_owned_txn/firewall-ports.state" \
+      || { rm -rf -- "$fw_owned_txn"; echo -e "${R}防火墙端口所有权快照失败${N}"; pause_screen; return 1; }
+    : > "$fw_owned_txn/firewall-ports.existed"
+  else
+    : > "$fw_owned_txn/firewall-ports.state"
+  fi
 
-  # 2. 停服 + 卸载 sing-box 软件包
+  if command -v iptables >/dev/null 2>&1; then
+    fw4_txn=$(firewall_transaction_begin 4) || {
+      rm -rf -- "$fw_owned_txn"
+      echo -e "${R}IPv4 防火墙快照失败，未修改任何规则${N}"
+      pause_screen
+      return 1
+    }
+  fi
+  if command -v ip6tables >/dev/null 2>&1; then
+    fw6_txn=$(firewall_transaction_begin 6) || {
+      [ -n "$fw4_txn" ] && firewall_transaction_commit "$fw4_txn"
+      rm -rf -- "$fw_owned_txn"
+      echo -e "${R}IPv6 防火墙快照失败，未修改任何规则${N}"
+      pause_screen
+      return 1
+    }
+  fi
+
+  port_hop_cleanup_all || cleanup_ok=0
+  if [ "$cleanup_ok" -eq 1 ]; then
+    firewall_remove_all_owned_ports || cleanup_ok=0
+  fi
+  if [ "$cleanup_ok" -eq 1 ] && firewall_managed_chain_exists 4; then
+    if ! iptables -P INPUT ACCEPT \
+       || ! firewall_remove_managed_chain 4 \
+       || ! ip4_save_rules; then
+      cleanup_ok=0
+    fi
+  fi
+  if [ "$cleanup_ok" -eq 1 ] && firewall_managed_chain_exists 6; then
+    if ! ip6tables -P INPUT ACCEPT \
+       || ! firewall_remove_managed_chain 6 \
+       || ! ip6_save_rules; then
+      cleanup_ok=0
+    fi
+  fi
+
+  if [ "$cleanup_ok" -ne 1 ]; then
+    firewall_owned_ports_restore "$fw_owned_txn/firewall-ports.state" \
+      "$fw_owned_txn/firewall-ports.existed" || rollback_ok=0
+    [ -n "$fw6_txn" ] && firewall_transaction_rollback 6 "$fw6_txn" || {
+      [ -z "$fw6_txn" ] || rollback_ok=0
+    }
+    [ -n "$fw4_txn" ] && firewall_transaction_rollback 4 "$fw4_txn" || {
+      [ -z "$fw4_txn" ] || rollback_ok=0
+    }
+    if [ "$rollback_ok" -eq 1 ]; then
+      rm -rf -- "$fw_owned_txn"
+      echo -e "${R}防火墙规则清理失败，已立即恢复操作前快照；完整卸载已中止${N}"
+    else
+      echo -e "${R}防火墙规则清理及回滚未完全成功，请立即检查；所有权快照保留在 ${fw_owned_txn}${N}"
+    fi
+    pause_screen
+    return 1
+  fi
+
+  if [ -n "$fw6_txn" ] && ! firewall_transaction_commit "$fw6_txn"; then rc=1; fi
+  if [ -n "$fw4_txn" ] && ! firewall_transaction_commit "$fw4_txn"; then rc=1; fi
+  rm -rf -- "$fw_owned_txn" || rc=1
+
+  # 4. 停服 + 卸载软件包。remove 不用 purge，避免包管理器删除用户配置。
   echo -e "${Y}==> 停止并禁用 sing-box 服务...${N}"
-  systemctl stop sing-box >/dev/null 2>&1 || true
-  systemctl disable sing-box >/dev/null 2>&1 || true
+  if systemctl is-active --quiet sing-box 2>/dev/null; then
+    systemctl stop sing-box >/dev/null 2>&1 || rc=1
+  fi
+  if systemctl is-enabled --quiet sing-box 2>/dev/null; then
+    systemctl disable sing-box >/dev/null 2>&1 || rc=1
+  fi
 
   echo -e "${Y}==> 卸载 sing-box 软件包...${N}"
-  apt-get remove --purge -y sing-box >/dev/null 2>&1 || true
+  if dpkg-query -W -f='${Status}' sing-box 2>/dev/null | grep -q 'install ok installed'; then
+    if ! DEBIAN_FRONTEND=noninteractive apt-get remove -y sing-box >/dev/null 2>&1; then
+      echo -e "${R}sing-box 软件包卸载失败；脚本本体已保留，便于重试${N}"
+      pause_screen
+      return 1
+    fi
+  fi
 
-  echo -e "${Y}==> 清理 /etc/sing-box（节点信息 / 证书 / 配置 / 备份）...${N}"
-  rm -rf /etc/sing-box
+  echo -e "${Y}==> 清理脚本节点信息、证书与自身生成的配置备份...${N}"
+  rm -f -- "$NODES_DIR/reality.info" "$NODES_DIR/hy2.info" "$NODES_DIR/anytls.info" \
+            "$NODES_DIR/tuic.info" "$NODES_DIR/ss2022.info" || rc=1
+  rm -f -- "$CERTS_DIR/hy2.crt" "$CERTS_DIR/hy2.key" \
+            "$CERTS_DIR/tuic.crt" "$CERTS_DIR/tuic.key" || rc=1
+  if [ -d "$(dirname -- "$CONFIG_PATH")" ]; then
+    find "$(dirname -- "$CONFIG_PATH")" -maxdepth 1 -type f \
+      \( -name 'config.json.bak.*' -o -name 'config.json.*.bak' \) -delete 2>/dev/null || rc=1
+  fi
+  [ -d "$NODES_DIR" ] && rmdir -- "$NODES_DIR" 2>/dev/null || true
+  [ -d "$CERTS_DIR" ] && rmdir -- "$CERTS_DIR" 2>/dev/null || true
+  [ -d /etc/sing-box ] && rmdir -- /etc/sing-box 2>/dev/null || true
 
-  echo -e "${Y}==> 清理 SagerNet APT 仓库与签名 key...${N}"
-  rm -f "$SAGERNET_SOURCES" "$SAGERNET_KEYRING"
-  DEBIAN_FRONTEND=noninteractive apt-get update -qq >/dev/null 2>&1 || true
+  echo -e "${Y}==> 清理脚本添加的 SagerNet APT 仓库与签名 key...${N}"
+  if ! sagernet_repo_restore; then
+    echo -e "${R}SagerNet 仓库文件恢复/清理失败${N}"
+    rc=1
+  fi
+  if ! DEBIAN_FRONTEND=noninteractive apt-get update -qq >/dev/null 2>&1; then
+    echo -e "  ${Y}APT 索引刷新失败，但仓库文件已移除；稍后可手动 apt-get update${N}"
+  fi
 
-  # 2.5 历史遗留组件清理（Realm 中转 / Xray 内核 / 流量统计已从本脚本移除，
-  #     这里兜底清掉旧版本装过的服务与数据，避免留下孤儿 unit）
+  # 5. 历史遗留：只处理脚本特征明确的 unit，不盲删用户自装的 realm。
   echo -e "${Y}==> 清理旧版遗留组件（Realm / Xray / 流量统计）...${N}"
   local legacy_u
-  for legacy_u in realm xray-leyili leyili-traffic.timer leyili-traffic; do
-    systemctl stop    "$legacy_u" >/dev/null 2>&1 || true
-    systemctl disable "$legacy_u" >/dev/null 2>&1 || true
+  for legacy_u in xray-leyili leyili-traffic.timer leyili-traffic; do
+    if systemctl is-active --quiet "$legacy_u" 2>/dev/null \
+       && ! systemctl stop "$legacy_u" >/dev/null 2>&1; then
+      rc=1
+    fi
+    if systemctl is-enabled --quiet "$legacy_u" 2>/dev/null \
+       && ! systemctl disable "$legacy_u" >/dev/null 2>&1; then
+      rc=1
+    fi
   done
-  rm -f /usr/local/bin/realm-bin /usr/local/bin/xray-leyili
-  rm -f /etc/systemd/system/realm.service \
+  if [ -f /etc/systemd/system/realm.service ] \
+     && grep -Fq '/usr/local/bin/realm-bin' /etc/systemd/system/realm.service; then
+    if systemctl is-active --quiet realm 2>/dev/null \
+       && ! systemctl stop realm >/dev/null 2>&1; then rc=1; fi
+    if systemctl is-enabled --quiet realm 2>/dev/null \
+       && ! systemctl disable realm >/dev/null 2>&1; then rc=1; fi
+    rm -f -- /etc/systemd/system/realm.service /usr/local/bin/realm-bin \
+              /etc/realm/config.toml || rc=1
+    [ -d /etc/realm ] && rmdir -- /etc/realm 2>/dev/null || true
+  fi
+  rm -f -- /usr/local/bin/xray-leyili \
         /etc/systemd/system/xray-leyili.service \
         /etc/systemd/system/leyili-traffic.service \
-        /etc/systemd/system/leyili-traffic.timer
-  rm -rf /etc/realm /etc/leyili/xray /etc/leyili/traffic
-  systemctl daemon-reload >/dev/null 2>&1 || true
+        /etc/systemd/system/leyili-traffic.timer || rc=1
+  rm -rf -- /etc/leyili/xray /etc/leyili/traffic || rc=1
+  systemctl daemon-reload >/dev/null 2>&1 || rc=1
 
-  # 3. 链路测评（目标 IP 记录 + 历史报告 + 脚本自装的 nexttrace）
+  # 6. 链路测评（独立命名文件，不碰用户自装 nexttrace）
   # NETBENCH_NEXTTRACE_BIN 是独立文件名，不会误删用户自装的 /usr/local/bin/nexttrace
   if [ -f "$NETBENCH_ENV_PATH" ] || [ -f "$NETBENCH_NEXTTRACE_BIN" ] || [ -n "$(_nb_latest_report)" ]; then
     echo -e "${Y}==> 清理链路测评数据与 nexttrace...${N}"
-    rm -f "$NETBENCH_ENV_PATH" "$NETBENCH_NEXTTRACE_BIN"
-    rm -f "${NETBENCH_REPORT_PREFIX}"-*.txt
+    rm -f -- "$NETBENCH_ENV_PATH" "$NETBENCH_NEXTTRACE_BIN" || rc=1
+    rm -f -- "${NETBENCH_REPORT_PREFIX}"-*.txt || rc=1
     [ -d /etc/leyili ] && rmdir --ignore-fail-on-non-empty /etc/leyili 2>/dev/null || true
   fi
 
-  # 4. 脚本痕迹
+  # 7. 只有前面全部完成才删除脚本本体；失败时保留入口方便重试。
   echo -e "${Y}==> 清理脚本本体与 legacy 信息文件...${N}"
-  rm -f "$INFO_PATH"
-  rm -f "$SCRIPT_PATH"
+  rm -f -- "$INFO_PATH" || rc=1
+
+  if [ "$rc" -ne 0 ]; then
+    echo ""
+    echo -e "${R}部分清理步骤失败，未删除 ${SCRIPT_PATH}；请检查上方信息后重试。${N}"
+    pause_screen
+    return 1
+  fi
+  if ! rm -f -- "$SCRIPT_PATH"; then
+    echo -e "${R}脚本入口删除失败：${SCRIPT_PATH}${N}"
+    pause_screen
+    return 1
+  fi
 
   echo ""
   echo -e "  ${G}╔══════════════════════════════════════════════════════╗${N}"
-  echo -e "  ${G}║${N}  ${B}${W}${APP_NAME}${N}  ${G}已彻底卸载${N}                                  ${G}║${N}"
+  echo -e "  ${G}║${N}  ${B}${W}${APP_NAME}${N}  ${G}脚本托管内容已卸载${N}                          ${G}║${N}"
   echo -e "  ${G}╚══════════════════════════════════════════════════════╝${N}"
+  if [ -f "$CONFIG_PATH" ] || [ -d /etc/sing-box ]; then
+    echo -e "  ${D}用户自定义的 /etc/sing-box 内容已保留。${N}"
+  fi
   exit 0
 }
 
@@ -10164,12 +12625,8 @@ upgrade_singbox_kernel(){
     echo ""
     echo -e "${R}sing-box 升级失败，请检查上方输出${N}"
     pause_screen
-  elif ! systemctl restart sing-box; then
-    echo ""
-    echo -e "${R}升级完成，但服务重启失败${N}"
-    pause_screen
   else
-    echo -e "${G}升级完成${N}"
+    echo -e "${G}升级完成，配置与服务健康检查已通过${N}"
     sleep 1
   fi
 }
@@ -10440,12 +12897,14 @@ show_node_manage_menu(){
     render_section_header "节点管理"
     render_menu_item 1 "创建节点 (Reality / Hysteria2 / AnyTLS / TUIC / SS-2022)"
     render_menu_item 2 "卸载单个节点"
+    render_menu_item 3 "查看状态 / 节点配置"
     render_menu_item 0 "返回上级"
     render_divider
     read -p "  请输入序号: " choice
     case $choice in
       1) show_node_install_menu ;;
       2) show_node_uninstall_menu ;;
+      3) show_status_menu ;;
       0) return ;;
       *) notify_invalid_choice ;;
     esac
@@ -10467,6 +12926,51 @@ warp_log_ok()   { echo -e "  ${G}✓${N} $*" >&2; }
 warp_log_info() { echo -e "  ${C}●${N} $*" >&2; }
 warp_log_warn() { echo -e "  ${Y}⚠${N} $*" >&2; }
 warp_log_err()  { echo -e "  ${R}✗${N} $*" >&2; }
+
+warp_transaction_begin(){
+  local txn
+  txn=$(config_transaction_begin warp) || return 1
+  if [ -d "$WARP_DIR" ]; then
+    cp -a -- "$WARP_DIR" "$txn/warp-dir" || { config_transaction_rollback "$txn"; return 1; }
+    : > "$txn/warp-dir.existed"
+  fi
+  if [ -f "$WARP_WGCF_BIN" ]; then
+    cp -a -- "$WARP_WGCF_BIN" "$txn/wgcf-bin" || { config_transaction_rollback "$txn"; return 1; }
+    : > "$txn/wgcf-bin.existed"
+  fi
+  printf '%s' "$txn"
+}
+
+warp_transaction_rollback(){
+  local txn="$1" rc=0
+  [ -d "$txn" ] || return 1
+  config_transaction_restore "$txn" || rc=1
+
+  if ! rm -rf -- "$WARP_DIR"; then
+    rc=1
+  elif [ -f "$txn/warp-dir.existed" ]; then
+    if ! mkdir -p -- "$(dirname -- "$WARP_DIR")" \
+       || ! cp -a -- "$txn/warp-dir" "$WARP_DIR"; then
+      rc=1
+    fi
+  fi
+  if [ -f "$txn/wgcf-bin.existed" ]; then
+    if ! restore_file_snapshot "$txn/wgcf-bin" "$WARP_WGCF_BIN"; then
+      rc=1
+    fi
+  else
+    rm -f -- "$WARP_WGCF_BIN" || rc=1
+  fi
+  if [ "$rc" -eq 0 ]; then
+    rm -rf -- "$txn" || rc=1
+  fi
+  [ "$rc" -eq 0 ] || warp_log_err "WARP 事务回滚有步骤失败，请检查账号与 sing-box 配置；快照保留在 ${txn}"
+  return "$rc"
+}
+
+warp_transaction_commit(){
+  config_transaction_commit "$1"
+}
 
 # ── 账号注册：curl 直连 Cloudflare API（wgcf 方案已废弃）──────────────
 # 旧版用 wgcf 二进制：要从 GitHub API 拿版本再下 release（VPS 上极易被限流/
@@ -10499,13 +13003,27 @@ warp_gen_keypair(){
   printf '%s %s\n' "$priv" "$pub"
 }
 
+warp_account_valid(){
+  [ -s "$WARP_ACCOUNT_JSON" ] || return 1
+  jq -e '
+    (.private_key | type == "string" and length > 0)
+    and (.config.interface.addresses.v4 | type == "string" and length > 0)
+    and (.config.peers[0].public_key | type == "string" and length > 0)
+  ' "$WARP_ACCOUNT_JSON" >/dev/null 2>&1
+}
+
 warp_register_account(){
-  mkdir -p "$WARP_DIR"
-  chmod 700 "$WARP_DIR" 2>/dev/null || true
-  if [ -s "$WARP_ACCOUNT_JSON" ]; then
+  local force="${1:-0}"
+  mkdir -p "$WARP_DIR" || return 1
+  chmod 700 "$WARP_DIR" || return 1
+  ensure_jq || return 1
+  if [ -s "$WARP_ACCOUNT_JSON" ] && [ "$force" != "1" ]; then
+    if ! warp_account_valid; then
+      warp_log_err "现有 account.json 无效，已拒绝覆盖；请使用“重新注册账号”"
+      return 1
+    fi
     return 0
   fi
-  ensure_jq || return 1
 
   local priv pub
   read -r priv pub <<< "$(warp_gen_keypair)"
@@ -10513,7 +13031,7 @@ warp_register_account(){
     return 1
   fi
 
-  local install_id fcm_token body resp try
+  local install_id fcm_token body resp try tmp
   install_id=$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 22)
   fcm_token="${install_id}:APA91b$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 134)"
   body=$(jq -nc --arg key "$pub" --arg iid "$install_id" --arg fcm "$fcm_token" \
@@ -10524,7 +13042,7 @@ warp_register_account(){
   warp_log_info "向 Cloudflare 注册 WARP 账号（直连 API，不下载任何二进制）..."
   resp=""
   for try in 1 2 3 4 5 6; do
-    resp=$(curl -sL --tlsv1.2 --max-time 20 -X POST "${WARP_API_BASE}/reg" \
+    resp=$(curl --proto '=https' --proto-redir '=https' -sL --tlsv1.2 --max-time 20 -X POST "${WARP_API_BASE}/reg" \
       -H "User-Agent: ${WARP_API_UA}" \
       -H "CF-Client-Version: ${WARP_API_CLIENT_VER}" \
       -H 'Content-Type: application/json' \
@@ -10547,26 +13065,33 @@ warp_register_account(){
   fi
 
   # 兼容有无 .result 包裹两种返回，并把我们自己的私钥合进去一起落盘
+  tmp=$(mktemp "${WARP_ACCOUNT_JSON}.tmp.XXXXXX") || return 1
   if ! printf '%s' "$resp" | jq --arg pk "$priv" '(.result // .) + {private_key: $pk}' \
-       > "$WARP_ACCOUNT_JSON" 2>/dev/null; then
+       > "$tmp" 2>/dev/null \
+     || ! jq -e '
+          (.private_key | type == "string" and length > 0)
+          and (.config.interface.addresses.v4 | type == "string" and length > 0)
+          and (.config.peers[0].public_key | type == "string" and length > 0)
+        ' "$tmp" >/dev/null 2>&1; then
     warp_log_err "写入 ${WARP_ACCOUNT_JSON} 失败"
-    rm -f "$WARP_ACCOUNT_JSON"
+    rm -f -- "$tmp"
     return 1
   fi
-  chmod 600 "$WARP_ACCOUNT_JSON" 2>/dev/null || true
+  chmod 600 "$tmp" || { rm -f -- "$tmp"; return 1; }
+  mv -f -- "$tmp" "$WARP_ACCOUNT_JSON" || { rm -f -- "$tmp"; return 1; }
   warp_log_ok "WARP 账号已注册：${WARP_ACCOUNT_JSON}"
 }
 
 warp_reregister_account(){
-  # 连旧版 wgcf 的残留一起清，保证走新注册链路
-  rm -f "$WARP_ACCOUNT_JSON" "${WARP_DIR}/wgcf-account.toml" "${WARP_DIR}/wgcf-profile.conf"
-  warp_register_account
+  # 新账号先原子落盘；失败时旧 account.json 保持不变。
+  warp_register_account 1 || return 1
+  rm -f -- "${WARP_DIR}/wgcf-account.toml" "${WARP_DIR}/wgcf-profile.conf"
 }
 
-# 解析 account.json，输出 KEY='VALUE' 行供 eval 使用。
+# 解析 account.json，直接写入调用者作用域中的 WARP_* 变量，避免 eval。
 # WARP_RESERVED 为 client_id base64 解码出的 3 字节（逗号分隔），注入
 # endpoint.peers[].reserved；解不出时回退 0,0,0 并靠端点优选兜底
-warp_parse_profile(){
+warp_load_profile(){
   local f="$WARP_ACCOUNT_JSON"
   if [ ! -s "$f" ]; then
     if [ -f "${WARP_DIR}/wgcf-profile.conf" ]; then
@@ -10577,13 +13102,18 @@ warp_parse_profile(){
     return 1
   fi
   ensure_jq || return 1
-  local pk v4 v6 peerpk cid reserved
+  local pk v4 v6 peerpk cid reserved v4_plain v6_plain
   pk=$(jq -r '.private_key // empty' "$f" 2>/dev/null)
   v4=$(jq -r '.config.interface.addresses.v4 // empty' "$f" 2>/dev/null)
   v6=$(jq -r '.config.interface.addresses.v6 // empty' "$f" 2>/dev/null)
   peerpk=$(jq -r '.config.peers[0].public_key // empty' "$f" 2>/dev/null)
   cid=$(jq -r '.config.client_id // empty' "$f" 2>/dev/null)
-  if [ -z "$pk" ] || [ -z "$v4" ]; then
+  v4_plain="${v4%%/*}"
+  v6_plain="${v6%%/*}"
+  if [ -z "$pk" ] || [ -z "$v4" ] \
+     || ! printf '%s' "$pk" | grep -Eq '^[A-Za-z0-9+/]{43}=$' \
+     || ! is_valid_ipv4 "$v4_plain" \
+     || { [ -n "$v6" ] && ! is_valid_ipv6_text "$v6_plain"; }; then
     warp_log_err "解析 account.json 失败（缺 private_key 或 v4 地址），请「重新注册」"
     return 1
   fi
@@ -10596,11 +13126,11 @@ warp_parse_profile(){
       | awk 'NF >= 3 {printf "%d,%d,%d", $1, $2, $3; exit}')
   fi
   [ -n "$reserved" ] || reserved="0,0,0"
-  printf "WARP_PRIVATE_KEY='%s'\n" "$pk"
-  printf "WARP_LOCAL_V4='%s'\n"    "$v4"
-  printf "WARP_LOCAL_V6='%s'\n"    "$v6"
-  printf "WARP_PEER_PK='%s'\n"     "${peerpk:-$WARP_PEER_PUBLIC_KEY}"
-  printf "WARP_RESERVED='%s'\n"    "$reserved"
+  WARP_PRIVATE_KEY="$pk"
+  WARP_LOCAL_V4="$v4"
+  WARP_LOCAL_V6="$v6"
+  WARP_PEER_PK="${peerpk:-$WARP_PEER_PUBLIC_KEY}"
+  WARP_RESERVED="$reserved"
 }
 
 # sing-box 版本护栏：endpoints 需 1.11+，本模块骨架用的新版 DNS/route 字段
@@ -10626,7 +13156,7 @@ warp_jq_apply(){
   local jq_filter="$1"
   shift
   local tmp
-  tmp=$(mktemp) || return 1
+  tmp=$(mktemp "${CONFIG_PATH}.tmp.XXXXXX") || return 1
   if ! jq "$@" "$jq_filter" "$CONFIG_PATH" > "$tmp" 2>/dev/null; then
     rm -f "$tmp"
     return 1
@@ -10637,7 +13167,8 @@ warp_jq_apply(){
     rm -f "$tmp"
     return 1
   fi
-  mv "$tmp" "$CONFIG_PATH"
+  chmod 600 "$tmp" || { rm -f -- "$tmp"; return 1; }
+  mv -f -- "$tmp" "$CONFIG_PATH"
 }
 
 # 读当前配置里 WARP endpoint 实际使用的 host port（没有则回退默认值）
@@ -10655,10 +13186,38 @@ warp_current_endpoint(){
   esac
 }
 
+warp_managed_state_get(){
+  local key="$1"
+  [ -f "$WARP_MANAGED_STATE" ] || return 1
+  grep -m1 "^${key}=" "$WARP_MANAGED_STATE" | cut -d= -f2-
+}
+
+warp_capture_managed_state(){
+  local tmp cache_added=0 cache_path=""
+  [ -f "$WARP_MANAGED_STATE" ] && return 0
+  mkdir -p -- "$WARP_DIR" || return 1
+  chmod 700 "$WARP_DIR" || return 1
+
+  if jq -e '.experimental.cache_file != null' "$CONFIG_PATH" >/dev/null 2>&1; then
+    cache_path=$(jq -r '.experimental.cache_file.path // empty' "$CONFIG_PATH" 2>/dev/null)
+  else
+    cache_added=1
+    cache_path="$WARP_CACHE_DEFAULT"
+  fi
+  tmp=$(mktemp "${WARP_MANAGED_STATE}.tmp.XXXXXX") || return 1
+  if ! printf 'CacheFileAdded=%s\nCachePath=%s\n' "$cache_added" "$cache_path" > "$tmp"; then
+    rm -f -- "$tmp"
+    return 1
+  fi
+  chmod 600 "$tmp" || { rm -f -- "$tmp"; return 1; }
+  mv -f -- "$tmp" "$WARP_MANAGED_STATE"
+}
+
 warp_config_inject(){
   local v4="$1" v6="$2" pk="$3" peerpk="${4:-$WARP_PEER_PUBLIC_KEY}" reserved="${5:-0,0,0}"
   ensure_jq || return 1
   [ -f "$CONFIG_PATH" ] || { warp_log_err "config.json 不存在：$CONFIG_PATH"; return 1; }
+  warp_capture_managed_state || return 1
   # 骨架兜底：保证 dns local 解析器 + route.default_domain_resolver 存在
   # （WireGuard endpoint 是用户态网络栈，拨域名必须有内部解析器，否则命中规则的流量全断）
   config_ensure_skeleton || return 1
@@ -10675,6 +13234,9 @@ warp_config_inject(){
 
   warp_log_info "注入 WARP endpoint / 规则集 / 路由规则..."
   warp_jq_apply '
+      def owned_sniff:
+        ((.action // "") == "sniff")
+        and (((.inbound // []) | sort) == (($sniff_inbounds | fromjson) | sort));
       .endpoints = ((.endpoints // []) | map(select(.tag != $tag)))
         + [{
             "type": "wireguard",
@@ -10711,8 +13273,8 @@ warp_config_inject(){
             "update_interval": "168h0m0s"
           }]
     | .route.rules = (
-        [{"action": "sniff"}]
-        + ((.route.rules // []) | map(select(((.outbound // "") != $tag) and ((.action // "") != "sniff"))))
+        [{"inbound": ($sniff_inbounds | fromjson), "action": "sniff"}]
+        + ((.route.rules // []) | map(select(((.outbound // "") != $tag) and (owned_sniff | not))))
         + [{"rule_set": [$rs, $rsyt], "outbound": $tag}]
       )
     | .experimental = (.experimental // {})
@@ -10729,21 +13291,42 @@ warp_config_inject(){
     --arg pk      "$pk" \
     --arg peerpk  "$peerpk" \
     --arg reserved "$reserved" \
+    --arg sniff_inbounds "$WARP_SNIFF_INBOUNDS_JSON" \
     --arg addrs   "$addr_json"
 }
 
 warp_config_remove(){
+  local remove_cache="0" cache_path=""
   ensure_jq || return 1
   [ -f "$CONFIG_PATH" ] || return 0
-  warp_jq_apply '
+  remove_cache=$(warp_managed_state_get CacheFileAdded 2>/dev/null || echo 0)
+  cache_path=$(warp_managed_state_get CachePath 2>/dev/null || true)
+  if ! warp_jq_apply '
+      def owned_sniff:
+        ((.action // "") == "sniff")
+        and (((.inbound // []) | sort) == (($sniff_inbounds | fromjson) | sort));
       .endpoints = ((.endpoints // []) | map(select(.tag != $tag)))
     | .route = (.route // {})
     | .route.rule_set = ((.route.rule_set // []) | map(select(.tag != $rs and .tag != $rsyt)))
-    | .route.rules = ((.route.rules // []) | map(select(((.outbound // "") != $tag) and ((.action // "") != "sniff"))))
+    | .route.rules = ((.route.rules // []) | map(select(((.outbound // "") != $tag) and (owned_sniff | not))))
+    | if $remove_cache == "1" then .experimental |= del(.cache_file) else . end
+    | if .experimental == {} then del(.experimental) else . end
   ' \
     --arg tag  "$WARP_OUTBOUND_TAG" \
     --arg rs   "$WARP_RULESET_TAG" \
-    --arg rsyt "$WARP_RULESET_TAG_YT"
+    --arg rsyt "$WARP_RULESET_TAG_YT" \
+    --arg sniff_inbounds "$WARP_SNIFF_INBOUNDS_JSON" \
+    --arg remove_cache "$remove_cache"; then
+    return 1
+  fi
+  if [ "$remove_cache" = "1" ] && [ -n "$cache_path" ]; then
+    case "$cache_path" in
+      /var/lib/sing-box/*|/var/cache/leyili/*)
+        rm -f -- "$cache_path" || return 1
+        ;;
+    esac
+  fi
+  rm -f -- "$WARP_MANAGED_STATE"
 }
 
 warp_config_has_outbound(){
@@ -10774,24 +13357,33 @@ warp_do_install(){
   echo ""
 
   warp_require_singbox_112 || { pause_screen; return 1; }
-  warp_register_account    || { pause_screen; return 1; }
 
-  local kv
-  kv=$(warp_parse_profile) || { pause_screen; return 1; }
-  eval "$kv"
+  local txn WARP_PRIVATE_KEY WARP_LOCAL_V4 WARP_LOCAL_V6 WARP_PEER_PK WARP_RESERVED
+  txn=$(warp_transaction_begin) || { warp_log_err "WARP 事务快照失败"; pause_screen; return 1; }
+  if ! warp_register_account || ! warp_load_profile; then
+    warp_transaction_rollback "$txn"
+    pause_screen
+    return 1
+  fi
 
-  warp_config_inject "$WARP_LOCAL_V4" "$WARP_LOCAL_V6" "$WARP_PRIVATE_KEY" "$WARP_PEER_PK" "$WARP_RESERVED" \
-    || { warp_log_err "写入 sing-box 配置失败"; pause_screen; return 1; }
+  if ! warp_config_inject "$WARP_LOCAL_V4" "$WARP_LOCAL_V6" "$WARP_PRIVATE_KEY" "$WARP_PEER_PK" "$WARP_RESERVED"; then
+    warp_transaction_rollback "$txn"
+    warp_log_err "写入 sing-box 配置失败，已恢复原状态"
+    pause_screen
+    return 1
+  fi
   warp_log_ok "sing-box 配置已更新"
 
   warp_log_info "重启 sing-box..."
   if config_check_and_restart; then
     warp_log_ok "sing-box 已重启，WARP 分流生效"
   else
-    warp_log_err "sing-box 重启失败，请用 journalctl -u sing-box 查看"
+    warp_transaction_rollback "$txn"
+    warp_log_err "sing-box 重启失败，已恢复原账号与配置"
     pause_screen
     return 1
   fi
+  warp_transaction_commit "$txn"
 
   echo ""
   warp_do_test
@@ -10806,40 +13398,56 @@ warp_do_uninstall(){
   read -r -p "  确认卸载？[y/N]: " yn
   case "$yn" in [yY]*) ;; *) return ;; esac
 
-  warp_config_remove || { warp_log_err "移除失败"; pause_screen; return 1; }
-  config_check_and_restart >/dev/null 2>&1 || true
-  warp_log_ok "已从 sing-box 配置中移除 WARP"
-
   read -r -p "  是否同时删除账号目录 ${WARP_DIR}（含 account.json 与旧版 wgcf 残留）？[y/N]: " yn2
+
+  local txn
+  txn=$(warp_transaction_begin) || { warp_log_err "WARP 事务快照失败"; pause_screen; return 1; }
+  if ! warp_config_remove || ! config_check_and_restart; then
+    warp_transaction_rollback "$txn"
+    warp_log_err "移除失败，已恢复原配置"
+    pause_screen
+    return 1
+  fi
   case "$yn2" in
     [yY]*)
-      rm -f "$WARP_WGCF_BIN"
-      rm -rf "$WARP_DIR"
-      warp_log_ok "账号文件与旧版 wgcf 残留已清理"
+      if ! rm -f -- "$WARP_WGCF_BIN" || ! rm -rf -- "$WARP_DIR"; then
+        warp_transaction_rollback "$txn"
+        warp_log_err "账号文件清理失败，已恢复原状态"
+        pause_screen
+        return 1
+      fi
       ;;
   esac
+  warp_transaction_commit "$txn"
+  warp_log_ok "已从 sing-box 配置中移除 WARP"
+  case "$yn2" in [yY]*) warp_log_ok "账号文件与旧版 wgcf 残留已清理" ;; esac
   pause_screen
 }
 
 warp_do_reregister(){
   require_root || return 1
+  require_singbox_installed || return 1
+  ensure_jq || return 1
   render_section_header "${WARP_APP_NAME} - 重新注册账号"
   echo -e "  ${D}用途：当前 WARP IP 仍被识别为中国，或握手异常时使用${N}"
-  echo -e "  ${D}流程：删旧账号 → 重新 register → 重新写 sing-box 配置 → 重启 sing-box${N}"
+  echo -e "  ${D}流程：原子生成新账号 → 重新写配置 → 健康检查；失败自动恢复旧账号${N}"
   echo ""
   read -r -p "  确认重新注册？[y/N]: " yn
   case "$yn" in [yY]*) ;; *) return ;; esac
 
-  warp_reregister_account || { pause_screen; return 1; }
-
-  local kv
-  kv=$(warp_parse_profile) || { pause_screen; return 1; }
-  eval "$kv"
-
-  warp_config_inject "$WARP_LOCAL_V4" "$WARP_LOCAL_V6" "$WARP_PRIVATE_KEY" "$WARP_PEER_PK" "$WARP_RESERVED" \
-    || { pause_screen; return 1; }
-  config_check_and_restart && warp_log_ok "完成，已切到新的 WARP 账号" \
-                          || warp_log_err "sing-box 重启失败"
+  local txn WARP_PRIVATE_KEY WARP_LOCAL_V4 WARP_LOCAL_V6 WARP_PEER_PK WARP_RESERVED
+  txn=$(warp_transaction_begin) || { warp_log_err "WARP 事务快照失败"; pause_screen; return 1; }
+  if ! warp_reregister_account \
+     || ! warp_load_profile \
+     || ! warp_config_inject "$WARP_LOCAL_V4" "$WARP_LOCAL_V6" "$WARP_PRIVATE_KEY" "$WARP_PEER_PK" "$WARP_RESERVED" \
+     || ! config_check_and_restart; then
+    warp_transaction_rollback "$txn"
+    warp_log_err "重新注册失败，已恢复旧账号与配置"
+    pause_screen
+    return 1
+  fi
+  warp_transaction_commit "$txn"
+  warp_log_ok "完成，已切到新的 WARP 账号"
   pause_screen
 }
 
@@ -10896,10 +13504,8 @@ warp_do_status(){
 # 注意：与主进程共用同一 WARP 账号，并发握手会漂移，测试期间主配置分流可能短暂中断。
 warp_probe_via_tunnel(){
   local host="$1" port="$2"
-  local kv
-  kv=$(warp_parse_profile) || return 1
   local WARP_PRIVATE_KEY WARP_LOCAL_V4 WARP_LOCAL_V6 WARP_PEER_PK WARP_RESERVED
-  eval "$kv"
+  warp_load_profile || return 1
 
   local addr_json
   if [ -n "$WARP_LOCAL_V6" ]; then
@@ -11026,27 +13632,33 @@ warp_do_endpoint_pick(){
   echo -e "  ${D}测试期间 WARP 分流可能短暂中断，完成后自动恢复${N}"
   echo ""
 
-  local cand host port trace
+  local cand host port trace txn
   for cand in $WARP_ENDPOINT_CANDIDATES; do
     host="${cand%:*}"
     port="${cand##*:}"
     warp_log_info "测试 ${cand} ..."
     if trace=$(warp_probe_via_tunnel "$host" "$port"); then
       warp_log_ok "可用：${cand}"
+      txn=$(warp_transaction_begin) || { warp_log_err "WARP 事务快照失败"; pause_screen; return 1; }
       if ! warp_jq_apply '
           .endpoints = ((.endpoints // []) | map(
             if .tag == $tag
             then (.peers[0].address = $host | .peers[0].port = ($port | tonumber))
             else . end))
         ' --arg tag "$WARP_OUTBOUND_TAG" --arg host "$host" --arg port "$port"; then
-        warp_log_err "写入配置失败"
+        warp_transaction_rollback "$txn"
+        warp_log_err "写入配置失败，已恢复原端点"
         pause_screen
         return 1
       fi
       if config_check_and_restart; then
+        warp_transaction_commit "$txn"
         warp_log_ok "已切换端点为 ${cand} 并重启 sing-box"
       else
-        warp_log_err "sing-box 重启失败，请用 journalctl -u sing-box 查看"
+        warp_transaction_rollback "$txn"
+        warp_log_err "sing-box 重启失败，已恢复原端点"
+        pause_screen
+        return 1
       fi
       pause_screen
       return 0
@@ -11064,6 +13676,8 @@ warp_do_endpoint_pick(){
 # 适用：老版本装的 WARP（缺 YouTube 规则集、缺域名嗅探、缺 DNS 解析器）升级修复
 warp_do_reinject(){
   require_root || return 1
+  require_singbox_installed || return 1
+  ensure_jq || return 1
   render_section_header "${WARP_APP_NAME} - 重新注入分流规则"
   echo -e "  ${D}用途：升级旧配置（补 YouTube 规则集 / 域名嗅探 / DNS 解析器 / reserved 字段）或修复被改坏的规则${N}"
   echo -e "  ${D}不改 WARP 账号，不改已优选的端点${N}"
@@ -11071,14 +13685,18 @@ warp_do_reinject(){
 
   warp_require_singbox_112 || { pause_screen; return 1; }
 
-  local kv
-  kv=$(warp_parse_profile) || { pause_screen; return 1; }
-  eval "$kv"
-
-  warp_config_inject "$WARP_LOCAL_V4" "$WARP_LOCAL_V6" "$WARP_PRIVATE_KEY" "$WARP_PEER_PK" "$WARP_RESERVED" \
-    || { pause_screen; return 1; }
-  config_check_and_restart && warp_log_ok "规则已重新注入，sing-box 已重启" \
-                          || warp_log_err "sing-box 重启失败，请用 journalctl -u sing-box 查看"
+  local txn WARP_PRIVATE_KEY WARP_LOCAL_V4 WARP_LOCAL_V6 WARP_PEER_PK WARP_RESERVED
+  warp_load_profile || { pause_screen; return 1; }
+  txn=$(warp_transaction_begin) || { warp_log_err "WARP 事务快照失败"; pause_screen; return 1; }
+  if ! warp_config_inject "$WARP_LOCAL_V4" "$WARP_LOCAL_V6" "$WARP_PRIVATE_KEY" "$WARP_PEER_PK" "$WARP_RESERVED" \
+     || ! config_check_and_restart; then
+    warp_transaction_rollback "$txn"
+    warp_log_err "重新注入失败，已恢复原配置"
+    pause_screen
+    return 1
+  fi
+  warp_transaction_commit "$txn"
+  warp_log_ok "规则已重新注入，sing-box 已重启"
   pause_screen
 }
 
@@ -11399,7 +14017,7 @@ show_menu(){
     render_menu_item 1 "管理员设置"
     render_menu_item 2 "系统基础设置"
     render_menu_item 3 "${main_action_label}"
-    render_menu_item 4 "查看状态"
+    render_menu_item 4 "网络管理"
     render_menu_item 5 "防火墙管理"
     render_menu_item 6 "卸载脚本"
     render_menu_item 7 "更新管理"
@@ -11422,7 +14040,7 @@ show_menu(){
         fi
         ;;
       4)
-        show_status_menu
+        show_network_menu
         ;;
       5)
         show_firewall_menu
@@ -11442,13 +14060,16 @@ show_menu(){
     esac
   done
 }
-
 # ─── 入口判断 ─────────────────────────────────────────
-if [ "${LEYILI_ALLOW_ANY_DISTRO:-0}" != "1" ]; then
-  if ! require_debian_family; then
+# 测试只加载函数时设置 LEYILI_SOURCE_ONLY=1，不执行菜单、写入口或获取全局锁。
+if [ "${LEYILI_SOURCE_ONLY:-0}" != "1" ]; then
+  if [ "${LEYILI_ALLOW_ANY_DISTRO:-0}" != "1" ] && ! require_debian_family; then
     exit 1
   fi
-fi
-register_sb_command || true
+  if ! acquire_global_lock; then
+    exit 1
+  fi
+  register_sb_command || true
 
-show_menu
+  show_menu
+fi

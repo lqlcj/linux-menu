@@ -1,7 +1,7 @@
 modify_ss2022_params(){
   local new_port="" new_method="" new_tag=""
   local cur_port cur_method cur_tag cur_password regen_choice
-  local backup_path="" confirm new_password=""
+  local backup_path="" confirm new_password="" txn=""
 
   if ! require_root; then return 1; fi
   if ! require_singbox_installed; then return 1; fi
@@ -97,15 +97,22 @@ modify_ss2022_params(){
     return 0
   fi
 
+  ensure_jq || { pause_screen; return 1; }
+  txn=$(node_transaction_begin ss2022) || { echo -e "${R}节点事务快照失败${N}"; pause_screen; return 1; }
   backup_path="${CONFIG_PATH}.bak.$(date +%Y%m%d-%H%M%S)"
-  cp "$CONFIG_PATH" "$backup_path" 2>/dev/null || true
+  if ! cp "$CONFIG_PATH" "$backup_path"; then
+    node_transaction_rollback "$txn"
+    echo -e "${R}配置备份失败${N}"
+    pause_screen
+    return 1
+  fi
 
   local cur_listen cur_mode
   cur_listen=$(get_node_value ss2022 ListenAddr 2>/dev/null || echo "0.0.0.0")
   cur_mode=$(get_node_value ss2022 Mode 2>/dev/null || echo ipv4)
 
   local inbound_json
-  inbound_json=$(jq -n \
+  if ! inbound_json=$(jq -n \
     --arg listen "$cur_listen" \
     --argjson port "$new_port" \
     --arg method "$new_method" \
@@ -117,39 +124,62 @@ modify_ss2022_params(){
       network: "tcp",
       method: $method,
       password: $password
-    }')
-
-  if ! config_add_inbound "$inbound_json"; then
-    echo -e "${R}写入 inbound 失败，已保留备份: $backup_path${N}"
+    }'); then
+    node_transaction_rollback "$txn"
+    echo -e "${R}节点配置生成失败，已完整回滚${N}"
     pause_screen
     return 1
   fi
 
-  if ! config_check_and_restart; then
-    echo -e "${R}sing-box 校验或重启失败，正在回滚...${N}"
-    cp "$backup_path" "$CONFIG_PATH" 2>/dev/null || true
-    systemctl restart sing-box >/dev/null 2>&1 || true
+  if ! config_add_inbound "$inbound_json"; then
+    node_transaction_rollback "$txn"
+    echo -e "${R}写入 inbound 失败，已完整回滚${N}"
+    pause_screen
+    return 1
+  fi
+
+  if ! config_check_and_restart "$new_port" tcp; then
+    node_transaction_rollback "$txn"
+    echo -e "${R}sing-box 校验或健康检查失败，已完整回滚${N}"
     pause_screen
     return 1
   fi
 
   # 端口变化时同步防火墙
   if [ "$new_port" != "$cur_port" ]; then
-    node_revoke_firewall_for_mode "$cur_port" tcp "$cur_mode"
-    node_apply_firewall_for_mode "$new_port" tcp "$cur_mode"
+    if ! node_revoke_firewall_for_mode "$cur_port" tcp "$cur_mode" \
+       || ! node_apply_firewall_for_mode "$new_port" tcp "$cur_mode"; then
+      node_transaction_rollback "$txn"
+      echo -e "${R}防火墙端口切换失败，已完整回滚${N}"
+      pause_screen
+      return 1
+    fi
     print_firewall_hint "$new_port" tcp "Shadowsocks-2022 节点入站"
   fi
 
-  set_node_value ss2022 Port "$new_port"
-  set_node_value ss2022 Method "$new_method"
-  set_node_value ss2022 Tag "$new_tag"
-  set_node_value ss2022 Password "$new_password"
+  if ! set_node_value ss2022 Port "$new_port" \
+     || ! set_node_value ss2022 Method "$new_method" \
+     || ! set_node_value ss2022 Tag "$new_tag" \
+     || ! set_node_value ss2022 Password "$new_password"; then
+    node_transaction_rollback "$txn"
+    echo -e "${R}节点信息保存失败，已完整回滚${N}"
+    pause_screen
+    return 1
+  fi
 
   local cur_ip new_link ipv6_new_link
   cur_ip=$(get_node_value ss2022 IP 2>/dev/null || true)
   new_link=$(build_ss2022_link "$new_method" "$new_password" "$cur_ip" "$new_port" "$new_tag" 2>/dev/null || true)
   ipv6_new_link=$(build_dualstack_ipv6_link_for_node ss2022 2>/dev/null || true)
-  [ -n "$new_link" ] && set_node_value ss2022 Link "$new_link"
+  if [ -n "$new_link" ] && ! set_node_value ss2022 Link "$new_link"; then
+    node_transaction_rollback "$txn"
+    echo -e "${R}客户端链接保存失败，已完整回滚${N}"
+    pause_screen
+    return 1
+  fi
+  node_transaction_commit "$txn"
+  cleanup_old_backups "${CONFIG_PATH}.bak.*" 5 \
+    || echo -e "${Y}旧配置备份自动清理失败，可稍后从备份菜单处理${N}"
 
   echo ""
   echo -e "  ${G}修改完成${N}"
@@ -172,7 +202,7 @@ modify_ss2022_params(){
 
 modify_anytls_params(){
   local new_port="" new_sni="" new_pw="" new_tag=""
-  local cur_port cur_sni cur_pw cur_tag backup_path="" confirm
+  local cur_port cur_sni cur_pw cur_tag backup_path="" confirm txn=""
 
   if ! require_root; then return 1; fi
   if ! require_singbox_installed; then return 1; fi
@@ -207,6 +237,14 @@ modify_anytls_params(){
       continue
     fi
     new_port=$((10#$new_port))
+    if [ "$new_port" != "$cur_port" ] && check_port_in_use "$new_port" tcp; then
+      local force_port=""
+      echo -e "${R}端口 ${new_port} 已被其他 TCP 服务占用${N}"
+      read -p "  仍然使用此端口？(y/N): " force_port
+      if [ "$force_port" != "y" ] && [ "$force_port" != "Y" ]; then
+        continue
+      fi
+    fi
     break
   done
 
@@ -255,11 +293,17 @@ modify_anytls_params(){
     return 0
   fi
 
-  # 备份配置
-  backup_path="${CONFIG_PATH}.$(date +%Y%m%d-%H%M%S).bak"
-  cp "$CONFIG_PATH" "$backup_path" 2>/dev/null || true
-
   ensure_jq || { pause_screen; return 1; }
+  txn=$(node_transaction_begin anytls) || { echo -e "${R}节点事务快照失败${N}"; pause_screen; return 1; }
+
+  # 备份配置
+  backup_path="${CONFIG_PATH}.bak.$(date +%Y%m%d-%H%M%S)"
+  if ! cp "$CONFIG_PATH" "$backup_path"; then
+    node_transaction_rollback "$txn"
+    echo -e "${R}配置备份失败${N}"
+    pause_screen
+    return 1
+  fi
 
   local tmp jq_filter
   tmp=$(mktemp)
@@ -273,15 +317,22 @@ modify_anytls_params(){
           --arg sni "$new_sni" \
           --arg pw "$new_pw" \
           "$jq_filter" "$CONFIG_PATH" > "$tmp" 2>/dev/null; then
-    echo -e "${R}配置写入失败（jq 过滤错误）${N}"
+    node_transaction_rollback "$txn"
+    echo -e "${R}配置写入失败，已完整回滚${N}"
     pause_screen
     return 1
   fi
-  mv "$tmp" "$CONFIG_PATH"
+  if ! mv "$tmp" "$CONFIG_PATH"; then
+    node_transaction_rollback "$txn"
+    echo -e "${R}配置替换失败，已完整回滚${N}"
+    pause_screen
+    return 1
+  fi
 
-  if ! config_check_and_restart; then
+  if ! config_check_and_restart "$new_port" tcp; then
+    node_transaction_rollback "$txn"
     echo ""
-    echo -e "${R}sing-box 校验或重启失败，已保留备份：${backup_path}${N}"
+    echo -e "${R}sing-box 校验或健康检查失败，已完整回滚${N}"
     pause_screen
     return 1
   fi
@@ -290,16 +341,26 @@ modify_anytls_params(){
   local cur_mode
   cur_mode=$(get_node_value anytls Mode 2>/dev/null || echo ipv4)
   if [ -n "$cur_port" ] && [ "$cur_port" != "$new_port" ]; then
-    node_revoke_firewall_for_mode "$cur_port" tcp "$cur_mode"
-    node_apply_firewall_for_mode "$new_port" tcp "$cur_mode"
+    if ! node_revoke_firewall_for_mode "$cur_port" tcp "$cur_mode" \
+       || ! node_apply_firewall_for_mode "$new_port" tcp "$cur_mode"; then
+      node_transaction_rollback "$txn"
+      echo -e "${R}防火墙端口切换失败，已完整回滚${N}"
+      pause_screen
+      return 1
+    fi
     print_firewall_hint "$new_port" tcp "AnyTLS 节点新端口"
   fi
 
   # 更新 info
-  set_node_value anytls Port "$new_port"
-  set_node_value anytls SNI "$new_sni"
-  set_node_value anytls Password "$new_pw"
-  set_node_value anytls Tag "$new_tag"
+  if ! set_node_value anytls Port "$new_port" \
+     || ! set_node_value anytls SNI "$new_sni" \
+     || ! set_node_value anytls Password "$new_pw" \
+     || ! set_node_value anytls Tag "$new_tag"; then
+    node_transaction_rollback "$txn"
+    echo -e "${R}节点信息保存失败，已完整回滚${N}"
+    pause_screen
+    return 1
+  fi
 
   # 重生成 Link
   local cur_ip pub sid new_link ipv6_new_link
@@ -308,7 +369,15 @@ modify_anytls_params(){
   sid=$(get_node_value anytls ShortID 2>/dev/null || true)
   new_link=$(build_anytls_link "$new_pw" "$cur_ip" "$new_port" "$new_sni" "$pub" "$sid" "$new_tag" 2>/dev/null || true)
   ipv6_new_link=$(build_dualstack_ipv6_link_for_node anytls 2>/dev/null || true)
-  [ -n "$new_link" ] && set_node_value anytls Link "$new_link"
+  if [ -n "$new_link" ] && ! set_node_value anytls Link "$new_link"; then
+    node_transaction_rollback "$txn"
+    echo -e "${R}客户端链接保存失败，已完整回滚${N}"
+    pause_screen
+    return 1
+  fi
+  node_transaction_commit "$txn"
+  cleanup_old_backups "${CONFIG_PATH}.bak.*" 5 \
+    || echo -e "${Y}旧配置备份自动清理失败，可稍后从备份菜单处理${N}"
 
   echo ""
   echo -e "${G}AnyTLS 节点参数已更新并重启服务${N}"
@@ -331,7 +400,7 @@ modify_tuic_params(){
   local new_port="" new_sni="" new_uuid="" new_pw="" new_cc="" new_tag=""
   local cur_port cur_sni cur_uuid cur_pw cur_cc cur_cert_src cur_email cur_mode cur_insecure cur_tag
   local cur_cert_path cur_key_path
-  local backup_path="" confirm cc_choice regen_uuid regen_pw
+  local backup_path="" confirm cc_choice regen_uuid regen_pw txn=""
 
   if ! require_root; then return 1; fi
   if ! require_singbox_installed; then return 1; fi
@@ -372,6 +441,14 @@ modify_tuic_params(){
     new_port="${new_port:-$cur_port}"
     if validate_port "$new_port"; then
       new_port=$((10#$new_port))
+      if [ "$new_port" != "$cur_port" ] && check_port_in_use "$new_port" udp; then
+        local force_port=""
+        echo -e "${R}端口 ${new_port} 已被其他 UDP 服务占用${N}"
+        read -p "  仍然使用此端口？(y/N): " force_port
+        if [ "$force_port" != "y" ] && [ "$force_port" != "Y" ]; then
+          continue
+        fi
+      fi
       break
     fi
     echo -e "${R}端口必须是 1-65535 的数字${N}"
@@ -465,17 +542,24 @@ modify_tuic_params(){
     return 0
   fi
 
-  # 备份配置
-  backup_path="${CONFIG_PATH}.$(date +%Y%m%d-%H%M%S).bak"
-  cp "$CONFIG_PATH" "$backup_path" 2>/dev/null || true
-
   ensure_jq || { pause_screen; return 1; }
+  txn=$(node_transaction_begin tuic) || { echo -e "${R}节点事务快照失败${N}"; pause_screen; return 1; }
+
+  # 备份配置
+  backup_path="${CONFIG_PATH}.bak.$(date +%Y%m%d-%H%M%S)"
+  if ! cp "$CONFIG_PATH" "$backup_path"; then
+    node_transaction_rollback "$txn"
+    echo -e "${R}配置备份失败${N}"
+    pause_screen
+    return 1
+  fi
 
   # 自签证书：SNI 变了 → 重新自签
   if [ "$cur_cert_src" = "self" ] && [ "$new_sni" != "$cur_sni" ]; then
     echo -e "${Y}==> SNI 已修改，重新生成自签证书...${N}"
     if ! generate_self_signed_cert_for_tuic "$new_sni" >/dev/null; then
-      echo -e "${R}自签证书生成失败${N}"
+      node_transaction_rollback "$txn"
+      echo -e "${R}自签证书生成失败，已完整回滚${N}"
       pause_screen
       return 1
     fi
@@ -498,40 +582,65 @@ modify_tuic_params(){
           --arg pw "$new_pw" \
           --arg cc "$new_cc" \
           "$jq_filter" "$CONFIG_PATH" > "$tmp" 2>/dev/null; then
-    echo -e "${R}配置写入失败（jq 过滤错误）${N}"
+    node_transaction_rollback "$txn"
+    echo -e "${R}配置写入失败，已完整回滚${N}"
     pause_screen
     return 1
   fi
-  mv "$tmp" "$CONFIG_PATH"
+  if ! mv "$tmp" "$CONFIG_PATH"; then
+    node_transaction_rollback "$txn"
+    echo -e "${R}配置替换失败，已完整回滚${N}"
+    pause_screen
+    return 1
+  fi
 
-  if ! config_check_and_restart; then
+  if ! config_check_and_restart "$new_port" udp; then
+    node_transaction_rollback "$txn"
     echo ""
-    echo -e "${R}sing-box 校验或重启失败，已保留备份：${backup_path}${N}"
+    echo -e "${R}sing-box 校验或健康检查失败，已完整回滚${N}"
     pause_screen
     return 1
   fi
 
   # 防火墙：撤旧放新
   if [ -n "$cur_port" ] && [ "$cur_port" != "$new_port" ]; then
-    node_revoke_firewall_for_mode "$cur_port" udp "$cur_mode"
-    node_apply_firewall_for_mode "$new_port" udp "$cur_mode"
+    if ! node_revoke_firewall_for_mode "$cur_port" udp "$cur_mode" \
+       || ! node_apply_firewall_for_mode "$new_port" udp "$cur_mode"; then
+      node_transaction_rollback "$txn"
+      echo -e "${R}防火墙端口切换失败，已完整回滚${N}"
+      pause_screen
+      return 1
+    fi
     print_firewall_hint "$new_port" udp "TUIC 节点新端口"
   fi
 
   # 更新 .info
-  set_node_value tuic Port "$new_port"
-  set_node_value tuic SNI "$new_sni"
-  set_node_value tuic UUID "$new_uuid"
-  set_node_value tuic Password "$new_pw"
-  set_node_value tuic CongestionControl "$new_cc"
-  set_node_value tuic Tag "$new_tag"
+  if ! set_node_value tuic Port "$new_port" \
+     || ! set_node_value tuic SNI "$new_sni" \
+     || ! set_node_value tuic UUID "$new_uuid" \
+     || ! set_node_value tuic Password "$new_pw" \
+     || ! set_node_value tuic CongestionControl "$new_cc" \
+     || ! set_node_value tuic Tag "$new_tag"; then
+    node_transaction_rollback "$txn"
+    echo -e "${R}节点信息保存失败，已完整回滚${N}"
+    pause_screen
+    return 1
+  fi
 
   # 重生成 Link
   local cur_ip new_link ipv6_new_link
   cur_ip=$(get_node_value tuic IP 2>/dev/null || true)
   new_link=$(build_tuic_link "$new_uuid" "$new_pw" "$cur_ip" "$new_port" "$new_sni" "$cur_insecure" "$new_cc" "$new_tag" 2>/dev/null || true)
   ipv6_new_link=$(build_dualstack_ipv6_link_for_node tuic 2>/dev/null || true)
-  [ -n "$new_link" ] && set_node_value tuic Link "$new_link"
+  if [ -n "$new_link" ] && ! set_node_value tuic Link "$new_link"; then
+    node_transaction_rollback "$txn"
+    echo -e "${R}客户端链接保存失败，已完整回滚${N}"
+    pause_screen
+    return 1
+  fi
+  node_transaction_commit "$txn"
+  cleanup_old_backups "${CONFIG_PATH}.bak.*" 5 \
+    || echo -e "${Y}旧配置备份自动清理失败，可稍后从备份菜单处理${N}"
 
   echo ""
   echo -e "${G}TUIC 节点参数已更新并重启服务${N}"
@@ -551,9 +660,10 @@ modify_tuic_params(){
 }
 
 # ─── 完整卸载脚本 ─────────────────────────────────────
-# 清理范围：节点 inbound、节点防火墙端口、sing-box 服务与软件包、
-#          /etc/sing-box（含 nodes/、certs/、备份）、
+# 清理范围：脚本固定 tag 的节点 inbound、节点信息/证书/防火墙端口、
+#          WARP 与 sing-box 服务/软件包、脚本生成的配置备份、
 #          legacy /root/proxy-info.txt、/usr/local/bin/sb。
+# 保留：/etc/sing-box 内用户自定义 inbound、DNS、路由、outbound 与其它文件。
 # 不动：SSH 端口/sshd 配置、用户账户、sudoers、自动更新策略、
 #        IPv6 防火墙菜单规则、1Panel、apt 基础工具、
 #        TCP 网络优化、QUIC 协议优化、initcwnd 持久化服务、本脚本创建的 SWAP。

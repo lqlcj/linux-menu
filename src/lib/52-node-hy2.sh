@@ -2,7 +2,7 @@ generate_hy2_random_port(){
   local p attempts=0
   while [ $attempts -lt 30 ]; do
     p=$(( (RANDOM << 15 | RANDOM) % 45535 + 20000 ))
-    if ! check_port_in_use "$p"; then
+    if ! check_port_in_use "$p" udp; then
       printf '%s' "$p"
       return 0
     fi
@@ -33,52 +33,69 @@ generate_anytls_random_port(){
   printf '%s' "$p"
 }
 
-generate_self_signed_cert_for_hy2(){
-  local sni="$1"
-  ensure_nodes_dir
-  local crt="$CERTS_DIR/hy2.crt"
-  local key="$CERTS_DIR/hy2.key"
+generate_self_signed_cert(){
+  local type="$1" sni="$2"
+  local crt="$CERTS_DIR/${type}.crt"
+  local key="$CERTS_DIR/${type}.key"
+  local workdir new_crt new_key
+
+  ensure_nodes_dir || return 1
   if ! command -v openssl >/dev/null 2>&1; then
     echo -e "${R}未找到 openssl${N}"
     return 1
   fi
-  if ! openssl ecparam -genkey -name prime256v1 -out "$key" 2>/dev/null; then
-    if ! openssl genrsa -out "$key" 2048 >/dev/null 2>&1; then
+  workdir=$(mktemp -d "$CERTS_DIR/.${type}.XXXXXX") || return 1
+  chmod 700 "$workdir" 2>/dev/null || { rm -rf -- "$workdir"; return 1; }
+  new_crt="$workdir/${type}.crt"
+  new_key="$workdir/${type}.key"
+  if ! openssl ecparam -genkey -name prime256v1 -out "$new_key" 2>/dev/null; then
+    if ! openssl genrsa -out "$new_key" 2048 >/dev/null 2>&1; then
       echo -e "${R}私钥生成失败${N}"
+      rm -rf -- "$workdir"
       return 1
     fi
   fi
-  if ! openssl req -new -x509 -days 3650 -key "$key" -out "$crt" \
+  if ! openssl req -new -x509 -days 3650 -key "$new_key" -out "$new_crt" \
        -subj "/CN=${sni}" >/dev/null 2>&1; then
     echo -e "${R}自签证书生成失败${N}"
+    rm -rf -- "$workdir"
     return 1
   fi
-  chmod 600 "$key"
+  chmod 600 "$new_key" "$new_crt" 2>/dev/null || { rm -rf -- "$workdir"; return 1; }
+  if [ -f "$key" ] && ! cp -a -- "$key" "$workdir/old.key"; then
+    rm -rf -- "$workdir"
+    return 1
+  fi
+  if [ -f "$crt" ] && ! cp -a -- "$crt" "$workdir/old.crt"; then
+    rm -rf -- "$workdir"
+    return 1
+  fi
+  if ! mv -f -- "$new_key" "$key" || ! mv -f -- "$new_crt" "$crt"; then
+    local restore_ok=1
+    if [ -f "$workdir/old.key" ]; then
+      cp -a -- "$workdir/old.key" "$key" 2>/dev/null || restore_ok=0
+    else
+      rm -f -- "$key" || restore_ok=0
+    fi
+    if [ -f "$workdir/old.crt" ]; then
+      cp -a -- "$workdir/old.crt" "$crt" 2>/dev/null || restore_ok=0
+    else
+      rm -f -- "$crt" || restore_ok=0
+    fi
+    rm -rf -- "$workdir"
+    [ "$restore_ok" -eq 1 ] || echo -e "${R}证书替换失败且旧证书恢复不完整${N}" >&2
+    return 1
+  fi
+  rm -rf -- "$workdir"
   printf '%s\n%s' "$crt" "$key"
 }
 
+generate_self_signed_cert_for_hy2(){
+  generate_self_signed_cert hy2 "$1"
+}
+
 generate_self_signed_cert_for_tuic(){
-  local sni="$1"
-  ensure_nodes_dir
-  local crt="$CERTS_DIR/tuic.crt"
-  local key="$CERTS_DIR/tuic.key"
-  if ! command -v openssl >/dev/null 2>&1; then
-    echo -e "${R}未找到 openssl${N}"
-    return 1
-  fi
-  if ! openssl ecparam -genkey -name prime256v1 -out "$key" 2>/dev/null; then
-    if ! openssl genrsa -out "$key" 2048 >/dev/null 2>&1; then
-      echo -e "${R}私钥生成失败${N}"
-      return 1
-    fi
-  fi
-  if ! openssl req -new -x509 -days 3650 -key "$key" -out "$crt" \
-       -subj "/CN=${sni}" >/dev/null 2>&1; then
-    echo -e "${R}自签证书生成失败${N}"
-    return 1
-  fi
-  chmod 600 "$key"
-  printf '%s\n%s' "$crt" "$key"
+  generate_self_signed_cert tuic "$1"
 }
 
 install_hy2_node(){
@@ -93,6 +110,7 @@ install_hy2_node(){
   local hop_choice HOP_ENABLE=0 HOP_MODE="" HOP_START="" HOP_END=""
   local range_input confirm_hop confirm_small force_hop
   local listen_v4="" listen_v6=""
+  local txn="" old_port="" old_mode="ipv4" old_hop="0" old_hop_start="" old_hop_end=""
 
   if ! require_root; then return 1; fi
 
@@ -107,6 +125,11 @@ install_hy2_node(){
       echo -e "  已取消"
       return 0
     fi
+    old_port=$(get_node_value hy2 Port 2>/dev/null || true)
+    old_mode=$(get_node_value hy2 Mode 2>/dev/null || echo ipv4)
+    old_hop=$(get_node_value hy2 PortHop 2>/dev/null || echo 0)
+    old_hop_start=$(get_node_value hy2 PortHopStart 2>/dev/null || true)
+    old_hop_end=$(get_node_value hy2 PortHopEnd 2>/dev/null || true)
   fi
 
   # 端口（默认随机高位 UDP）
@@ -117,6 +140,14 @@ install_hy2_node(){
     PORT="${port_input:-$default_port}"
     if validate_port "$PORT"; then
       PORT=$((10#$PORT))
+      if [ "$PORT" != "$old_port" ] && check_port_in_use "$PORT" udp; then
+        echo -e "${R}UDP 端口 ${PORT} 已被其他服务占用${N}"
+        local force_port=""
+        read -p "  仍然使用此端口？(y/N): " force_port
+        if [ "$force_port" != "y" ] && [ "$force_port" != "Y" ]; then
+          continue
+        fi
+      fi
       break
     fi
     echo -e "${R}端口必须是 1-65535 的数字${N}"
@@ -316,46 +347,69 @@ install_hy2_node(){
 
   mode_label=$(describe_install_mode "$install_mode")
 
+  echo -e "${Y}==> 建立节点事务快照...${N}"
+  ensure_jq || { pause_screen; return 1; }
+  txn=$(node_transaction_begin hy2) || { echo -e "${R}节点事务快照失败${N}"; pause_screen; return 1; }
+
   # 准备证书
   if [ "$cert_source" = "self" ]; then
     echo -e "${Y}==> 生成自签证书...${N}"
-    cert_paths=$(generate_self_signed_cert_for_hy2 "$SNI") || { pause_screen; return 1; }
+    if ! cert_paths=$(generate_self_signed_cert_for_hy2 "$SNI"); then
+      node_transaction_rollback "$txn"
+      pause_screen
+      return 1
+    fi
     cert_path=$(echo "$cert_paths" | sed -n '1p')
     key_path=$(echo "$cert_paths" | sed -n '2p')
   fi
 
   echo -e "${Y}==> 写入配置...${N}"
-  ensure_jq || { pause_screen; return 1; }
 
   local tls_json
   if [ "$cert_source" = "acme" ]; then
-    tls_json=$(jq -n --arg sni "$SNI" --arg email "$acme_email" '{
+    if ! tls_json=$(jq -n --arg sni "$SNI" --arg email "$acme_email" '{
       enabled: true,
       server_name: $sni,
       alpn: ["h3"],
       acme: {domain: [$sni], email: $email}
-    }')
+    }'); then
+      node_transaction_rollback "$txn"
+      pause_screen
+      return 1
+    fi
   else
-    tls_json=$(jq -n --arg sni "$SNI" --arg crt "$cert_path" --arg key "$key_path" '{
+    if ! tls_json=$(jq -n --arg sni "$SNI" --arg crt "$cert_path" --arg key "$key_path" '{
       enabled: true,
       server_name: $sni,
       alpn: ["h3"],
       certificate_path: $crt,
       key_path: $key
-    }')
+    }'); then
+      node_transaction_rollback "$txn"
+      pause_screen
+      return 1
+    fi
   fi
 
   local obfs_json="null"
   if [ "$obfs_enable" = "1" ]; then
-    obfs_json=$(jq -n --arg pw "$obfs_password" '{type: "salamander", password: $pw}')
+    if ! obfs_json=$(jq -n --arg pw "$obfs_password" '{type: "salamander", password: $pw}'); then
+      node_transaction_rollback "$txn"
+      pause_screen
+      return 1
+    fi
   fi
 
   # 构造 user 对象（Hysteria2 的 user 仅含 password；带宽限制 up_mbps/down_mbps 是 inbound 顶层字段）
   local user_obj
-  user_obj=$(jq -n --arg pw "$password" '{password: $pw}')
+  if ! user_obj=$(jq -n --arg pw "$password" '{password: $pw}'); then
+    node_transaction_rollback "$txn"
+    pause_screen
+    return 1
+  fi
 
   local inbound_json
-  inbound_json=$(jq -n \
+  if ! inbound_json=$(jq -n \
     --arg listen "$LISTEN_ADDR" \
     --argjson port "$PORT" \
     --argjson user "$user_obj" \
@@ -372,20 +426,36 @@ install_hy2_node(){
       tls: $tls
     }
     + (if $obfs == null then {} else {obfs: $obfs} end)
-    + (if $up > 0 and $down > 0 then {up_mbps: $up, down_mbps: $down} else {} end)')
+    + (if $up > 0 and $down > 0 then {up_mbps: $up, down_mbps: $down} else {} end)'); then
+    node_transaction_rollback "$txn"
+    pause_screen
+    return 1
+  fi
 
   if ! config_add_inbound "$inbound_json"; then
+    node_transaction_rollback "$txn"
     echo -e "${R}写入 inbound 失败${N}"
     pause_screen
     return 1
   fi
 
   echo -e "${Y}==> 校验并启动...${N}"
-  if ! config_check_and_restart; then
+  if ! config_check_and_restart "$PORT" udp; then
+    node_transaction_rollback "$txn"
     echo ""
     echo -e "${R}sing-box 校验或重启失败${N}"
     pause_screen
     return 1
+  fi
+
+  # 先撤掉旧节点的跳跃规则；后续任一步失败由节点事务恢复。
+  if [ "$old_hop" = "1" ] && [ -n "$old_hop_start" ] && [ -n "$old_hop_end" ]; then
+    if ! port_hop_remove "$old_hop_start" "$old_hop_end" "$old_mode"; then
+      node_transaction_rollback "$txn"
+      echo -e "${R}旧端口跳跃规则清理失败，已完整回滚${N}"
+      pause_screen
+      return 1
+    fi
   fi
 
   # 应用端口跳跃规则（启用时）
@@ -405,12 +475,30 @@ install_hy2_node(){
       addrs_pair=$(port_hop_listen_addrs_for_mode "$install_mode" "$public_ipv6")
       listen_v4="${addrs_pair%|*}"
       listen_v6="${addrs_pair#*|}"
-      port_hop_apply "$PORT" "$HOP_START" "$HOP_END" "$install_mode" "$listen_v4" "$listen_v6"
+      if ! port_hop_apply "$PORT" "$HOP_START" "$HOP_END" "$install_mode" "$listen_v4" "$listen_v6"; then
+        node_transaction_rollback "$txn"
+        echo -e "${R}端口跳跃规则应用失败，已完整回滚${N}"
+        pause_screen
+        return 1
+      fi
       echo -e "  ${G}端口跳跃已启用：${HOP_START}-${HOP_END} (UDP)${N}"
     fi
   fi
 
-  node_apply_firewall_for_mode "$PORT" udp "$install_mode"
+  if [ -n "$old_port" ] && { [ "$old_port" != "$PORT" ] || [ "$old_mode" != "$install_mode" ]; }; then
+    if ! node_revoke_firewall_for_mode "$old_port" udp "$old_mode"; then
+      node_transaction_rollback "$txn"
+      echo -e "${R}旧端口防火墙清理失败，已完整回滚${N}"
+      pause_screen
+      return 1
+    fi
+  fi
+  if ! node_apply_firewall_for_mode "$PORT" udp "$install_mode"; then
+    node_transaction_rollback "$txn"
+    echo -e "${R}防火墙放行失败，已完整回滚${N}"
+    pause_screen
+    return 1
+  fi
   print_firewall_hint "$PORT" udp "Hysteria2 节点入站"
   if [ "$HOP_ENABLE" = "1" ]; then
     echo -e "  ${D}端口跳跃 DNAT 已配置：${HOP_START}-${HOP_END}/udp → 主端口 ${PORT}/udp${N}"
@@ -429,9 +517,7 @@ install_hy2_node(){
     ipv6_link=$(build_hy2_link "$password" "$public_ipv6" "$PORT" "$SNI" "$insecure" "$link_obfs_type" "${obfs_password:-}" "${TAG}-ipv6" "$HOP_START" "$HOP_END" 2>/dev/null || true)
   fi
 
-  ensure_nodes_dir
-  {
-    cat <<EOF
+  if ! write_node_info_file hy2 <<EOF
 Type=hy2
 Tag=$TAG
 Mode=$install_mode
@@ -447,19 +533,30 @@ Obfs=${link_obfs_type:-none}
 ObfsPassword=${obfs_password:-}
 Insecure=$insecure
 IP=$access_ip
+UpMbps=$([ "$up_mbps" -gt 0 ] && printf '%s' "$up_mbps")
+DownMbps=$([ "$down_mbps" -gt 0 ] && printf '%s' "$down_mbps")
+PortHop=$HOP_ENABLE
+PortHopMode=$HOP_MODE
+PortHopStart=$HOP_START
+PortHopEnd=$HOP_END
+Link=$link
 EOF
-    if [ "$up_mbps" -gt 0 ] && [ "$down_mbps" -gt 0 ]; then
-      echo "UpMbps=$up_mbps"
-      echo "DownMbps=$down_mbps"
+  then
+    node_transaction_rollback "$txn"
+    echo -e "${R}节点信息保存失败，已完整回滚${N}"
+    pause_screen
+    return 1
+  fi
+
+  if [ "$cert_source" = "acme" ]; then
+    if ! rm -f -- "$CERTS_DIR/hy2.crt" "$CERTS_DIR/hy2.key"; then
+      node_transaction_rollback "$txn"
+      echo -e "${R}旧自签证书清理失败，已完整回滚${N}"
+      pause_screen
+      return 1
     fi
-    if [ "$HOP_ENABLE" = "1" ]; then
-      echo "PortHop=1"
-      echo "PortHopMode=$HOP_MODE"
-      echo "PortHopStart=$HOP_START"
-      echo "PortHopEnd=$HOP_END"
-    fi
-    echo "Link=$link"
-  } > "$(node_info_path hy2)"
+  fi
+  node_transaction_commit "$txn"
 
   register_sb_command || true
 
@@ -517,29 +614,11 @@ uninstall_hy2_node(){
     return 0
   fi
 
-  # 清理端口跳跃规则（必须在 remove_node_info 之前，否则读不到 info）
-  local hop_enabled hop_start hop_end mode hy2_port
-  hop_enabled=$(get_node_value hy2 PortHop 2>/dev/null || echo 0)
-  hy2_port=$(get_node_value hy2 Port 2>/dev/null || true)
-  mode=$(get_node_value hy2 Mode 2>/dev/null || echo ipv4)
-  if [ "$hop_enabled" = "1" ]; then
-    hop_start=$(get_node_value hy2 PortHopStart 2>/dev/null || true)
-    hop_end=$(get_node_value hy2 PortHopEnd 2>/dev/null || true)
-    if [ -n "$hop_start" ] && [ -n "$hop_end" ]; then
-      port_hop_remove "$hop_start" "$hop_end" "$mode"
-      echo -e "  ${D}端口跳跃规则已清理 (${hop_start}-${hop_end})${N}"
-    fi
+  if ! uninstall_node_transaction hy2 hy2-in udp; then
+    echo -e "${R}Hysteria2 节点卸载失败，已恢复原配置${N}"
+    pause_screen
+    return 1
   fi
-
-  # 撤销主端口防火墙规则
-  if [ -n "$hy2_port" ]; then
-    node_revoke_firewall_for_mode "$hy2_port" udp "$mode"
-  fi
-
-  config_remove_inbound_by_tag "hy2-in" || true
-  remove_node_info hy2
-  rm -f "$CERTS_DIR/hy2.crt" "$CERTS_DIR/hy2.key" 2>/dev/null || true
-  post_uninstall_service_step
   echo -e "${G}Hysteria2 节点已卸载${N}"
   pause_screen
 }
@@ -553,6 +632,7 @@ modify_hy2_params(){
   local bw_choice bw_action="keep" new_up=0 new_down=0
   local hop_choice new_hop=0 new_hop_mode="" new_hop_start="" new_hop_end=""
   local range_input confirm_small
+  local txn=""
 
   if ! require_root; then return 1; fi
   if ! require_singbox_installed; then return 1; fi
@@ -591,7 +671,18 @@ modify_hy2_params(){
   while true; do
     read -p "  端口 (${cur_port:-当前未知}): " new_port
     new_port="${new_port:-$cur_port}"
-    if validate_port "$new_port"; then break; fi
+    if validate_port "$new_port"; then
+      new_port=$((10#$new_port))
+      if [ "$new_port" != "$cur_port" ] && check_port_in_use "$new_port" udp; then
+        local force_port=""
+        echo -e "${R}端口 ${new_port} 已被其他 UDP 服务占用${N}"
+        read -p "  仍然使用此端口？(y/N): " force_port
+        if [ "$force_port" != "y" ] && [ "$force_port" != "Y" ]; then
+          continue
+        fi
+      fi
+      break
+    fi
     echo -e "${R}端口必须是 1-65535 的数字${N}"
   done
 
@@ -758,20 +849,23 @@ modify_hy2_params(){
     return 0
   fi
 
+  ensure_jq || { pause_screen; return 1; }
+  txn=$(node_transaction_begin hy2) || { echo -e "${R}节点事务快照失败${N}"; pause_screen; return 1; }
+
   backup_path="${CONFIG_PATH}.bak.$(date +%Y%m%d%H%M%S)"
   if ! cp "$CONFIG_PATH" "$backup_path"; then
+    node_transaction_rollback "$txn"
     echo -e "${R}配置备份失败${N}"
     pause_screen
     return 1
   fi
 
-  ensure_jq || { pause_screen; return 1; }
-
   # 自签时若 SNI 改变，重签证书
   if [ "$cur_cert_src" = "self" ] && [ "$new_sni" != "$cur_sni" ]; then
     echo -e "${Y}==> SNI 变更，重新生成自签证书...${N}"
     if ! generate_self_signed_cert_for_hy2 "$new_sni" >/dev/null; then
-      echo -e "${R}自签证书生成失败${N}"
+      node_transaction_rollback "$txn"
+      echo -e "${R}自签证书生成失败，已完整回滚${N}"
       pause_screen
       return 1
     fi
@@ -798,24 +892,22 @@ modify_hy2_params(){
        --arg bw_action "$bw_action" --arg up "$new_up" --arg down "$new_down" \
        "$jq_filter" "$CONFIG_PATH" > "$tmp_file"; then
     rm -f "$tmp_file"
-    cp "$backup_path" "$CONFIG_PATH" 2>/dev/null || true
-    echo -e "${R}配置写入失败，已恢复备份${N}"
+    node_transaction_rollback "$txn"
+    echo -e "${R}配置写入失败，已完整回滚${N}"
     pause_screen
     return 1
   fi
-  mv "$tmp_file" "$CONFIG_PATH"
+  if ! mv "$tmp_file" "$CONFIG_PATH"; then
+    node_transaction_rollback "$txn"
+    echo -e "${R}配置替换失败，已完整回滚${N}"
+    pause_screen
+    return 1
+  fi
 
-  if ! sing-box check -c "$CONFIG_PATH"; then
-    cp "$backup_path" "$CONFIG_PATH" 2>/dev/null || true
+  if ! config_check_and_restart "$new_port" udp; then
+    node_transaction_rollback "$txn"
     echo ""
-    echo -e "${R}配置校验失败，已恢复备份${N}"
-    pause_screen
-    return 1
-  fi
-  if ! systemctl restart sing-box; then
-    cp "$backup_path" "$CONFIG_PATH" 2>/dev/null || true
-    echo ""
-    echo -e "${R}服务重启失败，已恢复备份${N}"
+    echo -e "${R}配置校验或服务健康检查失败，已完整回滚${N}"
     pause_screen
     return 1
   fi
@@ -832,7 +924,12 @@ modify_hy2_params(){
     fi
   fi
   if [ "$need_remove_hop" = "1" ]; then
-    port_hop_remove "$cur_hop_start" "$cur_hop_end" "$cur_mode"
+    if ! port_hop_remove "$cur_hop_start" "$cur_hop_end" "$cur_mode"; then
+      node_transaction_rollback "$txn"
+      echo -e "${R}旧端口跳跃规则清理失败，已完整回滚${N}"
+      pause_screen
+      return 1
+    fi
     echo -e "  ${D}旧端口跳跃规则已清理${N}"
   fi
   if [ "$new_hop" = "1" ] && [ -n "$new_hop_start" ] && [ -n "$new_hop_end" ]; then
@@ -841,36 +938,89 @@ modify_hy2_params(){
     addrs_pair=$(port_hop_listen_addrs_for_mode "$cur_mode" "$public_ipv6_now")
     listen_v4="${addrs_pair%|*}"
     listen_v6="${addrs_pair#*|}"
-    port_hop_apply "$new_port" "$new_hop_start" "$new_hop_end" "$cur_mode" "$listen_v4" "$listen_v6"
+    if ! port_hop_apply "$new_port" "$new_hop_start" "$new_hop_end" "$cur_mode" "$listen_v4" "$listen_v6"; then
+      node_transaction_rollback "$txn"
+      echo -e "${R}新端口跳跃规则应用失败，已完整回滚${N}"
+      pause_screen
+      return 1
+    fi
     echo -e "  ${G}新端口跳跃规则已应用：${new_hop_start}-${new_hop_end}${N}"
   fi
 
+  if [ -n "$new_port" ] && [ "$new_port" != "$cur_port" ]; then
+    if [ -n "$cur_port" ] && ! node_revoke_firewall_for_mode "$cur_port" udp "$cur_mode"; then
+      node_transaction_rollback "$txn"
+      echo -e "${R}旧防火墙端口清理失败，已完整回滚${N}"
+      pause_screen
+      return 1
+    fi
+    if ! node_apply_firewall_for_mode "$new_port" udp "$cur_mode"; then
+      node_transaction_rollback "$txn"
+      echo -e "${R}防火墙端口切换失败，已完整回滚${N}"
+      pause_screen
+      return 1
+    fi
+    print_firewall_hint "$new_port" udp "Hysteria2 节点新端口"
+  fi
+
   # 写回 hy2.info
-  set_node_value hy2 Port "$new_port"
-  set_node_value hy2 SNI  "$new_sni"
-  [ -n "$new_pw" ] && set_node_value hy2 Password "$new_pw"
-  [ -n "$new_obfs_pw" ] && set_node_value hy2 ObfsPassword "$new_obfs_pw"
+  if ! set_node_value hy2 Port "$new_port" || ! set_node_value hy2 SNI "$new_sni"; then
+    node_transaction_rollback "$txn"
+    echo -e "${R}节点信息保存失败，已完整回滚${N}"
+    pause_screen
+    return 1
+  fi
+  if [ -n "$new_pw" ] && ! set_node_value hy2 Password "$new_pw"; then
+    node_transaction_rollback "$txn"
+    echo -e "${R}节点密码保存失败，已完整回滚${N}"
+    pause_screen
+    return 1
+  fi
+  if [ -n "$new_obfs_pw" ] && ! set_node_value hy2 ObfsPassword "$new_obfs_pw"; then
+    node_transaction_rollback "$txn"
+    echo -e "${R}混淆密码保存失败，已完整回滚${N}"
+    pause_screen
+    return 1
+  fi
   case "$bw_action" in
     set)
-      set_node_value hy2 UpMbps "$new_up"
-      set_node_value hy2 DownMbps "$new_down"
+      if ! set_node_value hy2 UpMbps "$new_up" || ! set_node_value hy2 DownMbps "$new_down"; then
+        node_transaction_rollback "$txn"
+        echo -e "${R}带宽参数保存失败，已完整回滚${N}"
+        pause_screen
+        return 1
+      fi
       ;;
     unset)
       # 清空（以空字符串覆盖；后续读取会判空）
-      set_node_value hy2 UpMbps ""
-      set_node_value hy2 DownMbps ""
+      if ! set_node_value hy2 UpMbps "" || ! set_node_value hy2 DownMbps ""; then
+        node_transaction_rollback "$txn"
+        echo -e "${R}带宽参数保存失败，已完整回滚${N}"
+        pause_screen
+        return 1
+      fi
       ;;
   esac
   if [ "$new_hop" = "1" ]; then
-    set_node_value hy2 PortHop "1"
-    set_node_value hy2 PortHopMode "$new_hop_mode"
-    set_node_value hy2 PortHopStart "$new_hop_start"
-    set_node_value hy2 PortHopEnd "$new_hop_end"
+    if ! set_node_value hy2 PortHop "1" \
+       || ! set_node_value hy2 PortHopMode "$new_hop_mode" \
+       || ! set_node_value hy2 PortHopStart "$new_hop_start" \
+       || ! set_node_value hy2 PortHopEnd "$new_hop_end"; then
+      node_transaction_rollback "$txn"
+      echo -e "${R}端口跳跃信息保存失败，已完整回滚${N}"
+      pause_screen
+      return 1
+    fi
   else
-    set_node_value hy2 PortHop "0"
-    set_node_value hy2 PortHopMode ""
-    set_node_value hy2 PortHopStart ""
-    set_node_value hy2 PortHopEnd ""
+    if ! set_node_value hy2 PortHop "0" \
+       || ! set_node_value hy2 PortHopMode "" \
+       || ! set_node_value hy2 PortHopStart "" \
+       || ! set_node_value hy2 PortHopEnd ""; then
+      node_transaction_rollback "$txn"
+      echo -e "${R}端口跳跃信息保存失败，已完整回滚${N}"
+      pause_screen
+      return 1
+    fi
   fi
 
   local cur_ip cur_tag insecure obfs_type final_pw final_obfs_pw new_link ipv6_new_link
@@ -888,15 +1038,13 @@ modify_hy2_params(){
   fi
   new_link=$(build_hy2_link "$final_pw" "$cur_ip" "$new_port" "$new_sni" "$insecure" "$obfs_type" "$final_obfs_pw" "${cur_tag:-hy2}" "$link_hop_start" "$link_hop_end" 2>/dev/null || true)
   ipv6_new_link=$(build_dualstack_ipv6_link_for_node hy2 2>/dev/null || true)
-  [ -n "$new_link" ] && set_node_value hy2 Link "$new_link"
-  if [ -n "$new_port" ] && [ "$new_port" != "$cur_port" ]; then
-    local hy2_mode_now
-    hy2_mode_now=$(get_node_value hy2 Mode 2>/dev/null || echo ipv4)
-    # 旧端口先撤、新端口再开（双栈/v6 模式同时处理 v4/v6）
-    [ -n "$cur_port" ] && node_revoke_firewall_for_mode "$cur_port" udp "$hy2_mode_now"
-    node_apply_firewall_for_mode "$new_port" udp "$hy2_mode_now"
-    print_firewall_hint "$new_port" udp "Hysteria2 节点新端口"
+  if [ -n "$new_link" ] && ! set_node_value hy2 Link "$new_link"; then
+    node_transaction_rollback "$txn"
+    echo -e "${R}客户端链接保存失败，已完整回滚${N}"
+    pause_screen
+    return 1
   fi
+  node_transaction_commit "$txn"
   cleanup_old_backups "${CONFIG_PATH}.bak.*" 5
 
   echo ""

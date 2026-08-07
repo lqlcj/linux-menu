@@ -35,6 +35,15 @@ enable_auto_updates(){
     fi
   fi
 
+  if grep -Fq '# Managed by Leyili' /etc/apt/apt.conf.d/20auto-upgrades 2>/dev/null \
+     || [ -e /etc/apt/apt.conf.d/20auto-upgrades.leyili-original ]; then
+    if ! managed_file_restore /etc/apt/apt.conf.d/20auto-upgrades; then
+      echo -e "${R}恢复启用前的自动更新配置失败${N}"
+      pause_screen
+      return 1
+    fi
+  fi
+
   echo ""
   echo -e "${Y}提示：${N} 如果出现交互界面，请选择 ${B}Yes${N}。"
   echo ""
@@ -51,7 +60,7 @@ enable_auto_updates(){
 }
 
 disable_auto_updates(){
-  local confirm=""
+  local confirm="" unit tmp_config="" rc=0
 
   if ! require_root; then
     return 1
@@ -68,12 +77,35 @@ disable_auto_updates(){
   read -p "  是否同时卸载 unattended-upgrades 软件包？(y/N): " confirm
 
   echo -e "${Y}==> 关闭自动更新...${N}"
-  systemctl disable --now unattended-upgrades.service >/dev/null 2>&1 || true
-  systemctl disable --now apt-daily.timer apt-daily-upgrade.timer >/dev/null 2>&1 || true
-  cat > /etc/apt/apt.conf.d/20auto-upgrades << 'EOF'
+  for unit in unattended-upgrades.service apt-daily.timer apt-daily-upgrade.timer; do
+    if systemctl is-active --quiet "$unit" 2>/dev/null \
+       || systemctl is-enabled --quiet "$unit" 2>/dev/null; then
+      systemctl disable --now "$unit" >/dev/null 2>&1 || rc=1
+    fi
+  done
+  if ! managed_file_prepare /etc/apt/apt.conf.d/20auto-upgrades 'Managed by Leyili'; then
+    rc=1
+  else
+    tmp_config=$(mktemp /etc/apt/apt.conf.d/20auto-upgrades.tmp.XXXXXX) || rc=1
+  fi
+  if [ -n "$tmp_config" ] && ! cat > "$tmp_config" << 'EOF'
+# Managed by Leyili
 APT::Periodic::Update-Package-Lists "0";
 APT::Periodic::Unattended-Upgrade "0";
 EOF
+  then
+    rc=1
+  fi
+  if [ -n "$tmp_config" ] \
+     && { ! chmod 644 "$tmp_config" || ! mv -f -- "$tmp_config" /etc/apt/apt.conf.d/20auto-upgrades; }; then
+    rm -f -- "$tmp_config"
+    rc=1
+  fi
+  if [ "$rc" -ne 0 ]; then
+    echo -e "${R}自动更新禁用未完全成功，请检查 systemd 定时器与 20auto-upgrades${N}"
+    pause_screen
+    return 1
+  fi
 
   if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
     echo -e "${Y}==> 卸载 unattended-upgrades...${N}"
@@ -136,11 +168,6 @@ install_basic_tools(){
 }
 
 # ─── fail2ban SSH 防爆破 ─────────────────────────────
-FAIL2BAN_JAIL_PATH="/etc/fail2ban/jail.d/leyili-sshd.local"
-FAIL2BAN_MAXRETRY="5"
-FAIL2BAN_BANTIME="600"
-FAIL2BAN_FINDTIME="300"
-
 normalize_fail2ban_port_list(){
   local raw="${1:-}" item ports="" count=0
   local -a items=()
@@ -170,6 +197,30 @@ normalize_fail2ban_port_list(){
   printf '%s' "$ports"
 }
 
+fail2ban_transaction_restore(){
+  local txn_dir="$1" was_active="$2" was_enabled="$3" rc=0
+  if [ -f "$txn_dir/jail.existed" ]; then
+    restore_file_snapshot "$txn_dir/jail.local" "$FAIL2BAN_JAIL_PATH" || rc=1
+  else
+    rm -f -- "$FAIL2BAN_JAIL_PATH" || rc=1
+  fi
+  if [ "$was_enabled" -eq 1 ]; then
+    systemctl enable fail2ban >/dev/null 2>&1 || rc=1
+  else
+    systemctl disable fail2ban >/dev/null 2>&1 || rc=1
+  fi
+  if [ "$was_active" -eq 1 ]; then
+    systemctl restart fail2ban >/dev/null 2>&1 || rc=1
+  else
+    systemctl stop fail2ban >/dev/null 2>&1 || rc=1
+  fi
+  if [ "$rc" -eq 0 ]; then
+    rm -rf -- "$txn_dir" || rc=1
+  fi
+  [ "$rc" -eq 0 ] || echo -e "${R}fail2ban 回滚未完全成功，私有快照保留在 ${txn_dir}${N}" >&2
+  return "$rc"
+}
+
 setup_fail2ban(){
   if ! require_root; then return 1; fi
   if ! require_debian_family; then
@@ -180,6 +231,7 @@ setup_fail2ban(){
   render_section_header "安装 / 配置 fail2ban (SSH 多端口)"
 
   local current_ssh_port default_ports saved_ports input_ports ports normalize_status
+  local txn_dir tmp_jail ping_ok=0 was_active=0 was_enabled=0 i
   current_ssh_port=$(get_current_ssh_port)
   default_ports="$current_ssh_port"
 
@@ -237,14 +289,27 @@ setup_fail2ban(){
     echo -e "  ${L}●${N} fail2ban 已安装，跳过安装步骤"
   fi
 
-  mkdir -p "$(dirname -- "$FAIL2BAN_JAIL_PATH")"
+  mkdir -p "$(dirname -- "$FAIL2BAN_JAIL_PATH")" || return 1
+  txn_dir=$(mktemp -d "${TMPDIR:-/tmp}/leyili-fail2ban.XXXXXX") || return 1
+  chmod 700 "$txn_dir" 2>/dev/null || { rm -rf -- "$txn_dir"; return 1; }
+  if [ -f "$FAIL2BAN_JAIL_PATH" ]; then
+    cp -a -- "$FAIL2BAN_JAIL_PATH" "$txn_dir/jail.local" || { rm -rf -- "$txn_dir"; return 1; }
+    : > "$txn_dir/jail.existed"
+  fi
+  systemctl is-active --quiet fail2ban 2>/dev/null && was_active=1
+  systemctl is-enabled --quiet fail2ban 2>/dev/null && was_enabled=1
 
   if [ -f "$FAIL2BAN_JAIL_PATH" ]; then
-    cp -a "$FAIL2BAN_JAIL_PATH" "${FAIL2BAN_JAIL_PATH}.bak.$(date +%Y%m%d%H%M%S)"
-    cleanup_old_backups "${FAIL2BAN_JAIL_PATH}.bak.*" 5
+    cp -a "$FAIL2BAN_JAIL_PATH" "${FAIL2BAN_JAIL_PATH}.bak.$(date +%Y%m%d%H%M%S)" || {
+      rm -rf -- "$txn_dir"
+      return 1
+    }
+    cleanup_old_backups "${FAIL2BAN_JAIL_PATH}.bak.*" 5 \
+      || echo -e "${Y}旧 fail2ban 备份清理失败，本次配置仍会继续${N}" >&2
   fi
 
-  cat > "$FAIL2BAN_JAIL_PATH" <<EOF
+  tmp_jail=$(mktemp "${FAIL2BAN_JAIL_PATH}.tmp.XXXXXX") || { rm -rf -- "$txn_dir"; return 1; }
+  cat > "$tmp_jail" <<EOF
 # Managed by ${APP_NAME} — do not edit by hand, it will be overwritten.
 [sshd]
 enabled  = true
@@ -254,21 +319,42 @@ maxretry = ${FAIL2BAN_MAXRETRY}
 bantime  = ${FAIL2BAN_BANTIME}
 findtime = ${FAIL2BAN_FINDTIME}
 EOF
-
-  systemctl enable fail2ban >/dev/null 2>&1 || true
-  if ! systemctl restart fail2ban; then
+  chmod 600 "$tmp_jail" || { rm -f -- "$tmp_jail"; rm -rf -- "$txn_dir"; return 1; }
+  if ! mv -f -- "$tmp_jail" "$FAIL2BAN_JAIL_PATH" \
+     || ! fail2ban-client -t >/dev/null 2>&1 \
+     || ! systemctl enable fail2ban >/dev/null 2>&1 \
+     || ! systemctl restart fail2ban; then
+    local rollback_ok=1
+    fail2ban_transaction_restore "$txn_dir" "$was_active" "$was_enabled" || rollback_ok=0
     echo ""
-    echo -e "${R}fail2ban 启动失败，请运行 systemctl status fail2ban 查看原因${N}"
+    if [ "$rollback_ok" -eq 1 ]; then
+      echo -e "${R}fail2ban 配置校验或启动失败，已恢复旧 jail 与服务状态${N}"
+    else
+      echo -e "${R}fail2ban 配置失败，且回滚未完全成功，请立即检查服务状态${N}"
+    fi
     pause_screen
     return 1
   fi
 
   # 等待 socket 就绪再调用 fail2ban-client，避免首次启动竞争
-  local i
   for i in 1 2 3 4 5; do
-    if fail2ban-client ping >/dev/null 2>&1; then break; fi
+    if fail2ban-client ping >/dev/null 2>&1; then ping_ok=1; break; fi
     sleep 1
   done
+  if [ "$ping_ok" -ne 1 ]; then
+    local rollback_ok=1
+    fail2ban_transaction_restore "$txn_dir" "$was_active" "$was_enabled" || rollback_ok=0
+    if [ "$rollback_ok" -eq 1 ]; then
+      echo -e "${R}fail2ban socket 未就绪，已恢复旧配置与服务状态${N}"
+    else
+      echo -e "${R}fail2ban socket 未就绪，且回滚未完全成功，请立即检查服务状态${N}"
+    fi
+    pause_screen
+    return 1
+  fi
+  if ! rm -rf -- "$txn_dir"; then
+    echo -e "${Y}fail2ban 已生效，但事务临时目录清理失败：${txn_dir}${N}" >&2
+  fi
 
   echo ""
   echo -e "${G}fail2ban 已配置并启动${N}"
