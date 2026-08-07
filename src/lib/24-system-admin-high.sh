@@ -180,37 +180,15 @@ configure_ssh_port(){
     return 0
   fi
 
-  # 先确保密码登录可用（防止云镜像 sshd_config.d 默认禁用密码登录），
-  # 否则改完端口、关掉旧会话后普通用户就连不上了。
   echo ""
-  if ! ensure_password_auth_enabled; then
-    echo -e "${R}密码登录配置失败，已中止 SSH 端口修改${N}"
+  if ! node_apply_firewall_for_mode "$ssh_port" tcp dualstack; then
+    echo -e "${R}新 SSH 端口防火墙放行失败，已中止修改${N}"
     pause_screen
     return 1
   fi
 
-  allow_tcp_port_in_firewall "$ssh_port"
-
   if apply_sshd_setting "Port" "$ssh_port" "SSH 端口已更新并重启服务"; then
     cleanup_old_backups "${SSHD_CONFIG_PATH}.bak.*" 5
-
-    # iptables 兜底：如果旧端口在 INPUT 链有显式 ACCEPT 规则
-    # （常见于搬瓦工预装 iptables-persistent 的镜像），给新端口加同样的规则
-    if command -v iptables >/dev/null 2>&1 \
-       && iptables -C INPUT -p tcp --dport "$current_ssh_port" -j ACCEPT 2>/dev/null; then
-      if ! iptables -C INPUT -p tcp --dport "$ssh_port" -j ACCEPT 2>/dev/null; then
-        if iptables -I INPUT -p tcp --dport "$ssh_port" -j ACCEPT 2>/dev/null; then
-          echo -e "  ${G}已在 iptables INPUT 链放行 ${ssh_port}/tcp${N}"
-          if command -v netfilter-persistent >/dev/null 2>&1; then
-            netfilter-persistent save >/dev/null 2>&1 || true
-          elif [ -d /etc/iptables ]; then
-            iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
-          fi
-        else
-          echo -e "  ${Y}iptables 规则追加失败，请手动执行：iptables -I INPUT -p tcp --dport ${ssh_port} -j ACCEPT${N}"
-        fi
-      fi
-    fi
 
     server_ip=$(detect_primary_ipv4)
     server_ip="${server_ip:-你的IP}"
@@ -231,7 +209,7 @@ disable_root_ssh_login(){
   local has_key=0
   local has_passwd=0
   local can_login_user=""
-  local pwd_auth_effective=""
+  local pwd_auth_effective="" pubkey_auth_effective=""
 
   if ! require_root; then
     return 1
@@ -246,16 +224,7 @@ disable_root_ssh_login(){
     return 0
   fi
 
-  # 防呆 1：保证密码登录可用（幂等，已开启就跳过）
-  echo ""
-  if ! ensure_password_auth_enabled; then
-    echo -e "${R}密码登录配置失败，已中止禁用 root 登录${N}"
-    pause_screen
-    return 1
-  fi
-
-  # 防呆 2：必须至少有 1 个非 root 的 sudo 用户能 SSH 登录
-  pwd_auth_effective=$(get_effective_sshd_value PasswordAuthentication)
+  # 必须至少有 1 个非 root 的 sudo 用户按当前认证策略可 SSH 登录。
   sudo_users=$(getent group sudo 2>/dev/null | awk -F: '{print $4}' | tr ',' '\n' | grep -v '^root$' | grep -v '^$')
   if [ -z "$sudo_users" ]; then
     echo ""
@@ -271,8 +240,11 @@ disable_root_ssh_login(){
     [ -z "$user" ] && continue
     has_key=0
     has_passwd=0
+    pwd_auth_effective=$(get_effective_sshd_value PasswordAuthentication "$user")
+    pubkey_auth_effective=$(get_effective_sshd_value PubkeyAuthentication "$user")
     home_dir=$(getent passwd "$user" | cut -d: -f6)
-    if [ -n "$home_dir" ] && [ -s "$home_dir/.ssh/authorized_keys" ]; then
+    if [ "$pubkey_auth_effective" != "no" ] \
+       && [ -n "$home_dir" ] && [ -s "$home_dir/.ssh/authorized_keys" ]; then
       has_key=1
     fi
     if [ "$pwd_auth_effective" = "yes" ] \
@@ -447,4 +419,3 @@ remove_passwordless_sudo(){
   echo -e "${G}已移除 ${C}$username${N}${G} 的 sudo 免密规则${N}"
   pause_screen
 }
-

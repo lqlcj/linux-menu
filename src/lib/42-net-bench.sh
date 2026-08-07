@@ -9,7 +9,11 @@ NETBENCH_REPORT_PREFIX="/root/netbench-report"
 NETBENCH_IPERF_PORT_DEFAULT="15201"
 # 用带 -leyili 后缀的独立文件名：卸载时只删自己下载的，不动用户自装的 nexttrace
 NETBENCH_NEXTTRACE_BIN="/usr/local/bin/nexttrace-leyili"
-NETBENCH_NEXTTRACE_BASE="https://github.com/nxtrace/NTrace-core/releases/latest/download"
+NETBENCH_NEXTTRACE_VERSION="v1.7.1"
+NETBENCH_NEXTTRACE_BASE="https://github.com/nxtrace/NTrace-core/releases/download/${NETBENCH_NEXTTRACE_VERSION}"
+NETBENCH_NEXTTRACE_SHA256_AMD64="1f4c559cbdf6f667a1a9e050567c9cf1fc11741e8cc1e50f5fdcaf2dbb247232"
+NETBENCH_NEXTTRACE_SHA256_ARM64="9c2f1b79e7d0e37f59ebe685aec1d5c41fb8f3407f54e17b34656712eaa66fd9"
+NETBENCH_NEXTTRACE_SHA256_ARMV7="1eb8be9394b2ac40a991d4fa3e651960e107bc8c6757a35c5f4720c0ab8eb71d"
 
 # 追加一行纯文本到报告（报告不带 ANSI 色与缩进，方便整段复制给 AI）
 _nb_report(){
@@ -69,8 +73,15 @@ _nb_load_target(){
 }
 
 _nb_save_target(){
-  mkdir -p "$(dirname "$NETBENCH_ENV_PATH")" 2>/dev/null || true
-  printf 'NETBENCH_TARGET_IP=%s\n' "$1" > "$NETBENCH_ENV_PATH" 2>/dev/null || true
+  local tmp
+  ensure_private_dir "$(dirname -- "$NETBENCH_ENV_PATH")" 700 || return 1
+  tmp=$(mktemp "${NETBENCH_ENV_PATH}.tmp.XXXXXX") || return 1
+  if ! printf 'NETBENCH_TARGET_IP=%s\n' "$1" > "$tmp" \
+     || ! chmod 600 "$tmp" \
+     || ! mv -f -- "$tmp" "$NETBENCH_ENV_PATH"; then
+    rm -f -- "$tmp"
+    return 1
+  fi
 }
 
 _nb_latest_report(){
@@ -104,31 +115,45 @@ _nb_ensure_tools(){
 # 163 / CN2 / 4837 / 9929 / CMIN2 哪条线 —— AI 判断线路质量的关键输入。
 # 下载失败不致命，回落到只看 mtr 的 IP 段。
 _nb_ensure_nexttrace(){
-  local arch tmp
+  local arch tmp expected_sha actual_sha
   command -v nexttrace >/dev/null 2>&1 && return 0
-  [ -x "$NETBENCH_NEXTTRACE_BIN" ] && return 0
 
   case "$(uname -m)" in
-    x86_64|amd64)  arch="amd64" ;;
-    aarch64|arm64) arch="arm64" ;;
-    armv7l)        arch="armv7" ;;
+    x86_64|amd64)  arch="amd64"; expected_sha="$NETBENCH_NEXTTRACE_SHA256_AMD64" ;;
+    aarch64|arm64) arch="arm64"; expected_sha="$NETBENCH_NEXTTRACE_SHA256_ARM64" ;;
+    armv7l)        arch="armv7"; expected_sha="$NETBENCH_NEXTTRACE_SHA256_ARMV7" ;;
     *)
       echo -e "${Y}    未适配的架构 $(uname -m)，跳过 nexttrace（仅用 mtr 看路由）${N}"
       return 1
       ;;
   esac
 
-  echo -e "${Y}==> 下载 nexttrace（回程线路识别，仅首次）...${N}"
-  tmp=$(mktemp)
-  # dd 取 magic 校验是 ELF：GitHub 故障时可能拿到 HTML 报错页，不能直接 chmod 上岗
-  if curl -fsSL --max-time 90 "${NETBENCH_NEXTTRACE_BASE}/nexttrace_linux_${arch}" -o "$tmp" \
-     && [ "$(dd if="$tmp" bs=1 skip=1 count=3 2>/dev/null)" = "ELF" ]; then
-    chmod +x "$tmp"
-    if mv "$tmp" "$NETBENCH_NEXTTRACE_BIN"; then
+  if [ -x "$NETBENCH_NEXTTRACE_BIN" ]; then
+    actual_sha=$(sha256sum "$NETBENCH_NEXTTRACE_BIN" 2>/dev/null | awk '{print $1}')
+    if [ "$actual_sha" = "$expected_sha" ]; then
       return 0
     fi
+    mv -f -- "$NETBENCH_NEXTTRACE_BIN" "${NETBENCH_NEXTTRACE_BIN}.rejected.$(date +%Y%m%d%H%M%S)" 2>/dev/null || return 1
+    echo -e "${Y}    已隔离校验不通过的旧 nexttrace-leyili${N}"
   fi
-  rm -f "$tmp"
+
+  echo -e "${Y}==> 下载 nexttrace（回程线路识别，仅首次）...${N}"
+  tmp=$(mktemp)
+  if curl --proto '=https' --tlsv1.2 -fsSL --max-time 90 \
+       "${NETBENCH_NEXTTRACE_BASE}/nexttrace_linux_${arch}" -o "$tmp"; then
+    actual_sha=$(sha256sum "$tmp" 2>/dev/null | awk '{print $1}')
+    if [ "$actual_sha" = "$expected_sha" ] \
+       && [ "$(dd if="$tmp" bs=1 skip=1 count=3 2>/dev/null)" = "ELF" ]; then
+      if install -m 0755 "$tmp" "$NETBENCH_NEXTTRACE_BIN"; then
+        rm -f -- "$tmp"
+        echo -e "  ${D}nexttrace ${NETBENCH_NEXTTRACE_VERSION} SHA-256 校验通过${N}"
+        return 0
+      fi
+    else
+      echo -e "${Y}    nexttrace SHA-256 校验失败，拒绝执行${N}"
+    fi
+  fi
+  rm -f -- "$tmp"
   echo -e "${Y}    nexttrace 下载失败，回程线路将只有 mtr 数据${N}"
   return 1
 }
@@ -819,7 +844,8 @@ run_netbench(){
     target="$input"
     break
   done
-  _nb_save_target "$target"
+  _nb_save_target "$target" \
+    || echo -e "  ${Y}目标 IP 本次可用，但未能保存到 ${NETBENCH_ENV_PATH}${N}" >&2
 
   echo ""
   _nb_ensure_tools || true
@@ -916,4 +942,3 @@ show_netbench_menu(){
     esac
   done
 }
-

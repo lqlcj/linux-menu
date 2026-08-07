@@ -97,12 +97,8 @@ upgrade_singbox_kernel(){
     echo ""
     echo -e "${R}sing-box 升级失败，请检查上方输出${N}"
     pause_screen
-  elif ! systemctl restart sing-box; then
-    echo ""
-    echo -e "${R}升级完成，但服务重启失败${N}"
-    pause_screen
   else
-    echo -e "${G}升级完成${N}"
+    echo -e "${G}升级完成，配置与服务健康检查已通过${N}"
     sleep 1
   fi
 }
@@ -373,12 +369,14 @@ show_node_manage_menu(){
     render_section_header "节点管理"
     render_menu_item 1 "创建节点 (Reality / Hysteria2 / AnyTLS / TUIC / SS-2022)"
     render_menu_item 2 "卸载单个节点"
+    render_menu_item 3 "查看状态 / 节点配置"
     render_menu_item 0 "返回上级"
     render_divider
     read -p "  请输入序号: " choice
     case $choice in
       1) show_node_install_menu ;;
       2) show_node_uninstall_menu ;;
+      3) show_status_menu ;;
       0) return ;;
       *) notify_invalid_choice ;;
     esac

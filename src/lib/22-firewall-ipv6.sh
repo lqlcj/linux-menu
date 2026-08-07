@@ -29,7 +29,7 @@ show_ipv6_firewall_menu(){
     render_divider
     render_menu_item 1 "查看当前规则"
     render_menu_item 2 "查看监听 IPv6 的服务"
-    render_menu_item 3 "一键关闭所有 IPv6 入站端口"
+    render_menu_item 3 "初始化 IPv6 防火墙（默认拒绝，保留用户规则）"
     render_menu_item 4 "开放端口"
     render_menu_item 5 "关闭端口"
     render_menu_item 6 "紧急放行 (关闭 v6 防火墙)"
@@ -123,22 +123,19 @@ ip6_view_listening(){
 
 ip6_close_all_inbound(){
   local confirm
-  local backup_rules="" rb_choice="y" rb_pid="" rb_seconds=180
+  local txn
 
   echo ""
-  echo -e "  ${B}${C}一键关闭所有 IPv6 入站端口${N}"
+  echo -e "  ${B}${C}初始化 IPv6 防火墙${N}"
   render_divider
   echo "  本次会执行："
-  echo "    1) 清空当前 IPv6 INPUT 规则"
-  echo "    2) 放行回环 lo"
-  echo "    3) 放行已建立的连接 (ESTABLISHED, RELATED)"
-  echo "    4) 放行 ICMPv6 (NDP / 邻居发现, IPv6 网络必需)"
-  echo -e "    5) ${R}${B}不放行任何业务端口 (含 SSH/80/443/节点端口)${N}"
-  echo "    6) INPUT 默认策略 = DROP"
-  echo "    7) OUTPUT 保持 ACCEPT (出站不受影响)"
-  echo "    8) FORWARD 不动 (留给 Docker)"
+  echo -e "    1) 仅重建脚本专属链 ${C}${IP6_LEYILI_CHAIN}${N}，保留用户与 fail2ban 规则"
+  echo "    2) 放行回环、已建立连接和 ICMPv6 (NDP 必需)"
+  echo -e "    3) ${R}${B}脚本专属链不放行业务端口${N}"
+  echo "    4) INPUT 默认策略 = DROP"
+  echo "    5) OUTPUT / FORWARD 保持原样"
   echo ""
-  echo -e "  ${Y}效果：外部无法主动连入任何 IPv6 端口；本机 IPv6 出站仍可用，回包能进。${N}"
+  echo -e "  ${Y}效果：未被用户既有规则放行的 IPv6 新入站会被拒绝；出站与回包可用。${N}"
   echo -e "  ${D}如需 IPv6 提供 HTTP/HTTPS/SSH 等服务，请改用本菜单 ${C}4) 开放端口${N}${D}。${N}"
   echo ""
 
@@ -162,56 +159,36 @@ ip6_close_all_inbound(){
     return 0
   fi
 
-  # 兜底：是否启用延时自动回滚守护
-  echo ""
-  echo -e "  ${B}延时自动回滚守护（强烈建议启用）${N}"
-  echo -e "  ${D}启用后规则应用 ${rb_seconds}s 内若未手动取消，将自动恢复旧规则${N}"
-  read -p "  启用 ${rb_seconds}s 自动回滚守护？(Y/n): " rb_choice
-  if [ "$rb_choice" = "n" ] || [ "$rb_choice" = "N" ]; then
-    rb_choice="n"
-  else
-    rb_choice="y"
-    backup_rules=$(mktemp /tmp/leyili-ip6tables-rb.XXXXXX 2>/dev/null) || backup_rules=""
-    if [ -n "$backup_rules" ]; then
-      ip6tables-save > "$backup_rules" 2>/dev/null || { rm -f "$backup_rules"; backup_rules=""; }
-    fi
-  fi
-
   if ! ip6_ensure_persistence; then
     echo ""
     echo -e "${R}持久化工具安装失败${N}"
-    [ -n "$backup_rules" ] && rm -f "$backup_rules"
     pause_screen
     return 1
   fi
 
-  ip6tables -F INPUT
-  ip6tables -A INPUT -i lo -j ACCEPT
-  ip6tables -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
-  ip6tables -A INPUT -p ipv6-icmp -j ACCEPT
-  ip6tables -P INPUT DROP
-  ip6tables -P OUTPUT ACCEPT
-
-  if ! ip6_save_rules; then
-    echo -e "${Y}规则已生效，但持久化失败，重启后可能丢失${N}"
+  txn=$(firewall_transaction_begin 6) || { echo -e "${R}防火墙快照失败${N}"; pause_screen; return 1; }
+  if ! firewall_ensure_managed_chain 6 \
+     || ! ip6tables -F "$IP6_LEYILI_CHAIN" \
+     || ! ip6tables -A "$IP6_LEYILI_CHAIN" -i lo -m comment --comment "leyili-managed" -j ACCEPT \
+     || ! ip6tables -A "$IP6_LEYILI_CHAIN" -m conntrack --ctstate ESTABLISHED,RELATED -m comment --comment "leyili-managed" -j ACCEPT \
+     || ! ip6tables -A "$IP6_LEYILI_CHAIN" -p ipv6-icmp -m comment --comment "leyili-managed" -j ACCEPT \
+     || ! ip6tables -P INPUT DROP \
+     || ! ip6_save_rules; then
+    firewall_transaction_rollback 6 "$txn"
+    echo -e "${R}规则写入或持久化失败，已恢复原规则${N}"
+    pause_screen
+    return 1
   fi
+  firewall_transaction_commit "$txn"
 
   echo ""
-  echo -e "${G}所有 IPv6 入站端口已关闭${N}"
-
-  if [ "$rb_choice" = "y" ] && [ -n "$backup_rules" ]; then
-    rb_pid=$(schedule_iptables_rollback "$rb_seconds" "" "$backup_rules")
-    if [ -n "$rb_pid" ]; then
-      echo -e "  ${Y}延时回滚守护已启动 (PID ${rb_pid})，${rb_seconds}s 后自动恢复旧规则${N}"
-      echo -e "  ${B}请尽快开新终端验证 SSH/服务仍可用 (走 IPv4)，然后执行：${N}"
-      echo -e "    ${C}kill ${rb_pid} && rm -f ${backup_rules}${N}  ${D}# 取消回滚${N}"
-    fi
-  fi
+  echo -e "${G}IPv6 默认拒绝策略已启用${N}"
+  echo -e "  ${D}用户 INPUT 规则均已保留；未启动延时回滚守护。${N}"
   pause_screen
 }
 
 ip6_open_port(){
-  local proto_choice protos="" port proto changed=0
+  local proto_choice protos="" port proto changed=0 txn
 
   echo ""
   echo -e "  ${B}${C}开放端口${N}"
@@ -241,26 +218,34 @@ ip6_open_port(){
     return 1
   fi
 
+  txn=$(firewall_transaction_begin 6) || { echo -e "${R}防火墙快照失败${N}"; pause_screen; return 1; }
   for proto in $protos; do
-    if ip6tables -C INPUT -p "$proto" --dport "$port" -j ACCEPT 2>/dev/null; then
+    if ip6tables -C "$IP6_LEYILI_CHAIN" -p "$proto" --dport "$port" -m comment --comment "leyili-managed" -j ACCEPT 2>/dev/null; then
       echo -e "  ${Y}${port}/${proto} 已放行，跳过${N}"
     else
-      ip6tables -A INPUT -p "$proto" --dport "$port" -j ACCEPT
+      if ! firewall_add_managed_port 6 "$proto" "$port"; then
+        firewall_transaction_rollback 6 "$txn"
+        echo -e "${R}规则写入失败，已恢复原规则${N}"
+        pause_screen
+        return 1
+      fi
       echo -e "  ${G}已放行 ${port}/${proto}${N}"
       changed=1
     fi
   done
 
-  if [ "$changed" -eq 1 ]; then
-    if ! ip6_save_rules; then
-      echo -e "${Y}持久化失败${N}"
-    fi
+  if [ "$changed" -eq 1 ] && ! ip6_save_rules; then
+    firewall_transaction_rollback 6 "$txn"
+    echo -e "${R}持久化失败，已恢复原规则${N}"
+    pause_screen
+    return 1
   fi
+  firewall_transaction_commit "$txn"
   pause_screen
 }
 
 ip6_close_port(){
-  local proto_choice protos="" port ssh_port confirm proto removed=0
+  local proto_choice protos="" port ssh_port confirm proto removed=0 txn
 
   echo ""
   echo -e "  ${B}${C}关闭端口${N}"
@@ -304,34 +289,49 @@ ip6_close_port(){
     fi
   fi
 
+  txn=$(firewall_transaction_begin 6) || { echo -e "${R}防火墙快照失败${N}"; pause_screen; return 1; }
   for proto in $protos; do
-    while ip6tables -C INPUT -p "$proto" --dport "$port" -j ACCEPT 2>/dev/null; do
-      ip6tables -D INPUT -p "$proto" --dport "$port" -j ACCEPT
-      echo -e "  ${G}已删除 ${port}/${proto}${N}"
+    if ip6tables -C "$IP6_LEYILI_CHAIN" -p "$proto" --dport "$port" -m comment --comment "leyili-managed" -j ACCEPT 2>/dev/null; then
+      if ! firewall_remove_managed_port 6 "$proto" "$port"; then
+        firewall_transaction_rollback 6 "$txn"
+        echo -e "${R}删除失败，已恢复原规则${N}"
+        pause_screen
+        return 1
+      fi
+      echo -e "  ${G}已删除脚本托管规则 ${port}/${proto}${N}"
       removed=$((removed + 1))
-    done
+    fi
   done
 
   if [ "$removed" -eq 0 ]; then
     echo -e "  ${Y}端口 ${port} 在所选协议下没有放行规则${N}"
   else
     if ! ip6_save_rules; then
-      echo -e "${Y}持久化失败${N}"
+      firewall_transaction_rollback 6 "$txn"
+      echo -e "${R}持久化失败，已恢复原规则${N}"
+      pause_screen
+      return 1
     fi
   fi
+  firewall_transaction_commit "$txn"
+  for proto in $protos; do
+    if ip6tables -C INPUT -p "$proto" --dport "$port" -j ACCEPT 2>/dev/null; then
+      echo -e "  ${Y}提示：INPUT 中仍有非脚本托管的 ${port}/${proto} ACCEPT 规则，本菜单未删除。${N}"
+    fi
+  done
   pause_screen
 }
 
 ip6_emergency_disable(){
-  local confirm confirm2
+  local confirm confirm2 txn
 
   echo ""
   echo -e "  ${R}${B}紧急放行（关闭 v6 防火墙）${N}"
   render_divider
   echo "  执行后："
-  echo "    - 清空所有 IPv6 INPUT 规则"
-  echo "    - 默认策略改回 ACCEPT"
-  echo "    - v6 入站回到完全裸奔状态"
+  echo -e "    - 删除脚本专属链 ${C}${IP6_LEYILI_CHAIN}${N}"
+  echo "    - INPUT 默认策略改回 ACCEPT"
+  echo "    - 保留用户规则、fail2ban 与面板规则"
   echo ""
 
   read -p "  确认？(y/N): " confirm
@@ -347,14 +347,19 @@ ip6_emergency_disable(){
     return 0
   fi
 
-  ip6tables -P INPUT ACCEPT
-  ip6tables -F INPUT
-  if ! ip6_save_rules; then
-    echo -e "${Y}持久化失败${N}"
+  txn=$(firewall_transaction_begin 6) || { echo -e "${R}防火墙快照失败${N}"; pause_screen; return 1; }
+  if ! ip6tables -P INPUT ACCEPT \
+     || ! firewall_remove_managed_chain 6 \
+     || ! ip6_save_rules; then
+    firewall_transaction_rollback 6 "$txn"
+    echo -e "${R}操作失败，已恢复原规则${N}"
+    pause_screen
+    return 1
   fi
+  firewall_transaction_commit "$txn"
 
   echo ""
-  echo -e "${Y}已关闭 v6 防火墙${N}"
+  echo -e "${Y}已停用脚本管理的 v6 防火墙（用户/面板规则仍保留）${N}"
   pause_screen
 }
 

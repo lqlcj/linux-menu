@@ -1,21 +1,169 @@
 check_port_in_use(){
   local port="$1"
+  local proto="${2:-tcp}"
+  local ss_args="-tlnH"
+  local netstat_args="-tln"
 
   if [ -z "$port" ]; then
     return 1
   fi
 
+  case "$proto" in
+    udp) ss_args="-ulnH"; netstat_args="-uln" ;;
+    tcp) ;;
+    *) return 1 ;;
+  esac
+
   if command -v ss >/dev/null 2>&1; then
-    ss -tlnH 2>/dev/null | awk -v p=":${port}$" '$4 ~ p {found=1} END {exit !found}'
+    ss $ss_args 2>/dev/null | awk -v p=":${port}$" '$4 ~ p {found=1} END {exit !found}'
     return $?
   fi
 
   if command -v netstat >/dev/null 2>&1; then
-    netstat -tln 2>/dev/null | awk -v p=":${port}$" '$4 ~ p {found=1} END {exit !found}'
+    netstat $netstat_args 2>/dev/null | awk -v p=":${port}$" '$4 ~ p {found=1} END {exit !found}'
     return $?
   fi
 
   return 1
+}
+
+firewall_owned_port_key(){
+  printf '%s\t%s\t%s' "$1" "$2" "$3"
+}
+
+firewall_owned_port_has(){
+  local backend="$1" port="$2" proto="$3" key
+  [ -r "$FIREWALL_PORT_STATE" ] || return 1
+  key=$(firewall_owned_port_key "$backend" "$port" "$proto")
+  grep -Fqx "$key" "$FIREWALL_PORT_STATE"
+}
+
+firewall_owned_port_add(){
+  local backend="$1" port="$2" proto="$3" key tmp
+  ensure_leyili_state_dir || return 1
+  key=$(firewall_owned_port_key "$backend" "$port" "$proto")
+  tmp=$(mktemp "${FIREWALL_PORT_STATE}.tmp.XXXXXX") || return 1
+  if [ -f "$FIREWALL_PORT_STATE" ]; then
+    cat "$FIREWALL_PORT_STATE" > "$tmp" || { rm -f -- "$tmp"; return 1; }
+  fi
+  grep -Fqx "$key" "$tmp" 2>/dev/null || printf '%s\n' "$key" >> "$tmp" \
+    || { rm -f -- "$tmp"; return 1; }
+  chmod 600 "$tmp" || { rm -f -- "$tmp"; return 1; }
+  mv -f -- "$tmp" "$FIREWALL_PORT_STATE"
+}
+
+firewall_owned_port_remove(){
+  local backend="$1" port="$2" proto="$3" tmp
+  [ -f "$FIREWALL_PORT_STATE" ] || return 0
+  tmp=$(mktemp "${FIREWALL_PORT_STATE}.tmp.XXXXXX") || return 1
+  if ! awk -F '\t' -v b="$backend" -v p="$port" -v r="$proto" \
+      '!(NF >= 3 && $1 == b && $2 == p && $3 == r)' \
+      "$FIREWALL_PORT_STATE" > "$tmp"; then
+    rm -f -- "$tmp"
+    return 1
+  fi
+  chmod 600 "$tmp" || { rm -f -- "$tmp"; return 1; }
+  mv -f -- "$tmp" "$FIREWALL_PORT_STATE"
+}
+
+firewall_backend_port_exists(){
+  local backend="$1" port="$2" proto="$3"
+  case "$backend" in
+    ufw)
+      command -v ufw >/dev/null 2>&1 || return 1
+      ufw status 2>/dev/null | awk -v rule="${port}/${proto}" \
+        '$1 == rule && $2 == "ALLOW" { found=1 } END { exit !found }'
+      ;;
+    firewalld)
+      command -v firewall-cmd >/dev/null 2>&1 || return 1
+      firewall-cmd --permanent --query-port="${port}/${proto}" >/dev/null 2>&1
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+firewall_backend_add_port_raw(){
+  local backend="$1" port="$2" proto="$3"
+  case "$backend" in
+    ufw)
+      firewall_backend_port_exists ufw "$port" "$proto" && return 0
+      ufw allow "${port}/${proto}" >/dev/null 2>&1
+      ;;
+    firewalld)
+      firewall_backend_port_exists firewalld "$port" "$proto" && return 0
+      firewall-cmd --permanent --add-port="${port}/${proto}" >/dev/null 2>&1 \
+        && firewall-cmd --reload >/dev/null 2>&1
+      ;;
+    none) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+firewall_backend_remove_port_raw(){
+  local backend="$1" port="$2" proto="$3"
+  case "$backend" in
+    ufw)
+      firewall_backend_port_exists ufw "$port" "$proto" || return 0
+      ufw delete allow "${port}/${proto}" >/dev/null 2>&1
+      ;;
+    firewalld)
+      firewall_backend_port_exists firewalld "$port" "$proto" || return 0
+      firewall-cmd --permanent --remove-port="${port}/${proto}" >/dev/null 2>&1 \
+        && firewall-cmd --reload >/dev/null 2>&1
+      ;;
+    none) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+firewall_owned_ports_restore(){
+  local desired="$1" existed_marker="$2"
+  local current backend port proto rc=0
+
+  current=$(mktemp "${TMPDIR:-/tmp}/leyili-fw-owned.XXXXXX") || return 1
+  if [ -f "$FIREWALL_PORT_STATE" ]; then
+    cp -a -- "$FIREWALL_PORT_STATE" "$current" || { rm -f -- "$current"; return 1; }
+  else
+    : > "$current"
+  fi
+
+  while IFS=$'\t' read -r backend port proto; do
+    [ -n "$backend" ] && [ -n "$port" ] && [ -n "$proto" ] || continue
+    if ! grep -Fqx "$(firewall_owned_port_key "$backend" "$port" "$proto")" "$desired" 2>/dev/null; then
+      firewall_backend_remove_port_raw "$backend" "$port" "$proto" || rc=1
+    fi
+  done < "$current"
+  while IFS=$'\t' read -r backend port proto; do
+    [ -n "$backend" ] && [ -n "$port" ] && [ -n "$proto" ] || continue
+    if ! grep -Fqx "$(firewall_owned_port_key "$backend" "$port" "$proto")" "$current" 2>/dev/null; then
+      firewall_backend_add_port_raw "$backend" "$port" "$proto" || rc=1
+    fi
+  done < "$desired"
+
+  if [ -f "$existed_marker" ]; then
+    ensure_leyili_state_dir || rc=1
+    if [ "$rc" -eq 0 ]; then
+      restore_file_snapshot "$desired" "$FIREWALL_PORT_STATE" || rc=1
+      chmod 600 "$FIREWALL_PORT_STATE" 2>/dev/null || rc=1
+    fi
+  else
+    rm -f -- "$FIREWALL_PORT_STATE" || rc=1
+  fi
+  rm -f -- "$current"
+  return "$rc"
+}
+
+firewall_remove_all_owned_ports(){
+  local backend port proto rc=0
+  [ -f "$FIREWALL_PORT_STATE" ] || return 0
+  while IFS=$'\t' read -r backend port proto; do
+    [ -n "$backend" ] && [ -n "$port" ] && [ -n "$proto" ] || continue
+    firewall_backend_remove_port_raw "$backend" "$port" "$proto" || rc=1
+  done < "$FIREWALL_PORT_STATE"
+  if [ "$rc" -eq 0 ]; then
+    rm -f -- "$FIREWALL_PORT_STATE" || rc=1
+  fi
+  return "$rc"
 }
 
 detect_firewall_backend(){
@@ -40,24 +188,38 @@ allow_port_in_firewall(){
 
   case "$backend" in
     ufw)
-      if ufw allow "${port}/${proto}" >/dev/null 2>&1; then
-        echo -e "  防火墙  : ${C}ufw 已放行 ${port}/${proto}${N}"
+      if firewall_backend_port_exists ufw "$port" "$proto"; then
+        echo -e "  防火墙  : ${D}ufw 已有 ${port}/${proto} 规则，保持不变${N}"
+      elif firewall_backend_add_port_raw ufw "$port" "$proto" \
+           && firewall_owned_port_add ufw "$port" "$proto"; then
+        echo -e "  防火墙  : ${C}ufw 已放行 ${port}/${proto}（脚本托管）${N}"
       else
+        if ! firewall_backend_remove_port_raw ufw "$port" "$proto" >/dev/null 2>&1; then
+          echo -e "  防火墙  : ${R}ufw 所有权记录失败，且新增规则撤销失败，请立即检查 ${port}/${proto}${N}"
+        fi
         echo -e "  防火墙  : ${Y}ufw 放行失败，请手动执行 ufw allow ${port}/${proto}${N}"
+        return 1
       fi
       ;;
     firewalld)
-      if firewall-cmd --permanent --add-port="${port}/${proto}" >/dev/null 2>&1 \
-         && firewall-cmd --reload >/dev/null 2>&1; then
-        echo -e "  防火墙  : ${C}firewalld 已放行 ${port}/${proto}${N}"
+      if firewall_backend_port_exists firewalld "$port" "$proto"; then
+        echo -e "  防火墙  : ${D}firewalld 已有 ${port}/${proto} 规则，保持不变${N}"
+      elif firewall_backend_add_port_raw firewalld "$port" "$proto" \
+           && firewall_owned_port_add firewalld "$port" "$proto"; then
+        echo -e "  防火墙  : ${C}firewalld 已放行 ${port}/${proto}（脚本托管）${N}"
       else
+        if ! firewall_backend_remove_port_raw firewalld "$port" "$proto" >/dev/null 2>&1; then
+          echo -e "  防火墙  : ${R}firewalld 所有权记录失败，且新增规则撤销失败，请立即检查 ${port}/${proto}${N}"
+        fi
         echo -e "  防火墙  : ${Y}firewalld 放行失败，请手动执行 firewall-cmd --permanent --add-port=${port}/${proto}${N}"
+        return 1
       fi
       ;;
     *)
       echo -e "  防火墙  : ${D}未启用 ufw/firewalld（如有外部安全组请自行放行 ${port}/${proto}）${N}"
       ;;
   esac
+  return 0
 }
 
 allow_tcp_port_in_firewall(){
@@ -72,18 +234,117 @@ deny_port_in_firewall(){
 
   case "$backend" in
     ufw)
-      ufw delete allow "${port}/${proto}" >/dev/null 2>&1 || true
-      echo -e "  防火墙  : ${D}ufw 撤销 ${port}/${proto}${N}"
+      if firewall_owned_port_has ufw "$port" "$proto"; then
+        if ! firewall_backend_remove_port_raw ufw "$port" "$proto"; then
+          return 1
+        fi
+        if ! firewall_owned_port_remove ufw "$port" "$proto"; then
+          if ! firewall_backend_add_port_raw ufw "$port" "$proto" >/dev/null 2>&1; then
+            echo -e "${R}ufw 所有权记录更新失败，且旧规则恢复失败：${port}/${proto}${N}" >&2
+          fi
+          return 1
+        fi
+        echo -e "  防火墙  : ${D}ufw 已撤销脚本托管的 ${port}/${proto}${N}"
+      else
+        echo -e "  防火墙  : ${D}ufw 的 ${port}/${proto} 非脚本托管，已保留${N}"
+      fi
       ;;
     firewalld)
-      firewall-cmd --permanent --remove-port="${port}/${proto}" >/dev/null 2>&1 || true
-      firewall-cmd --reload >/dev/null 2>&1 || true
-      echo -e "  防火墙  : ${D}firewalld 撤销 ${port}/${proto}${N}"
+      if firewall_owned_port_has firewalld "$port" "$proto"; then
+        if ! firewall_backend_remove_port_raw firewalld "$port" "$proto"; then
+          return 1
+        fi
+        if ! firewall_owned_port_remove firewalld "$port" "$proto"; then
+          if ! firewall_backend_add_port_raw firewalld "$port" "$proto" >/dev/null 2>&1; then
+            echo -e "${R}firewalld 所有权记录更新失败，且旧规则恢复失败：${port}/${proto}${N}" >&2
+          fi
+          return 1
+        fi
+        echo -e "  防火墙  : ${D}firewalld 已撤销脚本托管的 ${port}/${proto}${N}"
+      else
+        echo -e "  防火墙  : ${D}firewalld 的 ${port}/${proto} 非脚本托管，已保留${N}"
+      fi
       ;;
     *)
       :
       ;;
   esac
+  return 0
+}
+
+firewall_managed_chain_exists(){
+  local family="$1"
+  local cmd chain
+  case "$family" in
+    4) cmd="iptables"; chain="$IP4_LEYILI_CHAIN" ;;
+    6) cmd="ip6tables"; chain="$IP6_LEYILI_CHAIN" ;;
+    *) return 1 ;;
+  esac
+  command -v "$cmd" >/dev/null 2>&1 || return 1
+  "$cmd" -nL "$chain" >/dev/null 2>&1
+}
+
+firewall_ensure_managed_chain(){
+  local family="$1"
+  local cmd chain
+  case "$family" in
+    4) cmd="iptables"; chain="$IP4_LEYILI_CHAIN" ;;
+    6) cmd="ip6tables"; chain="$IP6_LEYILI_CHAIN" ;;
+    *) return 1 ;;
+  esac
+  command -v "$cmd" >/dev/null 2>&1 || return 1
+  "$cmd" -nL "$chain" >/dev/null 2>&1 || "$cmd" -N "$chain" || return 1
+  # 放在 INPUT 末尾：先让 fail2ban / 用户已有规则执行，避免脚本 ACCEPT 绕过封禁链。
+  "$cmd" -C INPUT -j "$chain" >/dev/null 2>&1 || "$cmd" -A INPUT -j "$chain" || return 1
+}
+
+firewall_add_managed_port(){
+  local family="$1" proto="$2" port="$3"
+  local cmd chain
+  case "$family" in
+    4) cmd="iptables"; chain="$IP4_LEYILI_CHAIN" ;;
+    6) cmd="ip6tables"; chain="$IP6_LEYILI_CHAIN" ;;
+    *) return 1 ;;
+  esac
+  firewall_ensure_managed_chain "$family" || return 1
+  "$cmd" -C "$chain" -p "$proto" --dport "$port" -m comment --comment "leyili-managed" -j ACCEPT >/dev/null 2>&1 \
+    || "$cmd" -A "$chain" -p "$proto" --dport "$port" -m comment --comment "leyili-managed" -j ACCEPT
+}
+
+firewall_remove_managed_port(){
+  local family="$1" proto="$2" port="$3"
+  local cmd chain removed=0
+  case "$family" in
+    4) cmd="iptables"; chain="$IP4_LEYILI_CHAIN" ;;
+    6) cmd="ip6tables"; chain="$IP6_LEYILI_CHAIN" ;;
+    *) return 1 ;;
+  esac
+  firewall_managed_chain_exists "$family" || return 0
+  while "$cmd" -C "$chain" -p "$proto" --dport "$port" -m comment --comment "leyili-managed" -j ACCEPT >/dev/null 2>&1; do
+    if ! "$cmd" -D "$chain" -p "$proto" --dport "$port" -m comment --comment "leyili-managed" -j ACCEPT; then
+      return 1
+    fi
+    removed=1
+  done
+  [ "$removed" -eq 0 ] || return 0
+}
+
+firewall_remove_managed_chain(){
+  local family="$1"
+  local cmd chain
+  case "$family" in
+    4) cmd="iptables"; chain="$IP4_LEYILI_CHAIN" ;;
+    6) cmd="ip6tables"; chain="$IP6_LEYILI_CHAIN" ;;
+    *) return 1 ;;
+  esac
+  command -v "$cmd" >/dev/null 2>&1 || return 0
+  while "$cmd" -C INPUT -j "$chain" >/dev/null 2>&1; do
+    "$cmd" -D INPUT -j "$chain" || return 1
+  done
+  if "$cmd" -nL "$chain" >/dev/null 2>&1; then
+    "$cmd" -F "$chain" || return 1
+    "$cmd" -X "$chain" || return 1
+  fi
 }
 
 # 节点入站统一开放端口：
@@ -95,7 +356,7 @@ node_apply_firewall_for_mode(){
   local port="$1"
   local proto="${2:-tcp}"
   local mode="${3:-ipv4}"
-  local need_v4=0 need_v6=0
+  local need_v4=0 need_v6=0 backend txn
 
   case "$mode" in
     ipv4)              need_v4=1 ;;
@@ -104,41 +365,43 @@ node_apply_firewall_for_mode(){
     *)                 need_v4=1 ;;
   esac
 
-  # ufw / firewalld 是双栈，只要任一侧需要就调一次
+  backend=$(detect_firewall_backend)
+  # ufw / firewalld 是双栈，只要任一侧需要就调一次。
   if [ "$need_v4" = "1" ] || [ "$need_v6" = "1" ]; then
-    allow_port_in_firewall "$port" "$proto"
+    allow_port_in_firewall "$port" "$proto" || return 1
   fi
 
-  # 脚本自管的 iptables 防火墙（默认策略 DROP 时 INPUT 是白名单制）
-  if [ "$need_v4" = "1" ] && command -v iptables >/dev/null 2>&1; then
-    local v4_pol
-    v4_pol=$(ip4_get_input_policy 2>/dev/null || true)
-    if [ "$v4_pol" = "DROP" ]; then
-      if iptables -C INPUT -p "$proto" --dport "$port" -j ACCEPT 2>/dev/null; then
-        echo -e "  v4 防火墙: ${D}${port}/${proto} 已在放行列表${N}"
-      else
-        iptables -A INPUT -p "$proto" --dport "$port" -j ACCEPT 2>/dev/null \
-          && echo -e "  v4 防火墙: ${C}iptables 已放行 ${port}/${proto}${N}" \
-          || echo -e "  v4 防火墙: ${Y}iptables 放行失败，请手动检查${N}"
-        ip4_save_rules >/dev/null 2>&1 || true
-      fi
+  # ufw/firewalld 活跃时不再额外插裸 iptables ACCEPT，避免绕过其封禁语义。
+  if [ "$backend" != "none" ]; then
+    return 0
+  fi
+
+  if [ "$need_v4" = "1" ] && command -v iptables >/dev/null 2>&1 \
+     && { [ "$(ip4_get_input_policy 2>/dev/null)" = "DROP" ] || firewall_managed_chain_exists 4; }; then
+    txn=$(firewall_transaction_begin 4) || return 1
+    if firewall_add_managed_port 4 "$proto" "$port" && ip4_save_rules; then
+      firewall_transaction_commit "$txn"
+      echo -e "  v4 防火墙: ${C}已放行 ${port}/${proto}${N}"
+    else
+      firewall_transaction_rollback 4 "$txn"
+      echo -e "  v4 防火墙: ${R}放行失败，已恢复原规则${N}"
+      return 1
     fi
   fi
 
-  if [ "$need_v6" = "1" ] && command -v ip6tables >/dev/null 2>&1; then
-    local v6_pol
-    v6_pol=$(ip6_get_input_policy 2>/dev/null || true)
-    if [ "$v6_pol" = "DROP" ]; then
-      if ip6tables -C INPUT -p "$proto" --dport "$port" -j ACCEPT 2>/dev/null; then
-        echo -e "  v6 防火墙: ${D}${port}/${proto} 已在放行列表${N}"
-      else
-        ip6tables -A INPUT -p "$proto" --dport "$port" -j ACCEPT 2>/dev/null \
-          && echo -e "  v6 防火墙: ${C}ip6tables 已放行 ${port}/${proto}${N}" \
-          || echo -e "  v6 防火墙: ${Y}ip6tables 放行失败，请手动检查${N}"
-        ip6_save_rules >/dev/null 2>&1 || true
-      fi
+  if [ "$need_v6" = "1" ] && command -v ip6tables >/dev/null 2>&1 \
+     && { [ "$(ip6_get_input_policy 2>/dev/null)" = "DROP" ] || firewall_managed_chain_exists 6; }; then
+    txn=$(firewall_transaction_begin 6) || return 1
+    if firewall_add_managed_port 6 "$proto" "$port" && ip6_save_rules; then
+      firewall_transaction_commit "$txn"
+      echo -e "  v6 防火墙: ${C}已放行 ${port}/${proto}${N}"
+    else
+      firewall_transaction_rollback 6 "$txn"
+      echo -e "  v6 防火墙: ${R}放行失败，已恢复原规则${N}"
+      return 1
     fi
   fi
+  return 0
 }
 
 # 节点入站统一撤销端口（uninstall / 改端口时配套使用）
@@ -147,7 +410,7 @@ node_revoke_firewall_for_mode(){
   local port="$1"
   local proto="${2:-tcp}"
   local mode="${3:-ipv4}"
-  local need_v4=0 need_v6=0
+  local need_v4=0 need_v6=0 backend txn
 
   case "$mode" in
     ipv4)              need_v4=1 ;;
@@ -156,33 +419,35 @@ node_revoke_firewall_for_mode(){
     *)                 need_v4=1 ;;
   esac
 
+  backend=$(detect_firewall_backend)
   if [ "$need_v4" = "1" ] || [ "$need_v6" = "1" ]; then
-    deny_port_in_firewall "$port" "$proto"
+    deny_port_in_firewall "$port" "$proto" || return 1
   fi
 
-  if [ "$need_v4" = "1" ] && command -v iptables >/dev/null 2>&1; then
-    local v4_removed=0
-    while iptables -C INPUT -p "$proto" --dport "$port" -j ACCEPT 2>/dev/null; do
-      iptables -D INPUT -p "$proto" --dport "$port" -j ACCEPT 2>/dev/null || break
-      v4_removed=1
-    done
-    if [ "$v4_removed" = "1" ]; then
-      echo -e "  v4 防火墙: ${D}iptables 撤销 ${port}/${proto}${N}"
-      ip4_save_rules >/dev/null 2>&1 || true
+  [ "$backend" != "none" ] && return 0
+
+  if [ "$need_v4" = "1" ] && firewall_managed_chain_exists 4; then
+    txn=$(firewall_transaction_begin 4) || return 1
+    if firewall_remove_managed_port 4 "$proto" "$port" && ip4_save_rules; then
+      firewall_transaction_commit "$txn"
+      echo -e "  v4 防火墙: ${D}已撤销 ${port}/${proto}${N}"
+    else
+      firewall_transaction_rollback 4 "$txn"
+      return 1
     fi
   fi
 
-  if [ "$need_v6" = "1" ] && command -v ip6tables >/dev/null 2>&1; then
-    local v6_removed=0
-    while ip6tables -C INPUT -p "$proto" --dport "$port" -j ACCEPT 2>/dev/null; do
-      ip6tables -D INPUT -p "$proto" --dport "$port" -j ACCEPT 2>/dev/null || break
-      v6_removed=1
-    done
-    if [ "$v6_removed" = "1" ]; then
-      echo -e "  v6 防火墙: ${D}ip6tables 撤销 ${port}/${proto}${N}"
-      ip6_save_rules >/dev/null 2>&1 || true
+  if [ "$need_v6" = "1" ] && firewall_managed_chain_exists 6; then
+    txn=$(firewall_transaction_begin 6) || return 1
+    if firewall_remove_managed_port 6 "$proto" "$port" && ip6_save_rules; then
+      firewall_transaction_commit "$txn"
+      echo -e "  v6 防火墙: ${D}已撤销 ${port}/${proto}${N}"
+    else
+      firewall_transaction_rollback 6 "$txn"
+      return 1
     fi
   fi
+  return 0
 }
 
 # 给用户打印"请自行放行端口"的提示，覆盖 IPv4(ufw/firewalld)、IPv6(本脚本菜单)、云安全组
@@ -333,31 +598,101 @@ ensure_iptables_installed(){
 
 ip6_save_rules(){
   local target="$IP6_RULES_PATH_DEBIAN"
+  local tmp
 
   if ! is_debian_family; then
     target="$IP6_RULES_PATH_RHEL"
   fi
 
-  mkdir -p "$(dirname "$target")"
-  if ! ip6tables-save > "$target"; then
+  mkdir -p "$(dirname "$target")" || return 1
+  tmp=$(mktemp "${target}.tmp.XXXXXX") || return 1
+  if ! ip6tables-save > "$tmp"; then
+    rm -f -- "$tmp"
     return 1
   fi
-  return 0
+  chmod 600 "$tmp" || { rm -f -- "$tmp"; return 1; }
+  mv -f -- "$tmp" "$target"
 }
 
 # ─── IPv4 防火墙底层 helpers ──────────────────────────
 ip4_save_rules(){
   local target="$IP4_RULES_PATH_DEBIAN"
+  local tmp
 
   if ! is_debian_family; then
     target="$IP4_RULES_PATH_RHEL"
   fi
 
-  mkdir -p "$(dirname "$target")"
-  if ! iptables-save > "$target"; then
+  mkdir -p "$(dirname "$target")" || return 1
+  tmp=$(mktemp "${target}.tmp.XXXXXX") || return 1
+  if ! iptables-save > "$tmp"; then
+    rm -f -- "$tmp"
     return 1
   fi
-  return 0
+  chmod 600 "$tmp" || { rm -f -- "$tmp"; return 1; }
+  mv -f -- "$tmp" "$target"
+}
+
+firewall_transaction_begin(){
+  local family="$1"
+  local txn save_cmd target
+
+  case "$family" in
+    4)
+      save_cmd="iptables-save"
+      target="$IP4_RULES_PATH_DEBIAN"
+      is_debian_family || target="$IP4_RULES_PATH_RHEL"
+      ;;
+    6)
+      save_cmd="ip6tables-save"
+      target="$IP6_RULES_PATH_DEBIAN"
+      is_debian_family || target="$IP6_RULES_PATH_RHEL"
+      ;;
+    *) return 1 ;;
+  esac
+  command -v "$save_cmd" >/dev/null 2>&1 || return 1
+  txn=$(mktemp -d "${TMPDIR:-/tmp}/leyili-fw${family}.XXXXXX") || return 1
+  chmod 700 "$txn" 2>/dev/null || { rm -rf -- "$txn"; return 1; }
+  if ! "$save_cmd" > "$txn/active.rules"; then
+    rm -rf -- "$txn"
+    return 1
+  fi
+  printf '%s\n' "$target" > "$txn/persistent.path"
+  if [ -f "$target" ]; then
+    cp -a -- "$target" "$txn/persistent.rules" || { rm -rf -- "$txn"; return 1; }
+    : > "$txn/persistent.existed"
+  fi
+  printf '%s' "$txn"
+}
+
+firewall_transaction_rollback(){
+  local family="$1" txn="$2"
+  local restore_cmd target rc=0
+
+  [ -d "$txn" ] || return 1
+  case "$family" in
+    4) restore_cmd="iptables-restore" ;;
+    6) restore_cmd="ip6tables-restore" ;;
+    *) return 1 ;;
+  esac
+  "$restore_cmd" < "$txn/active.rules" 2>/dev/null || rc=1
+  target=$(cat "$txn/persistent.path" 2>/dev/null)
+  if [ -n "$target" ]; then
+    if [ -f "$txn/persistent.existed" ]; then
+      restore_file_snapshot "$txn/persistent.rules" "$target" || rc=1
+    else
+      rm -f -- "$target" || rc=1
+    fi
+  fi
+  if [ "$rc" -eq 0 ]; then
+    rm -rf -- "$txn" || rc=1
+  fi
+  [ "$rc" -eq 0 ] || echo -e "${R}警告：IPv${family} 防火墙回滚未完全成功，请立即检查规则；快照保留在 ${txn}${N}" >&2
+  return "$rc"
+}
+
+firewall_transaction_commit(){
+  rm -rf -- "$1"
 }
 
 ip4_get_input_policy(){
@@ -400,55 +735,28 @@ ip4_detect_1panel(){
   return 1
 }
 
-# 把 IPv4 防火墙交还 1Panel：清掉 INPUT 规则 + 默认策略 ACCEPT，并持久化
+# 把 IPv4 防火墙交还 1Panel：只清脚本专属链，保留用户/fail2ban 规则。
 ip4_handover_to_1panel(){
-  iptables -P INPUT ACCEPT 2>/dev/null || return 1
-  iptables -F INPUT 2>/dev/null || return 1
-  ip4_save_rules >/dev/null 2>&1 || true
-  return 0
+  local txn
+  txn=$(firewall_transaction_begin 4) || return 1
+  if iptables -P INPUT ACCEPT \
+     && firewall_remove_managed_chain 4 \
+     && ip4_save_rules; then
+    firewall_transaction_commit "$txn"
+    return 0
+  fi
+  firewall_transaction_rollback 4 "$txn"
+  return 1
 }
 
-# ─── 防火墙锁库兜底机制 ──────────────────────────────
-# 验证 sshd 真的在指定端口监听（不依赖 sshd 进程名 grep，更稳）
+# ─── 防火墙锁库校验 ──────────────────────────────────
+# 验证指定 SSH 端口确实在监听；兼容 ssh.socket 下监听进程显示为 systemd。
 verify_sshd_listening_on_port(){
   local port="$1"
   if [ -z "$port" ]; then return 1; fi
   # 无 ss 工具时无法验证 → 视为未通过，让调用方触发回滚保护
   # （ss 在 Debian/Ubuntu 默认 iproute2 内，缺失极罕见）
   command -v ss >/dev/null 2>&1 || return 1
-  ss -tlnp 2>/dev/null \
-    | awk -v p=":${port}$" '$4 ~ p && $0 ~ /sshd/ {found=1} END {exit !found}'
-}
-
-# 安排一个延时回滚守护：seconds 秒后自动恢复 iptables/ip6tables 备份
-# 用法：rb_pid=$(schedule_iptables_rollback 180 /tmp/v4.bak /tmp/v6.bak)
-# 取消：cancel_rollback_pid "$rb_pid"
-schedule_iptables_rollback(){
-  local seconds="${1:-180}"
-  local backup_v4="${2:-}"
-  local backup_v6="${3:-}"
-  local cmd=""
-
-  if [ -n "$backup_v4" ] && [ -s "$backup_v4" ]; then
-    cmd="iptables-restore < '$backup_v4' 2>/dev/null; "
-  fi
-  if [ -n "$backup_v6" ] && [ -s "$backup_v6" ]; then
-    cmd="${cmd}ip6tables-restore < '$backup_v6' 2>/dev/null; "
-  fi
-  if [ -z "$cmd" ]; then
-    return 1
-  fi
-
-  # 用 setsid 让守护脱离会话，避免 SSH 断开被 SIGHUP 杀掉
-  setsid bash -c "sleep $seconds; $cmd rm -f '$backup_v4' '$backup_v6' 2>/dev/null" \
-    </dev/null >/dev/null 2>&1 &
-  local pid=$!
-  disown "$pid" 2>/dev/null || true
-  printf '%s' "$pid"
-}
-
-cancel_rollback_pid(){
-  local pid="$1"
-  [ -n "$pid" ] || return 0
-  kill "$pid" 2>/dev/null || true
+  ss -tlnH 2>/dev/null \
+    | awk -v p=":${port}$" '$4 ~ p {found=1} END {exit !found}'
 }

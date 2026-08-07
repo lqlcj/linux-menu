@@ -9,8 +9,15 @@ get_latest_singbox_version(){
 # 命中且未过期 → 直接读缓存；过期/不存在 → 拉一次并写回。
 # 拉取失败时写空内容作为「负缓存」，短 TTL 内不再重试，避免每次刷新都卡 5 秒。
 get_latest_singbox_version_cached(){
-  local now mtime age content ttl ver
-  if [ -f "$SINGBOX_LATEST_CACHE" ]; then
+  local now mtime age content ttl ver cache_ok=0 tmp_cache
+  if [ ! -L "$LEYILI_CACHE_DIR" ] && ! [ -L "$SINGBOX_LATEST_CACHE" ]; then
+    if [ "$(id -u)" -eq 0 ]; then
+      ensure_private_dir "$LEYILI_CACHE_DIR" 700 >/dev/null 2>&1 && cache_ok=1
+    elif [ -d "$LEYILI_CACHE_DIR" ] && [ -r "$SINGBOX_LATEST_CACHE" ]; then
+      cache_ok=1
+    fi
+  fi
+  if [ "$cache_ok" = "1" ] && [ -f "$SINGBOX_LATEST_CACHE" ]; then
     now=$(date +%s 2>/dev/null || echo 0)
     mtime=$(stat -c %Y "$SINGBOX_LATEST_CACHE" 2>/dev/null || echo 0)
     age=$((now - mtime))
@@ -22,7 +29,15 @@ get_latest_singbox_version_cached(){
     fi
   fi
   ver=$(get_latest_singbox_version)
-  printf '%s' "$ver" > "$SINGBOX_LATEST_CACHE" 2>/dev/null || true
+  if [ "$cache_ok" = "1" ] && [ -w "$LEYILI_CACHE_DIR" ]; then
+    tmp_cache=$(mktemp "${SINGBOX_LATEST_CACHE}.tmp.XXXXXX" 2>/dev/null || true)
+    if [ -n "$tmp_cache" ]; then
+      printf '%s' "$ver" > "$tmp_cache" 2>/dev/null \
+        && chmod 600 "$tmp_cache" 2>/dev/null \
+        && mv -f -- "$tmp_cache" "$SINGBOX_LATEST_CACHE" 2>/dev/null \
+        || rm -f -- "$tmp_cache"
+    fi
+  fi
   printf '%s' "$ver"
 }
 
@@ -63,6 +78,7 @@ sb_version_at_least(){
 update_self_script(){
   local tmp_file=""
   local confirm=""
+  local actual_sha="" size="" stage_file="" backup_path=""
 
   if ! require_root; then
     return 1
@@ -79,9 +95,33 @@ update_self_script(){
   echo -e "${Y}==> 下载最新脚本...${N}"
   tmp_file=$(mktemp)
   trap 'rm -f "$tmp_file"' RETURN
-  if ! curl -fsSL --max-time 15 "$SELF_INSTALL_URL" -o "$tmp_file"; then
+  case "$SELF_INSTALL_URL" in
+    https://*) ;;
+    *)
+      echo -e "${R}自更新地址必须使用 HTTPS：$SELF_INSTALL_URL${N}"
+      pause_screen
+      return 1
+      ;;
+  esac
+  if ! curl --proto '=https' --tlsv1.2 -fsSL --max-time 30 "$SELF_INSTALL_URL" -o "$tmp_file"; then
     rm -f "$tmp_file"
     echo -e "${R}下载失败，请检查网络或 SELF_INSTALL_URL${N}"
+    pause_screen
+    return 1
+  fi
+
+  size=$(wc -c < "$tmp_file" 2>/dev/null | tr -d ' ')
+  if [ -z "$size" ] || [ "$size" -lt 50000 ] || [ "$size" -gt 2097152 ]; then
+    echo -e "${R}新脚本大小异常（${size:-未知} 字节），已放弃更新${N}"
+    pause_screen
+    return 1
+  fi
+
+  if ! head -n 1 "$tmp_file" | grep -Eq '^#!/(usr/)?bin/(env )?bash' \
+     || ! grep -Fq 'APP_NAME="Leyili"' "$tmp_file" \
+     || ! grep -Fq 'show_menu' "$tmp_file" \
+     || ! grep -Fq 'acquire_global_lock' "$tmp_file"; then
+    echo -e "${R}下载内容缺少 Leyili 脚本结构标记，已放弃更新${N}"
     pause_screen
     return 1
   fi
@@ -93,6 +133,17 @@ update_self_script(){
     return 1
   fi
 
+  actual_sha=$(sha256sum "$tmp_file" 2>/dev/null | awk '{print $1}')
+  if [ -n "$SELF_INSTALL_SHA256" ]; then
+    if [ "$(printf '%s' "$actual_sha" | tr 'A-F' 'a-f')" != "$(printf '%s' "$SELF_INSTALL_SHA256" | tr 'A-F' 'a-f')" ]; then
+      echo -e "${R}新脚本 SHA-256 不匹配，已放弃更新${N}"
+      echo -e "  预期: ${C}${SELF_INSTALL_SHA256}${N}"
+      echo -e "  实际: ${C}${actual_sha:-无法计算}${N}"
+      pause_screen
+      return 1
+    fi
+  fi
+
   if [ -f "$SCRIPT_PATH" ] && cmp -s "$tmp_file" "$SCRIPT_PATH"; then
     rm -f "$tmp_file"
     echo -e "${G}当前已是最新版本${N}"
@@ -101,22 +152,59 @@ update_self_script(){
   fi
 
   echo -e "  来源: ${C}$SELF_INSTALL_URL${N}"
-  read -p "  确认覆盖 ${SCRIPT_PATH}？(y/N): " confirm
-  if [ "$confirm" != "y" ] && [ "$confirm" != "Y" ]; then
+  echo -e "  SHA-256: ${C}${actual_sha:-无法计算}${N}"
+  if [ -z "$SELF_INSTALL_SHA256" ]; then
+    echo -e "  ${Y}未配置 SELF_INSTALL_SHA256，来源身份无法做固定哈希校验。${N}"
+    read -p "  如已人工核对上方哈希，输入 UNVERIFIED 继续: " confirm
+    if [ "$confirm" != "UNVERIFIED" ]; then
+      echo -e "  已取消"
+      sleep 1
+      return 0
+    fi
+  else
+    read -p "  哈希校验通过，确认覆盖 ${SCRIPT_PATH}？(y/N): " confirm
+    if [ "$confirm" != "y" ] && [ "$confirm" != "Y" ]; then
+      echo -e "  已取消"
+      sleep 1
+      return 0
+    fi
+  fi
+  if [ -z "$confirm" ]; then
     rm -f "$tmp_file"
     echo -e "  已取消"
     sleep 1
     return 0
   fi
 
+  if [ -L "$SCRIPT_PATH" ]; then
+    echo -e "${R}拒绝覆盖符号链接脚本入口：${SCRIPT_PATH}${N}"
+    pause_screen
+    return 1
+  fi
+  mkdir -p -- "$(dirname -- "$SCRIPT_PATH")" || return 1
+  stage_file=$(mktemp "${SCRIPT_PATH}.new.XXXXXX") || return 1
+  if ! install -m 0755 "$tmp_file" "$stage_file"; then
+    rm -f -- "$stage_file"
+    echo -e "${R}准备新脚本失败${N}"
+    pause_screen
+    return 1
+  fi
   if [ -f "$SCRIPT_PATH" ]; then
-    cp "$SCRIPT_PATH" "${SCRIPT_PATH}.bak.$(date +%Y%m%d%H%M%S)" 2>/dev/null || true
-    cleanup_old_backups "${SCRIPT_PATH}.bak.*" 3
+    backup_path="${SCRIPT_PATH}.bak.$(date +%Y%m%d%H%M%S)"
+    if ! cp -a -- "$SCRIPT_PATH" "$backup_path"; then
+      rm -f -- "$stage_file"
+      echo -e "${R}旧脚本备份失败，已取消覆盖${N}"
+      pause_screen
+      return 1
+    fi
+    cleanup_old_backups "${SCRIPT_PATH}.bak.*" 3 \
+      || echo -e "${Y}旧脚本备份轮转失败，新版本仍会继续安装${N}" >&2
   fi
 
-  if ! install -m 0755 "$tmp_file" "$SCRIPT_PATH"; then
+  if ! mv -f -- "$stage_file" "$SCRIPT_PATH"; then
+    rm -f -- "$stage_file"
     rm -f "$tmp_file"
-    echo -e "${R}写入 $SCRIPT_PATH 失败${N}"
+    echo -e "${R}原子替换 $SCRIPT_PATH 失败，旧入口保持不变${N}"
     pause_screen
     return 1
   fi
@@ -154,6 +242,7 @@ view_singbox_config(){
 edit_singbox_config(){
   local editor_bin=""
   local backup_path=""
+  local txn="" rollback="" rollback_ok=1 editor_rc=0
 
   if ! require_root; then
     return 1
@@ -192,15 +281,29 @@ edit_singbox_config(){
     return 1
   fi
 
-  "$editor_bin" "$CONFIG_PATH"
+  txn=$(config_transaction_begin manual-edit) || {
+    echo -e "${R}配置事务快照失败${N}"
+    pause_screen
+    return 1
+  }
+
+  "$editor_bin" "$CONFIG_PATH" || editor_rc=$?
+  if [ "$editor_rc" -ne 0 ]; then
+    echo -e "${Y}编辑器退出码为 ${editor_rc}，继续以配置校验结果为准${N}"
+  fi
 
   if ! sing-box check -c "$CONFIG_PATH"; then
     echo ""
     read -p "  配置校验失败，是否回滚到编辑前备份？(Y/n): " rollback
     if [ "$rollback" != "n" ] && [ "$rollback" != "N" ]; then
-      cp "$backup_path" "$CONFIG_PATH"
-      echo -e "${G}已回滚${N}"
+      config_transaction_rollback "$txn" || rollback_ok=0
+      if [ "$rollback_ok" -eq 1 ]; then
+        echo -e "${G}已回滚配置与服务状态${N}"
+      else
+        echo -e "${R}回滚未完全成功，请立即检查；事务快照已保留${N}"
+      fi
     else
+      config_transaction_commit "$txn"
       echo -e "${Y}已保留有问题的配置（备份：$backup_path）${N}"
     fi
     pause_screen
@@ -208,14 +311,20 @@ edit_singbox_config(){
   fi
 
   if ! systemctl restart sing-box; then
-    cp "$backup_path" "$CONFIG_PATH" 2>/dev/null || true
-    systemctl restart sing-box >/dev/null 2>&1 || true
-    echo -e "${R}服务重启失败，已回滚${N}"
+    config_transaction_rollback "$txn" || rollback_ok=0
+    if [ "$rollback_ok" -eq 1 ]; then
+      echo -e "${R}服务重启失败，已回滚配置与服务状态${N}"
+    else
+      echo -e "${R}服务重启失败，且回滚未完全成功，请立即检查 sing-box${N}"
+    fi
     pause_screen
     return 1
   fi
 
-  cleanup_old_backups "${CONFIG_PATH}.bak.*" 5
+  config_transaction_commit "$txn"
+
+  cleanup_old_backups "${CONFIG_PATH}.bak.*" 5 \
+    || echo -e "${Y}旧配置备份轮转失败，本次配置已正常生效${N}" >&2
 
   echo ""
   echo -e "${G}配置已更新并重启服务${N}"
@@ -232,12 +341,16 @@ cleanup_config_backups(){
   fi
 
   count=$(ls -1 "${CONFIG_PATH}".bak.* 2>/dev/null | wc -l)
+  count=$((count + $(ls -1 "${CONFIG_PATH}".*.bak 2>/dev/null | wc -l)))
   count=$((count + $(ls -1 "${SSHD_CONFIG_PATH}".bak.* 2>/dev/null | wc -l)))
+  count=$((count + $(ls -1 "${FAIL2BAN_JAIL_PATH}".bak.* 2>/dev/null | wc -l)))
   count=$((count + $(ls -1 "${SCRIPT_PATH}".bak.* 2>/dev/null | wc -l)))
 
   echo ""
   echo -e "  ${B}当前备份文件${N}"
-  ls -1 "${CONFIG_PATH}".bak.* "${SSHD_CONFIG_PATH}".bak.* "${SCRIPT_PATH}".bak.* 2>/dev/null || true
+  ls -1 "${CONFIG_PATH}".bak.* "${CONFIG_PATH}".*.bak \
+        "${SSHD_CONFIG_PATH}".bak.* "${FAIL2BAN_JAIL_PATH}".bak.* \
+        "${SCRIPT_PATH}".bak.* 2>/dev/null || true
   echo ""
   if [ "$count" -eq 0 ]; then
     echo -e "${Y}无需清理${N}"
@@ -262,9 +375,15 @@ cleanup_config_backups(){
     return 0
   fi
 
-  cleanup_old_backups "${CONFIG_PATH}.bak.*" "$keep"
-  cleanup_old_backups "${SSHD_CONFIG_PATH}.bak.*" "$keep"
-  cleanup_old_backups "${SCRIPT_PATH}.bak.*" "$keep"
+  if ! cleanup_old_backups "${CONFIG_PATH}.bak.*" "$keep" \
+     || ! cleanup_old_backups "${CONFIG_PATH}.*.bak" "$keep" \
+     || ! cleanup_old_backups "${SSHD_CONFIG_PATH}.bak.*" "$keep" \
+     || ! cleanup_old_backups "${FAIL2BAN_JAIL_PATH}.bak.*" "$keep" \
+     || ! cleanup_old_backups "${SCRIPT_PATH}.bak.*" "$keep"; then
+    echo -e "${R}部分备份删除失败，请检查文件权限${N}"
+    pause_screen
+    return 1
+  fi
 
   echo ""
   echo -e "${G}备份已清理${N}"

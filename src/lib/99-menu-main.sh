@@ -42,7 +42,7 @@ show_menu(){
     render_menu_item 1 "管理员设置"
     render_menu_item 2 "系统基础设置"
     render_menu_item 3 "${main_action_label}"
-    render_menu_item 4 "查看状态"
+    render_menu_item 4 "网络管理"
     render_menu_item 5 "防火墙管理"
     render_menu_item 6 "卸载脚本"
     render_menu_item 7 "更新管理"
@@ -65,7 +65,7 @@ show_menu(){
         fi
         ;;
       4)
-        show_status_menu
+        show_network_menu
         ;;
       5)
         show_firewall_menu
@@ -84,3 +84,4 @@ show_menu(){
         ;;
     esac
   done
+}

@@ -47,20 +47,19 @@ port_hop_list_conflicts(){
 
 port_hop_apply_v4(){
   local port="$1" start="$2" end="$3" listen="$4"
-  iptables -t nat -N "$PORT_HOP_NAT_CHAIN" 2>/dev/null || true
-  iptables -t nat -F "$PORT_HOP_NAT_CHAIN"
+  command -v iptables >/dev/null 2>&1 || return 1
+  iptables -t nat -nL "$PORT_HOP_NAT_CHAIN" >/dev/null 2>&1 \
+    || iptables -t nat -N "$PORT_HOP_NAT_CHAIN" || return 1
+  iptables -t nat -F "$PORT_HOP_NAT_CHAIN" || return 1
   if [ -z "$listen" ] || [ "$listen" = "0.0.0.0" ]; then
     iptables -t nat -A "$PORT_HOP_NAT_CHAIN" -p udp \
-      --dport "${start}:${end}" -j REDIRECT --to-ports "$port"
+      --dport "${start}:${end}" -j REDIRECT --to-ports "$port" || return 1
   else
     iptables -t nat -A "$PORT_HOP_NAT_CHAIN" -p udp \
-      --dport "${start}:${end}" -j DNAT --to-destination "${listen}:${port}"
+      --dport "${start}:${end}" -j DNAT --to-destination "${listen}:${port}" || return 1
   fi
   iptables -t nat -C PREROUTING -j "$PORT_HOP_NAT_CHAIN" 2>/dev/null \
-    || iptables -t nat -I PREROUTING 1 -j "$PORT_HOP_NAT_CHAIN"
-  # filter 表 INPUT 看到的是 DNAT/REDIRECT 之后的 dport（主端口），所以放行主端口而非 hop 范围
-  iptables -C INPUT -p udp --dport "$port" -j ACCEPT 2>/dev/null \
-    || iptables -A INPUT -p udp --dport "$port" -j ACCEPT
+    || iptables -t nat -I PREROUTING 1 -j "$PORT_HOP_NAT_CHAIN" || return 1
 }
 
 port_hop_apply_v6(){
@@ -68,39 +67,42 @@ port_hop_apply_v6(){
   if ! command -v ip6tables >/dev/null 2>&1; then
     return 0
   fi
-  ip6tables -t nat -N "$PORT_HOP_NAT_CHAIN" 2>/dev/null || true
-  ip6tables -t nat -F "$PORT_HOP_NAT_CHAIN"
+  ip6tables -t nat -nL "$PORT_HOP_NAT_CHAIN" >/dev/null 2>&1 \
+    || ip6tables -t nat -N "$PORT_HOP_NAT_CHAIN" || return 1
+  ip6tables -t nat -F "$PORT_HOP_NAT_CHAIN" || return 1
   if [ -z "$listen" ] || [ "$listen" = "::" ]; then
     ip6tables -t nat -A "$PORT_HOP_NAT_CHAIN" -p udp \
-      --dport "${start}:${end}" -j REDIRECT --to-ports "$port"
+      --dport "${start}:${end}" -j REDIRECT --to-ports "$port" || return 1
   else
     ip6tables -t nat -A "$PORT_HOP_NAT_CHAIN" -p udp \
-      --dport "${start}:${end}" -j DNAT --to-destination "[${listen}]:${port}"
+      --dport "${start}:${end}" -j DNAT --to-destination "[${listen}]:${port}" || return 1
   fi
   ip6tables -t nat -C PREROUTING -j "$PORT_HOP_NAT_CHAIN" 2>/dev/null \
-    || ip6tables -t nat -I PREROUTING 1 -j "$PORT_HOP_NAT_CHAIN"
-  # filter 表 INPUT 看到的是 DNAT/REDIRECT 之后的 dport（主端口），所以放行主端口而非 hop 范围
-  ip6tables -C INPUT -p udp --dport "$port" -j ACCEPT 2>/dev/null \
-    || ip6tables -A INPUT -p udp --dport "$port" -j ACCEPT
+    || ip6tables -t nat -I PREROUTING 1 -j "$PORT_HOP_NAT_CHAIN" || return 1
 }
 
 port_hop_remove_v4(){
-  local start="$1" end="$2"
-  iptables -t nat -F "$PORT_HOP_NAT_CHAIN" 2>/dev/null || true
-  iptables -t nat -D PREROUTING -j "$PORT_HOP_NAT_CHAIN" 2>/dev/null || true
-  iptables -t nat -X "$PORT_HOP_NAT_CHAIN" 2>/dev/null || true
+  command -v iptables >/dev/null 2>&1 || return 0
+  iptables -t nat -nL "$PORT_HOP_NAT_CHAIN" >/dev/null 2>&1 || return 0
+  while iptables -t nat -C PREROUTING -j "$PORT_HOP_NAT_CHAIN" >/dev/null 2>&1; do
+    iptables -t nat -D PREROUTING -j "$PORT_HOP_NAT_CHAIN" || return 1
+  done
+  iptables -t nat -F "$PORT_HOP_NAT_CHAIN" || return 1
+  iptables -t nat -X "$PORT_HOP_NAT_CHAIN" || return 1
   # 注意：不在此删除 INPUT 链主端口 ACCEPT，因为节点本身可能仍需要它；
   # 节点真正卸载时由 node_revoke_firewall_for_mode 统一清理。
 }
 
 port_hop_remove_v6(){
-  local start="$1" end="$2"
   if ! command -v ip6tables >/dev/null 2>&1; then
     return 0
   fi
-  ip6tables -t nat -F "$PORT_HOP_NAT_CHAIN" 2>/dev/null || true
-  ip6tables -t nat -D PREROUTING -j "$PORT_HOP_NAT_CHAIN" 2>/dev/null || true
-  ip6tables -t nat -X "$PORT_HOP_NAT_CHAIN" 2>/dev/null || true
+  ip6tables -t nat -nL "$PORT_HOP_NAT_CHAIN" >/dev/null 2>&1 || return 0
+  while ip6tables -t nat -C PREROUTING -j "$PORT_HOP_NAT_CHAIN" >/dev/null 2>&1; do
+    ip6tables -t nat -D PREROUTING -j "$PORT_HOP_NAT_CHAIN" || return 1
+  done
+  ip6tables -t nat -F "$PORT_HOP_NAT_CHAIN" || return 1
+  ip6tables -t nat -X "$PORT_HOP_NAT_CHAIN" || return 1
   # 同上，不在此清 INPUT 主端口规则
 }
 
@@ -109,56 +111,61 @@ port_hop_apply(){
   local listen_v4="$5" listen_v6="$6"
   case "$mode" in
     ipv4)              port_hop_apply_v4 "$port" "$start" "$end" "$listen_v4" ;;
-    dualstack)         port_hop_apply_v4 "$port" "$start" "$end" "$listen_v4"
-                       port_hop_apply_v6 "$port" "$start" "$end" "$listen_v6" ;;
+    dualstack)         port_hop_apply_v4 "$port" "$start" "$end" "$listen_v4" \
+                         && port_hop_apply_v6 "$port" "$start" "$end" "$listen_v6" ;;
     ipv6-in-ipv4-out)  port_hop_apply_v6 "$port" "$start" "$end" "$listen_v6" ;;
+    *) return 1 ;;
   esac
-  # ufw / firewalld：DNAT 后 dport 是主端口，放行 hop 范围本身没用，
-  # 但用户阅读规则列表时能看到该范围被显式标记，且不会与节点主端口规则冲突。
-  # 主端口本身由 node_apply_firewall_for_mode 在 install/modify 时放行。
-  case "$(detect_firewall_backend)" in
-    ufw)
-      ufw allow "${start}:${end}/udp" >/dev/null 2>&1 || true
-      ;;
-    firewalld)
-      firewall-cmd --permanent --add-port="${start}-${end}/udp" >/dev/null 2>&1 || true
-      firewall-cmd --reload >/dev/null 2>&1 || true
-      ;;
+  local rc=$?
+  [ "$rc" -eq 0 ] || return "$rc"
+  case "$mode" in
+    ipv4|dualstack) ip4_save_rules >/dev/null 2>&1 || return 1 ;;
   esac
-  ip4_save_rules >/dev/null 2>&1 || true
-  ip6_save_rules >/dev/null 2>&1 || true
+  case "$mode" in
+    dualstack|ipv6-in-ipv4-out) ip6_save_rules >/dev/null 2>&1 || return 1 ;;
+  esac
 }
 
 port_hop_remove(){
   local start="$1" end="$2" mode="$3"
   case "$mode" in
-    ipv4|dualstack)              port_hop_remove_v4 "$start" "$end" ;;
+    ipv4|dualstack)              port_hop_remove_v4 "$start" "$end" || return 1 ;;
   esac
   case "$mode" in
-    dualstack|ipv6-in-ipv4-out)  port_hop_remove_v6 "$start" "$end" ;;
+    dualstack|ipv6-in-ipv4-out)  port_hop_remove_v6 "$start" "$end" || return 1 ;;
   esac
-  case "$(detect_firewall_backend)" in
-    ufw)
-      ufw delete allow "${start}:${end}/udp" >/dev/null 2>&1 || true
-      ;;
-    firewalld)
-      firewall-cmd --permanent --remove-port="${start}-${end}/udp" >/dev/null 2>&1 || true
-      firewall-cmd --reload >/dev/null 2>&1 || true
-      ;;
+  case "$mode" in
+    ipv4|dualstack) ip4_save_rules >/dev/null 2>&1 || return 1 ;;
   esac
-  ip4_save_rules >/dev/null 2>&1 || true
-  ip6_save_rules >/dev/null 2>&1 || true
+  case "$mode" in
+    dualstack|ipv6-in-ipv4-out) ip6_save_rules >/dev/null 2>&1 || return 1 ;;
+  esac
 }
 
 port_hop_cleanup_all(){
-  iptables -t nat -F "$PORT_HOP_NAT_CHAIN" 2>/dev/null || true
-  iptables -t nat -D PREROUTING -j "$PORT_HOP_NAT_CHAIN" 2>/dev/null || true
-  iptables -t nat -X "$PORT_HOP_NAT_CHAIN" 2>/dev/null || true
-  if command -v ip6tables >/dev/null 2>&1; then
-    ip6tables -t nat -F "$PORT_HOP_NAT_CHAIN" 2>/dev/null || true
-    ip6tables -t nat -D PREROUTING -j "$PORT_HOP_NAT_CHAIN" 2>/dev/null || true
-    ip6tables -t nat -X "$PORT_HOP_NAT_CHAIN" 2>/dev/null || true
+  local rc=0
+  if command -v iptables >/dev/null 2>&1 \
+     && iptables -t nat -nL "$PORT_HOP_NAT_CHAIN" >/dev/null 2>&1; then
+    while iptables -t nat -C PREROUTING -j "$PORT_HOP_NAT_CHAIN" >/dev/null 2>&1; do
+      iptables -t nat -D PREROUTING -j "$PORT_HOP_NAT_CHAIN" || rc=1
+      [ "$rc" -eq 0 ] || break
+    done
+    iptables -t nat -F "$PORT_HOP_NAT_CHAIN" || rc=1
+    iptables -t nat -X "$PORT_HOP_NAT_CHAIN" || rc=1
+    ip4_save_rules >/dev/null 2>&1 || rc=1
   fi
+  if command -v ip6tables >/dev/null 2>&1; then
+    if ip6tables -t nat -nL "$PORT_HOP_NAT_CHAIN" >/dev/null 2>&1; then
+      while ip6tables -t nat -C PREROUTING -j "$PORT_HOP_NAT_CHAIN" >/dev/null 2>&1; do
+        ip6tables -t nat -D PREROUTING -j "$PORT_HOP_NAT_CHAIN" || rc=1
+        [ "$rc" -eq 0 ] || break
+      done
+      ip6tables -t nat -F "$PORT_HOP_NAT_CHAIN" || rc=1
+      ip6tables -t nat -X "$PORT_HOP_NAT_CHAIN" || rc=1
+      ip6_save_rules >/dev/null 2>&1 || rc=1
+    fi
+  fi
+  return "$rc"
 }
 
 # 根据 install_mode 推导端口跳跃所需的 v4 / v6 监听地址

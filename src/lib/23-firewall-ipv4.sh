@@ -16,14 +16,13 @@ show_ipv4_firewall_menu(){
     echo -e "  ${R}${B}检测到 1Panel 在管理 IPv4 防火墙${N}"
     render_divider
     echo -e "  ${Y}本脚本之前可能下发过 INPUT DROP/ACCEPT 规则，会与 1Panel 冲突${N}"
-    echo -e "  ${D}清理动作：${C}iptables -F INPUT${N} ${D}+ ${C}iptables -P INPUT ACCEPT${N} ${D}并持久化${N}"
-    echo -e "  ${D}清理后 IPv4 入站策略全部交给 1Panel 管理${N}"
-    echo -e "  ${R}注意：会清空 INPUT 链所有规则 (1Panel 通常走 ufw/firewalld，不直接挂 INPUT，一般安全)${N}"
+    echo -e "  ${D}清理动作：删除脚本专属链 ${C}${IP4_LEYILI_CHAIN}${N}，INPUT 改为 ACCEPT 并持久化${N}"
+    echo -e "  ${D}用户规则与 fail2ban 链不会被清空，清理后由 1Panel 接管新增策略${N}"
     echo ""
     read -p "  立即清理脚本残留 IPv4 规则交还 1Panel？(y/N): " hp_choice
     if [ "$hp_choice" = "y" ] || [ "$hp_choice" = "Y" ]; then
       if ip4_handover_to_1panel; then
-        echo -e "  ${G}已清空 INPUT 规则并切回 ACCEPT，IPv4 防火墙由 1Panel 接管${N}"
+        echo -e "  ${G}已移除脚本专属链并切回 ACCEPT，IPv4 防火墙由 1Panel 接管${N}"
       else
         echo -e "  ${R}清理失败，请手动检查${N}"
       fi
@@ -150,10 +149,9 @@ ip4_view_listening(){
 }
 
 ip4_init_firewall(){
-  local ssh_port confirm conflicts
-  local backup_rules="" rb_choice="y" rb_pid="" rb_seconds=180
+  local ssh_port confirm conflicts txn node node_port node_mode node_proto
 
-  # 缺 ss 工具无法验证 sshd 监听，直接拒绝避免应用规则后被回滚守护偷偷恢复
+  # 缺 ss 工具无法验证 sshd 监听，直接拒绝，避免写错 SSH 放行端口。
   if ! command -v ss >/dev/null 2>&1; then
     echo ""
     echo -e "  ${R}本机未安装 ss 命令（iproute2 包），无法安全验证 SSH 监听端口${N}"
@@ -169,19 +167,14 @@ ip4_init_firewall(){
   echo -e "  ${B}${C}一键初始化${N}"
   render_divider
   echo "  本次会执行："
-  echo "    1) 清空当前 IPv4 INPUT 规则"
-  echo "    2) 放行回环 lo"
-  echo "    3) 放行已建立的连接 (ESTABLISHED, RELATED)"
-  echo "    4) 放行 ICMP (ping 等必需)"
-  echo -e "    5) 放行 SSH 端口: ${C}${ssh_port}${N}/tcp  ${D}(自动检测)${N}"
-  echo "    6) 放行 80/tcp"
-  echo "    7) 放行 443/tcp"
-  echo "    8) INPUT 默认策略 = DROP"
-  echo "    9) OUTPUT 保持 ACCEPT"
-  echo "   10) FORWARD 不动 (留给 Docker)"
+  echo -e "    1) 仅重建脚本专属链 ${C}${IP4_LEYILI_CHAIN}${N}，保留用户与 fail2ban 规则"
+  echo "    2) 放行回环、已建立连接与 ICMP"
+  echo -e "    3) 放行 SSH ${C}${ssh_port}/tcp${N}、80/tcp、443/tcp"
+  echo "    4) 自动恢复全部已安装节点的 IPv4 主端口"
+  echo "    5) INPUT 默认策略 = DROP"
+  echo "    6) OUTPUT / FORWARD 保持原样"
   echo ""
-  echo -e "  ${D}注意：节点端口（Reality TCP / Hysteria2 UDP）不在此初始化范围内，${N}"
-  echo -e "  ${D}      请在初始化完成后到本菜单 ${C}4) 开放端口${N} ${D}里手动放行。${N}"
+  echo -e "  ${D}所有写入均先快照；任一步失败会立即恢复活动规则与持久化文件。${N}"
   echo ""
 
   # 锁库前置检查 1：sshd 必须真的在 ssh_port 监听
@@ -220,129 +213,62 @@ ip4_init_firewall(){
     return 0
   fi
 
-  # 兜底问询：是否启用延时自动回滚守护
-  echo ""
-  echo -e "  ${B}延时自动回滚守护（强烈建议启用）${N}"
-  echo -e "  ${D}若启用，规则应用后会启动后台守护，${rb_seconds} 秒内若你未手动取消，将自动恢复旧规则${N}"
-  echo -e "  ${D}规则生效后请立即开新终端验证 SSH 仍可登录，再回此菜单选「6) 紧急放行」之外的任意项即可取消守护${N}"
-  read -p "  启用 ${rb_seconds}s 自动回滚守护？(Y/n): " rb_choice
-  if [ "$rb_choice" = "n" ] || [ "$rb_choice" = "N" ]; then
-    rb_choice="n"
-  else
-    rb_choice="y"
-    backup_rules=$(mktemp /tmp/leyili-iptables-rb.XXXXXX 2>/dev/null) || backup_rules=""
-    if [ -n "$backup_rules" ]; then
-      iptables-save > "$backup_rules" 2>/dev/null || { rm -f "$backup_rules"; backup_rules=""; }
-    fi
-  fi
-
   if ! ip6_ensure_persistence; then
     echo ""
     echo -e "${R}持久化工具安装失败${N}"
-    [ -n "$backup_rules" ] && rm -f "$backup_rules"
     pause_screen
     return 1
   fi
 
-  iptables -F INPUT
-  iptables -A INPUT -i lo -j ACCEPT
-  iptables -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
-  iptables -A INPUT -p icmp -j ACCEPT
-  iptables -A INPUT -p tcp --dport "$ssh_port" -j ACCEPT
-  iptables -A INPUT -p tcp --dport 80 -j ACCEPT
-  iptables -A INPUT -p tcp --dport 443 -j ACCEPT
-  iptables -P INPUT DROP
-  iptables -P OUTPUT ACCEPT
-
-  # 自动恢复 reality / hy2 / anytls 节点主端口放行（IPv4 侧）
-  # 仅在节点 Mode 为 ipv4 / dualstack 时需要
-  local node_port node_mode
-  if node_installed reality; then
-    node_port=$(get_node_value reality Port 2>/dev/null || true)
-    node_mode=$(get_node_value reality Mode 2>/dev/null || echo ipv4)
-    if [ -n "$node_port" ] \
-       && { [ "$node_mode" = "ipv4" ] || [ "$node_mode" = "dualstack" ]; }; then
-      iptables -C INPUT -p tcp --dport "$node_port" -j ACCEPT 2>/dev/null \
-        || iptables -A INPUT -p tcp --dport "$node_port" -j ACCEPT 2>/dev/null || true
-      echo -e "  ${G}已自动恢复 reality 主端口放行：${node_port}/tcp${N}"
-    fi
-  fi
-  if node_installed hy2; then
-    node_port=$(get_node_value hy2 Port 2>/dev/null || true)
-    node_mode=$(get_node_value hy2 Mode 2>/dev/null || echo ipv4)
-    if [ -n "$node_port" ] \
-       && { [ "$node_mode" = "ipv4" ] || [ "$node_mode" = "dualstack" ]; }; then
-      iptables -C INPUT -p udp --dport "$node_port" -j ACCEPT 2>/dev/null \
-        || iptables -A INPUT -p udp --dport "$node_port" -j ACCEPT 2>/dev/null || true
-      echo -e "  ${G}已自动恢复 hy2 主端口放行：${node_port}/udp${N}"
-    fi
-  fi
-  if node_installed anytls; then
-    node_port=$(get_node_value anytls Port 2>/dev/null || true)
-    node_mode=$(get_node_value anytls Mode 2>/dev/null || echo ipv4)
-    if [ -n "$node_port" ] \
-       && { [ "$node_mode" = "ipv4" ] || [ "$node_mode" = "dualstack" ]; }; then
-      iptables -C INPUT -p tcp --dport "$node_port" -j ACCEPT 2>/dev/null \
-        || iptables -A INPUT -p tcp --dport "$node_port" -j ACCEPT 2>/dev/null || true
-      echo -e "  ${G}已自动恢复 anytls 主端口放行：${node_port}/tcp${N}"
-    fi
-  fi
-  if node_installed tuic; then
-    node_port=$(get_node_value tuic Port 2>/dev/null || true)
-    node_mode=$(get_node_value tuic Mode 2>/dev/null || echo ipv4)
-    if [ -n "$node_port" ] \
-       && { [ "$node_mode" = "ipv4" ] || [ "$node_mode" = "dualstack" ]; }; then
-      iptables -C INPUT -p udp --dport "$node_port" -j ACCEPT 2>/dev/null \
-        || iptables -A INPUT -p udp --dport "$node_port" -j ACCEPT 2>/dev/null || true
-      echo -e "  ${G}已自动恢复 tuic 主端口放行：${node_port}/udp${N}"
-    fi
-  fi
-  if node_installed ss2022; then
-    node_port=$(get_node_value ss2022 Port 2>/dev/null || true)
-    node_mode=$(get_node_value ss2022 Mode 2>/dev/null || echo ipv4)
-    if [ -n "$node_port" ] \
-       && { [ "$node_mode" = "ipv4" ] || [ "$node_mode" = "dualstack" ]; }; then
-      iptables -C INPUT -p tcp --dport "$node_port" -j ACCEPT 2>/dev/null \
-        || iptables -A INPUT -p tcp --dport "$node_port" -j ACCEPT 2>/dev/null || true
-      echo -e "  ${G}已自动恢复 ss2022 主端口放行：${node_port}/tcp${N}"
-    fi
-  fi
-
-  # 应用后再次校验 sshd 监听依然存在（防止备份/检测误差）
-  if ! verify_sshd_listening_on_port "$ssh_port"; then
-    if [ -n "$backup_rules" ]; then
-      iptables-restore < "$backup_rules" 2>/dev/null || true
-      rm -f "$backup_rules"
-      echo -e "${R}应用后 sshd 在 ${ssh_port} 上未监听，已自动回滚到旧规则${N}"
-    else
-      echo -e "${R}应用后 sshd 在 ${ssh_port} 上未监听，但你未启用回滚守护，请尽快人工处理${N}"
-    fi
+  txn=$(firewall_transaction_begin 4) || { echo -e "${R}防火墙快照失败${N}"; pause_screen; return 1; }
+  if ! firewall_ensure_managed_chain 4 \
+     || ! iptables -F "$IP4_LEYILI_CHAIN" \
+     || ! iptables -A "$IP4_LEYILI_CHAIN" -i lo -m comment --comment "leyili-managed" -j ACCEPT \
+     || ! iptables -A "$IP4_LEYILI_CHAIN" -m conntrack --ctstate ESTABLISHED,RELATED -m comment --comment "leyili-managed" -j ACCEPT \
+     || ! iptables -A "$IP4_LEYILI_CHAIN" -p icmp -m comment --comment "leyili-managed" -j ACCEPT \
+     || ! firewall_add_managed_port 4 tcp "$ssh_port" \
+     || ! firewall_add_managed_port 4 tcp 80 \
+     || ! firewall_add_managed_port 4 tcp 443; then
+    firewall_transaction_rollback 4 "$txn"
+    echo -e "${R}基础规则写入失败，已恢复原规则${N}"
     pause_screen
     return 1
   fi
 
-  if ! ip4_save_rules; then
-    echo -e "${Y}规则已生效，但持久化失败，重启后可能丢失${N}"
+  for node in reality hy2 anytls tuic ss2022; do
+    node_installed "$node" || continue
+    node_port=$(get_node_value "$node" Port 2>/dev/null || true)
+    node_mode=$(get_node_value "$node" Mode 2>/dev/null || echo ipv4)
+    [ -n "$node_port" ] || continue
+    { [ "$node_mode" = "ipv4" ] || [ "$node_mode" = "dualstack" ]; } || continue
+    case "$node" in hy2|tuic) node_proto="udp" ;; *) node_proto="tcp" ;; esac
+    if ! firewall_add_managed_port 4 "$node_proto" "$node_port"; then
+      firewall_transaction_rollback 4 "$txn"
+      echo -e "${R}恢复 ${node} 端口失败，已恢复原规则${N}"
+      pause_screen
+      return 1
+    fi
+    echo -e "  ${G}已恢复 ${node}：${node_port}/${node_proto}${N}"
+  done
+
+  if ! iptables -P INPUT DROP \
+     || ! verify_sshd_listening_on_port "$ssh_port" \
+     || ! ip4_save_rules; then
+    firewall_transaction_rollback 4 "$txn"
+    echo -e "${R}规则校验或持久化失败，已恢复原规则${N}"
+    pause_screen
+    return 1
   fi
+  firewall_transaction_commit "$txn"
 
   echo ""
   echo -e "${G}IPv4 防火墙已启用${N}"
-
-  # 启动延时回滚守护
-  if [ "$rb_choice" = "y" ] && [ -n "$backup_rules" ]; then
-    rb_pid=$(schedule_iptables_rollback "$rb_seconds" "$backup_rules" "")
-    if [ -n "$rb_pid" ]; then
-      echo -e "  ${Y}延时回滚守护已启动 (PID ${rb_pid})，${rb_seconds}s 后自动恢复旧规则${N}"
-      echo -e "  ${B}请在 ${rb_seconds} 秒内开新终端验证 SSH 可登录，然后执行：${N}"
-      echo -e "    ${C}kill ${rb_pid} && rm -f ${backup_rules}${N}  ${D}# 取消回滚${N}"
-      echo -e "  ${D}（也可以直接等待 ${rb_seconds}s 让规则被自动撤销）${N}"
-    fi
-  fi
+  echo -e "  ${D}用户 INPUT 规则与 fail2ban 链均已保留；未启动延时回滚守护。${N}"
   pause_screen
 }
 
 ip4_open_port(){
-  local proto_choice protos="" port proto changed=0
+  local proto_choice protos="" port proto changed=0 txn
 
   echo ""
   echo -e "  ${B}${C}开放端口${N}"
@@ -372,26 +298,34 @@ ip4_open_port(){
     return 1
   fi
 
+  txn=$(firewall_transaction_begin 4) || { echo -e "${R}防火墙快照失败${N}"; pause_screen; return 1; }
   for proto in $protos; do
-    if iptables -C INPUT -p "$proto" --dport "$port" -j ACCEPT 2>/dev/null; then
+    if iptables -C "$IP4_LEYILI_CHAIN" -p "$proto" --dport "$port" -m comment --comment "leyili-managed" -j ACCEPT 2>/dev/null; then
       echo -e "  ${Y}${port}/${proto} 已放行，跳过${N}"
     else
-      iptables -A INPUT -p "$proto" --dport "$port" -j ACCEPT
+      if ! firewall_add_managed_port 4 "$proto" "$port"; then
+        firewall_transaction_rollback 4 "$txn"
+        echo -e "${R}规则写入失败，已恢复原规则${N}"
+        pause_screen
+        return 1
+      fi
       echo -e "  ${G}已放行 ${port}/${proto}${N}"
       changed=1
     fi
   done
 
-  if [ "$changed" -eq 1 ]; then
-    if ! ip4_save_rules; then
-      echo -e "${Y}持久化失败${N}"
-    fi
+  if [ "$changed" -eq 1 ] && ! ip4_save_rules; then
+    firewall_transaction_rollback 4 "$txn"
+    echo -e "${R}持久化失败，已恢复原规则${N}"
+    pause_screen
+    return 1
   fi
+  firewall_transaction_commit "$txn"
   pause_screen
 }
 
 ip4_close_port(){
-  local proto_choice protos="" port ssh_port confirm proto removed=0
+  local proto_choice protos="" port ssh_port confirm proto removed=0 txn
 
   echo ""
   echo -e "  ${B}${C}关闭端口${N}"
@@ -435,34 +369,49 @@ ip4_close_port(){
     fi
   fi
 
+  txn=$(firewall_transaction_begin 4) || { echo -e "${R}防火墙快照失败${N}"; pause_screen; return 1; }
   for proto in $protos; do
-    while iptables -C INPUT -p "$proto" --dport "$port" -j ACCEPT 2>/dev/null; do
-      iptables -D INPUT -p "$proto" --dport "$port" -j ACCEPT
-      echo -e "  ${G}已删除 ${port}/${proto}${N}"
+    if iptables -C "$IP4_LEYILI_CHAIN" -p "$proto" --dport "$port" -m comment --comment "leyili-managed" -j ACCEPT 2>/dev/null; then
+      if ! firewall_remove_managed_port 4 "$proto" "$port"; then
+        firewall_transaction_rollback 4 "$txn"
+        echo -e "${R}删除失败，已恢复原规则${N}"
+        pause_screen
+        return 1
+      fi
+      echo -e "  ${G}已删除脚本托管规则 ${port}/${proto}${N}"
       removed=$((removed + 1))
-    done
+    fi
   done
 
   if [ "$removed" -eq 0 ]; then
     echo -e "  ${Y}端口 ${port} 在所选协议下没有放行规则${N}"
   else
     if ! ip4_save_rules; then
-      echo -e "${Y}持久化失败${N}"
+      firewall_transaction_rollback 4 "$txn"
+      echo -e "${R}持久化失败，已恢复原规则${N}"
+      pause_screen
+      return 1
     fi
   fi
+  firewall_transaction_commit "$txn"
+  for proto in $protos; do
+    if iptables -C INPUT -p "$proto" --dport "$port" -j ACCEPT 2>/dev/null; then
+      echo -e "  ${Y}提示：INPUT 中仍有非脚本托管的 ${port}/${proto} ACCEPT 规则，本菜单未删除。${N}"
+    fi
+  done
   pause_screen
 }
 
 ip4_emergency_disable(){
-  local confirm confirm2
+  local confirm confirm2 txn
 
   echo ""
   echo -e "  ${R}${B}紧急放行（关闭 v4 防火墙）${N}"
   render_divider
   echo "  执行后："
-  echo "    - 清空所有 IPv4 INPUT 规则"
-  echo "    - 默认策略改回 ACCEPT"
-  echo "    - v4 入站回到完全裸奔状态"
+  echo -e "    - 删除脚本专属链 ${C}${IP4_LEYILI_CHAIN}${N}"
+  echo "    - INPUT 默认策略改回 ACCEPT"
+  echo "    - 保留用户规则、fail2ban 与面板规则"
   echo ""
 
   read -p "  确认？(y/N): " confirm
@@ -478,14 +427,18 @@ ip4_emergency_disable(){
     return 0
   fi
 
-  iptables -P INPUT ACCEPT
-  iptables -F INPUT
-  if ! ip4_save_rules; then
-    echo -e "${Y}持久化失败${N}"
+  txn=$(firewall_transaction_begin 4) || { echo -e "${R}防火墙快照失败${N}"; pause_screen; return 1; }
+  if ! iptables -P INPUT ACCEPT \
+     || ! firewall_remove_managed_chain 4 \
+     || ! ip4_save_rules; then
+    firewall_transaction_rollback 4 "$txn"
+    echo -e "${R}操作失败，已恢复原规则${N}"
+    pause_screen
+    return 1
   fi
+  firewall_transaction_commit "$txn"
 
   echo ""
-  echo -e "${Y}已关闭 v4 防火墙（INPUT=ACCEPT 且规则清空）${N}"
+  echo -e "${Y}已停用脚本管理的 v4 防火墙（用户/面板规则仍保留）${N}"
   pause_screen
 }
-

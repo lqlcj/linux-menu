@@ -5,6 +5,7 @@ install_reality_node(){
   local public_ipv4="" public_ipv6=""
   local install_mode="ipv4" mode_label=""
   local PORT SNI TAG LISTEN_CHOICE LISTEN_ADDR UUID SHORT_ID confirm
+  local txn="" old_port="" old_mode="ipv4"
 
   if ! require_root; then return 1; fi
 
@@ -19,6 +20,8 @@ install_reality_node(){
       echo -e "  已取消"
       return 0
     fi
+    old_port=$(get_node_value reality Port 2>/dev/null || true)
+    old_mode=$(get_node_value reality Mode 2>/dev/null || echo ipv4)
   fi
 
   while true; do
@@ -29,7 +32,7 @@ install_reality_node(){
       continue
     fi
     PORT=$((10#$PORT))
-    if check_port_in_use "$PORT"; then
+    if [ "$PORT" != "$old_port" ] && check_port_in_use "$PORT" tcp; then
       echo -e "${R}端口 ${PORT} 已被其他服务占用${N}"
       local force_port=""
       read -p "  仍然使用此端口？(y/N): " force_port
@@ -141,6 +144,7 @@ install_reality_node(){
 
   echo -e "${Y}==> 写入配置...${N}"
   ensure_jq || { pause_screen; return 1; }
+  txn=$(node_transaction_begin reality) || { echo -e "${R}节点事务快照失败${N}"; pause_screen; return 1; }
 
   local inbound_json
   inbound_json=$(jq -n \
@@ -168,20 +172,27 @@ install_reality_node(){
     }')
 
   if ! config_add_inbound "$inbound_json"; then
+    node_transaction_rollback "$txn"
     echo -e "${R}写入 inbound 失败${N}"
     pause_screen
     return 1
   fi
 
   echo -e "${Y}==> 校验并启动...${N}"
-  if ! config_check_and_restart; then
+  if ! config_check_and_restart "$PORT" tcp; then
+    node_transaction_rollback "$txn"
     echo ""
     echo -e "${R}sing-box 校验或重启失败${N}"
     pause_screen
     return 1
   fi
 
-  node_apply_firewall_for_mode "$PORT" tcp "$install_mode"
+  if ! node_apply_firewall_for_mode "$PORT" tcp "$install_mode"; then
+    node_transaction_rollback "$txn"
+    echo -e "${R}防火墙放行失败，节点配置已回滚${N}"
+    pause_screen
+    return 1
+  fi
   print_firewall_hint "$PORT" tcp "Reality 节点入站"
 
   link=$(build_reality_link "$UUID" "$access_ip" "$PORT" "$SNI" "$public_key" "$SHORT_ID" "$TAG" 2>/dev/null || true)
@@ -189,8 +200,7 @@ install_reality_node(){
     ipv6_link=$(build_reality_link "$UUID" "$public_ipv6" "$PORT" "$SNI" "$public_key" "$SHORT_ID" "${TAG}-ipv6" 2>/dev/null || true)
   fi
 
-  ensure_nodes_dir
-  cat > "$(node_info_path reality)" <<EOF
+  if ! write_node_info_file reality <<EOF
 Type=reality
 Tag=$TAG
 Mode=$install_mode
@@ -204,6 +214,22 @@ ShortID=$SHORT_ID
 IP=$access_ip
 Link=$link
 EOF
+  then
+    node_transaction_rollback "$txn"
+    echo -e "${R}节点信息保存失败，已完整回滚${N}"
+    pause_screen
+    return 1
+  fi
+
+  if [ -n "$old_port" ] && [ "$old_port" != "$PORT" ]; then
+    if ! node_revoke_firewall_for_mode "$old_port" tcp "$old_mode"; then
+      node_transaction_rollback "$txn"
+      echo -e "${R}旧端口防火墙清理失败，已完整回滚${N}"
+      pause_screen
+      return 1
+    fi
+  fi
+  node_transaction_commit "$txn"
 
   register_sb_command || true
 
@@ -237,13 +263,12 @@ EOF
 config_inbound_count(){
   if [ ! -f "$CONFIG_PATH" ]; then
     printf '0'
-    return
+    return 0
   fi
   if ! command -v jq >/dev/null 2>&1; then
-    printf '0'
-    return
+    return 1
   fi
-  jq '(.inbounds // []) | length' "$CONFIG_PATH" 2>/dev/null || printf '0'
+  jq -er '(.inbounds // []) | length' "$CONFIG_PATH" 2>/dev/null
 }
 
 # 卸载某节点后调用：剩 0 个 inbound 则停服务，否则校验+重启
@@ -255,16 +280,61 @@ post_uninstall_service_step(){
     return 0
   fi
   local remain
-  remain=$(config_inbound_count)
+  remain=$(config_inbound_count) || return 1
+  [[ "$remain" =~ ^[0-9]+$ ]] || return 1
   if [ "${remain:-0}" -eq 0 ]; then
     echo -e "${Y}==> 已无任何节点，停止 sing-box 服务...${N}"
-    systemctl stop sing-box >/dev/null 2>&1 || true
-    systemctl disable sing-box >/dev/null 2>&1 || true
+    systemctl stop sing-box >/dev/null 2>&1 || return 1
+    if systemctl is-enabled --quiet sing-box 2>/dev/null; then
+      systemctl disable sing-box >/dev/null 2>&1 || return 1
+    fi
+    systemctl is-active --quiet sing-box 2>/dev/null && return 1
     return 0
   fi
-  if sing-box check -c "$CONFIG_PATH" >/dev/null 2>&1; then
-    systemctl restart sing-box >/dev/null 2>&1 || true
+  config_check_and_restart
+}
+
+uninstall_node_transaction(){
+  local type="$1" inbound_tag="$2" proto="$3"
+  local txn port mode hop_enabled hop_start hop_end
+
+  port=$(get_node_value "$type" Port 2>/dev/null || true)
+  mode=$(get_node_value "$type" Mode 2>/dev/null || echo ipv4)
+  txn=$(node_transaction_begin "$type") || return 1
+
+  if [ "$type" = "hy2" ]; then
+    hop_enabled=$(get_node_value hy2 PortHop 2>/dev/null || echo 0)
+    hop_start=$(get_node_value hy2 PortHopStart 2>/dev/null || true)
+    hop_end=$(get_node_value hy2 PortHopEnd 2>/dev/null || true)
+    if [ "$hop_enabled" = "1" ] && [ -n "$hop_start" ] && [ -n "$hop_end" ]; then
+      if ! port_hop_remove "$hop_start" "$hop_end" "$mode"; then
+        node_transaction_rollback "$txn"
+        return 1
+      fi
+    fi
   fi
+
+  if [ -n "$port" ] && ! node_revoke_firewall_for_mode "$port" "$proto" "$mode"; then
+    node_transaction_rollback "$txn"
+    return 1
+  fi
+  if ! config_remove_inbound_by_tag "$inbound_tag" || ! remove_node_info "$type"; then
+    node_transaction_rollback "$txn"
+    return 1
+  fi
+  case "$type" in
+    hy2|tuic)
+      if ! rm -f -- "$CERTS_DIR/${type}.crt" "$CERTS_DIR/${type}.key"; then
+        node_transaction_rollback "$txn"
+        return 1
+      fi
+      ;;
+  esac
+  if ! post_uninstall_service_step; then
+    node_transaction_rollback "$txn"
+    return 1
+  fi
+  node_transaction_commit "$txn"
 }
 
 uninstall_reality_node(){
@@ -282,17 +352,11 @@ uninstall_reality_node(){
     return 0
   fi
 
-  # 必须在 remove_node_info 之前撤防火墙规则，否则读不到 Mode/Port
-  local rt_port rt_mode
-  rt_port=$(get_node_value reality Port 2>/dev/null || true)
-  rt_mode=$(get_node_value reality Mode 2>/dev/null || echo ipv4)
-  if [ -n "$rt_port" ]; then
-    node_revoke_firewall_for_mode "$rt_port" tcp "$rt_mode"
+  if ! uninstall_node_transaction reality reality-in tcp; then
+    echo -e "${R}Reality 节点卸载失败，已恢复原配置${N}"
+    pause_screen
+    return 1
   fi
-
-  config_remove_inbound_by_tag "reality-in" || true
-  remove_node_info reality
-  post_uninstall_service_step
   echo -e "${G}Reality 节点已卸载${N}"
   pause_screen
 }

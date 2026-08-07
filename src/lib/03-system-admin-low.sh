@@ -58,7 +58,12 @@ get_sshd_binary(){
 get_current_ssh_port(){
   local current_port=""
 
-  if [ -f "$SSHD_CONFIG_PATH" ]; then
+  current_port=$(get_effective_sshd_value Port root 127.0.0.1 2>/dev/null || true)
+  case "$current_port" in
+    ''|*[!0-9]*) current_port="" ;;
+  esac
+
+  if [ -z "$current_port" ] && [ -f "$SSHD_CONFIG_PATH" ]; then
     current_port=$(awk '
       BEGIN { in_match = 0 }
       /^[[:space:]]*Match[[:space:]]+/ {
@@ -83,8 +88,11 @@ get_current_ssh_port(){
 # 返回小写值，找不到时返回空。失败不终止调用方。
 get_effective_sshd_value(){
   local key="$1"
+  local user="${2:-root}"
+  local addr="${3:-127.0.0.1}"
   local sshd_bin=""
   local lower_key=""
+  local host=""
 
   [ -z "$key" ] && return 0
   sshd_bin=$(get_sshd_binary)
@@ -92,7 +100,9 @@ get_effective_sshd_value(){
   [ ! -f "$SSHD_CONFIG_PATH" ] && return 0
 
   lower_key=$(printf '%s' "$key" | tr '[:upper:]' '[:lower:]')
-  "$sshd_bin" -T -f "$SSHD_CONFIG_PATH" 2>/dev/null \
+  host=$(hostname -f 2>/dev/null || hostname 2>/dev/null || echo localhost)
+  "$sshd_bin" -T -f "$SSHD_CONFIG_PATH" \
+    -C "user=${user},host=${host},addr=${addr}" 2>/dev/null \
     | awk -v k="$lower_key" 'tolower($1) == k {print $2; exit}'
 }
 
@@ -107,6 +117,7 @@ neutralize_sshd_dropin_overrides(){
   local timestamp=""
   local touched=0
   local lower_expected=""
+  local tmp_file=""
 
   [ -z "$key" ] && return 1
   [ -d "$dropin_dir" ] || return 0
@@ -128,9 +139,13 @@ neutralize_sshd_dropin_overrides(){
       }
       END{ exit !found }
     ' "$file"; then
-      cp "$file" "${file}.bak.${timestamp}" 2>/dev/null || true
+      if ! cp -a -- "$file" "${file}.bak.${timestamp}"; then
+        shopt -u nullglob
+        return 1
+      fi
       # 注释掉所有 <key> 行（在 Match 之前），保留 Match 之后不动
-      awk -v k="$key" '
+      tmp_file=$(mktemp "${file}.tmp.XXXXXX") || { shopt -u nullglob; return 1; }
+      if ! awk -v k="$key" '
         BEGIN{ in_match=0 }
         /^[[:space:]]*Match[[:space:]]+/ { in_match=1; print; next }
         {
@@ -140,7 +155,22 @@ neutralize_sshd_dropin_overrides(){
           }
           print
         }
-      ' "$file" > "${file}.tmp.$$" && mv "${file}.tmp.$$" "$file"
+      ' "$file" > "$tmp_file"; then
+        rm -f -- "$tmp_file"
+        shopt -u nullglob
+        return 1
+      fi
+      if ! chmod --reference="$file" "$tmp_file" 2>/dev/null \
+         || ! chown --reference="$file" "$tmp_file" 2>/dev/null; then
+        rm -f -- "$tmp_file"
+        shopt -u nullglob
+        return 1
+      fi
+      if ! mv -f -- "$tmp_file" "$file"; then
+        rm -f -- "$tmp_file"
+        shopt -u nullglob
+        return 1
+      fi
       touched=1
       echo -e "  ${Y}已注释覆盖项：${N}${C}${file}${N} ${D}(备份 .bak.${timestamp})${N}"
     fi
@@ -172,7 +202,7 @@ set_sshd_global_directive(){
   local value="$2"
   local tmp_file=""
 
-  tmp_file=$(mktemp)
+  tmp_file=$(mktemp "${SSHD_CONFIG_PATH}.tmp.XXXXXX") || return 1
   if ! awk -v key="$key" -v value="$value" '
     BEGIN {
       updated = 0
@@ -203,7 +233,154 @@ set_sshd_global_directive(){
     return 1
   fi
 
-  mv "$tmp_file" "$SSHD_CONFIG_PATH"
+  chmod --reference="$SSHD_CONFIG_PATH" "$tmp_file" 2>/dev/null \
+    || chmod 600 "$tmp_file" 2>/dev/null \
+    || { rm -f -- "$tmp_file"; return 1; }
+  chown --reference="$SSHD_CONFIG_PATH" "$tmp_file" 2>/dev/null \
+    || { rm -f -- "$tmp_file"; return 1; }
+  mv -f "$tmp_file" "$SSHD_CONFIG_PATH"
+}
+
+sshd_transaction_begin(){
+  local txn
+  txn=$(mktemp -d "${TMPDIR:-/tmp}/leyili-sshd.XXXXXX") || return 1
+  chmod 700 "$txn" 2>/dev/null || { rm -rf -- "$txn"; return 1; }
+  cp -a -- "$SSHD_CONFIG_PATH" "$txn/sshd_config" || { rm -rf -- "$txn"; return 1; }
+  if [ -d /etc/ssh/sshd_config.d ]; then
+    cp -a -- /etc/ssh/sshd_config.d "$txn/sshd_config.d" || { rm -rf -- "$txn"; return 1; }
+    : > "$txn/sshd_config.d.existed"
+  fi
+  if [ -f "$SSHD_SOCKET_DROPIN_PATH" ]; then
+    cp -a -- "$SSHD_SOCKET_DROPIN_PATH" "$txn/ssh.socket.conf" || { rm -rf -- "$txn"; return 1; }
+    : > "$txn/ssh.socket.conf.existed"
+  fi
+  if systemctl is-active --quiet ssh.socket 2>/dev/null; then : > "$txn/socket.active"; fi
+  if systemctl is-enabled --quiet ssh.socket 2>/dev/null; then : > "$txn/socket.enabled"; fi
+  printf '%s' "$txn"
+}
+
+sshd_transaction_restore(){
+  local txn="$1"
+  local prepared="" current_backup="" rc=0 dropin_ok=1
+  [ -d "$txn" ] || return 1
+
+  restore_file_snapshot "$txn/sshd_config" "$SSHD_CONFIG_PATH" || rc=1
+
+  if [ -f "$txn/sshd_config.d.existed" ]; then
+    prepared=$(mktemp -d "/etc/ssh/.sshd_config.d.restore.XXXXXX") || rc=1
+    if [ -n "$prepared" ] && ! cp -a -- "$txn/sshd_config.d/." "$prepared/"; then
+      rm -rf -- "$prepared"
+      prepared=""
+      rc=1
+    fi
+    if [ -n "$prepared" ]; then
+      if [ -e /etc/ssh/sshd_config.d ]; then
+        current_backup=$(mktemp -d "/etc/ssh/.sshd_config.d.current.XXXXXX") || {
+          rm -rf -- "$prepared"
+          prepared=""
+          rc=1
+          dropin_ok=0
+        }
+        if [ -n "$current_backup" ] && ! rmdir -- "$current_backup"; then
+          rm -rf -- "$prepared" "$current_backup"
+          prepared=""
+          current_backup=""
+          rc=1
+          dropin_ok=0
+        fi
+      fi
+      if [ -n "$prepared" ] && [ -e /etc/ssh/sshd_config.d ]; then
+        if ! mv -- /etc/ssh/sshd_config.d "$current_backup"; then
+          rc=1
+          dropin_ok=0
+        fi
+      fi
+      if [ "$dropin_ok" -eq 1 ] && ! mv -- "$prepared" /etc/ssh/sshd_config.d; then
+        if [ -n "$current_backup" ] && [ -e "$current_backup" ]; then
+          mv -- "$current_backup" /etc/ssh/sshd_config.d 2>/dev/null || rc=1
+        fi
+        rc=1
+      elif [ "$dropin_ok" -ne 1 ]; then
+        [ -n "$prepared" ] && rm -rf -- "$prepared"
+      fi
+      if [ "$dropin_ok" -eq 1 ] && [ -n "$current_backup" ] && [ -e "$current_backup" ]; then
+        rm -rf -- "$current_backup" || rc=1
+      fi
+    fi
+  elif [ -e /etc/ssh/sshd_config.d ]; then
+    dropin_ok=1
+    current_backup=$(mktemp -d "/etc/ssh/.sshd_config.d.remove.XXXXXX") || { rc=1; dropin_ok=0; }
+    if [ -n "$current_backup" ]; then
+      rmdir -- "$current_backup" || { rc=1; dropin_ok=0; }
+      if [ "$dropin_ok" -eq 1 ]; then
+        mv -- /etc/ssh/sshd_config.d "$current_backup" || rc=1
+      fi
+      if [ ! -e /etc/ssh/sshd_config.d ] && [ -e "$current_backup" ]; then
+        rm -rf -- "$current_backup" || rc=1
+      fi
+    fi
+  fi
+
+  if [ -f "$txn/ssh.socket.conf.existed" ]; then
+    restore_file_snapshot "$txn/ssh.socket.conf" "$SSHD_SOCKET_DROPIN_PATH" || rc=1
+  else
+    rm -f -- "$SSHD_SOCKET_DROPIN_PATH" || rc=1
+  fi
+  systemctl daemon-reload >/dev/null 2>&1 || rc=1
+  if [ -f "$txn/socket.enabled" ]; then
+    systemctl enable ssh.socket >/dev/null 2>&1 || rc=1
+  else
+    systemctl disable ssh.socket >/dev/null 2>&1 || rc=1
+  fi
+  if [ -f "$txn/socket.active" ]; then
+    systemctl restart ssh.socket >/dev/null 2>&1 || rc=1
+  elif systemctl is-active --quiet ssh.socket 2>/dev/null; then
+    systemctl stop ssh.socket >/dev/null 2>&1 || rc=1
+  fi
+  return "$rc"
+}
+
+sshd_transaction_rollback(){
+  local txn="$1"
+  local service rc=0
+  sshd_transaction_restore "$txn" || rc=1
+  service=$(detect_ssh_service_name)
+  systemctl restart "$service" >/dev/null 2>&1 || rc=1
+  if [ "$rc" -eq 0 ]; then
+    rm -rf -- "$txn" || rc=1
+  fi
+  [ "$rc" -eq 0 ] || echo -e "${R}警告：SSH 配置回滚未完全成功，请保持当前会话并立即检查 sshd；快照保留在 ${txn}${N}" >&2
+  return "$rc"
+}
+
+sshd_transaction_commit(){
+  rm -rf -- "$1"
+}
+
+ssh_socket_activation_in_use(){
+  systemctl cat ssh.socket >/dev/null 2>&1 || return 1
+  systemctl is-active --quiet ssh.socket 2>/dev/null \
+    || systemctl is-enabled --quiet ssh.socket 2>/dev/null
+}
+
+configure_ssh_socket_port(){
+  local port="$1"
+  local dir tmp
+
+  ssh_socket_activation_in_use || return 0
+  dir=$(dirname -- "$SSHD_SOCKET_DROPIN_PATH")
+  mkdir -p "$dir" || return 1
+  tmp=$(mktemp "${SSHD_SOCKET_DROPIN_PATH}.tmp.XXXXXX") || return 1
+  cat > "$tmp" <<EOF
+# Managed by Leyili. Empty assignment resets vendor ListenStream entries.
+[Socket]
+ListenStream=
+ListenStream=${port}
+EOF
+  chmod 644 "$tmp" || { rm -f -- "$tmp"; return 1; }
+  mv -f -- "$tmp" "$SSHD_SOCKET_DROPIN_PATH" || return 1
+  systemctl daemon-reload || return 1
+  systemctl restart ssh.socket
 }
 
 apply_sshd_setting(){
@@ -217,6 +394,7 @@ apply_sshd_setting(){
   local lower_key=""
   local lower_value=""
   local listen_ok=0
+  local txn=""
 
   if ! require_root; then
     return 1
@@ -237,8 +415,14 @@ apply_sshd_setting(){
     return 1
   fi
 
+  txn=$(sshd_transaction_begin) || {
+    echo -e "${R}SSH 配置事务快照失败${N}"
+    pause_screen
+    return 1
+  }
   backup_path="${SSHD_CONFIG_PATH}.bak.$(date +%Y%m%d%H%M%S)"
   if ! cp "$SSHD_CONFIG_PATH" "$backup_path"; then
+    sshd_transaction_rollback "$txn"
     echo ""
     echo -e "${R}SSH 配置备份失败${N}"
     pause_screen
@@ -246,7 +430,7 @@ apply_sshd_setting(){
   fi
 
   if ! set_sshd_global_directive "$key" "$value"; then
-    cp "$backup_path" "$SSHD_CONFIG_PATH" 2>/dev/null || true
+    sshd_transaction_rollback "$txn"
     echo ""
     echo -e "${R}SSH 配置写入失败，已恢复备份${N}"
     pause_screen
@@ -254,7 +438,7 @@ apply_sshd_setting(){
   fi
 
   if ! "$sshd_bin" -t -f "$SSHD_CONFIG_PATH"; then
-    cp "$backup_path" "$SSHD_CONFIG_PATH" 2>/dev/null || true
+    sshd_transaction_rollback "$txn"
     echo ""
     echo -e "${R}SSH 配置校验失败，已恢复备份${N}"
     pause_screen
@@ -269,16 +453,21 @@ apply_sshd_setting(){
   if [ -n "$effective_value" ] && [ "$(printf '%s' "$effective_value" | tr '[:upper:]' '[:lower:]')" != "$lower_value" ]; then
     echo -e "  ${Y}sshd -T 报告 ${key} 实际生效=${effective_value}，与目标 ${value} 不一致${N}"
     echo -e "  ${Y}尝试清理 /etc/ssh/sshd_config.d/*.conf 中的覆盖项...${N}"
-    neutralize_sshd_dropin_overrides "$key" "$value" || true
+    if ! neutralize_sshd_dropin_overrides "$key" "$value"; then
+      sshd_transaction_rollback "$txn"
+      echo -e "${R}处理 sshd_config.d 覆盖项失败，已完整回滚${N}"
+      pause_screen
+      return 1
+    fi
     if ! "$sshd_bin" -t -f "$SSHD_CONFIG_PATH"; then
-      cp "$backup_path" "$SSHD_CONFIG_PATH" 2>/dev/null || true
+      sshd_transaction_rollback "$txn"
       echo -e "${R}清理覆盖后 sshd -t 校验失败，已恢复备份${N}"
       pause_screen
       return 1
     fi
     effective_value=$(get_effective_sshd_value "$key")
     if [ -n "$effective_value" ] && [ "$(printf '%s' "$effective_value" | tr '[:upper:]' '[:lower:]')" != "$lower_value" ]; then
-      cp "$backup_path" "$SSHD_CONFIG_PATH" 2>/dev/null || true
+      sshd_transaction_rollback "$txn"
       echo ""
       echo -e "${R}sshd -T 仍显示 ${key}=${effective_value}，无法达到 ${value}，已恢复备份${N}"
       echo -e "${Y}可能存在 Match 块限制，请手动检查 /etc/ssh/sshd_config 与 /etc/ssh/sshd_config.d/${N}"
@@ -287,11 +476,17 @@ apply_sshd_setting(){
     fi
   fi
 
+  if [ "$key" = "Port" ] && ! configure_ssh_socket_port "$value"; then
+    sshd_transaction_rollback "$txn"
+    echo ""
+    echo -e "${R}ssh.socket 端口配置失败，已恢复主配置、drop-in 与 socket 配置${N}"
+    pause_screen
+    return 1
+  fi
+
   ssh_service=$(detect_ssh_service_name)
   if ! systemctl restart "$ssh_service"; then
-    cp "$backup_path" "$SSHD_CONFIG_PATH" 2>/dev/null || true
-    "$sshd_bin" -t -f "$SSHD_CONFIG_PATH" >/dev/null 2>&1 || true
-    systemctl restart "$ssh_service" >/dev/null 2>&1 || true
+    sshd_transaction_rollback "$txn"
     echo ""
     echo -e "${R}SSH 服务重启失败，已恢复备份并尝试恢复原配置${N}"
     pause_screen
@@ -312,8 +507,7 @@ apply_sshd_setting(){
       i=$((i + 1))
     done
     if [ "$listen_ok" -ne 1 ]; then
-      cp "$backup_path" "$SSHD_CONFIG_PATH" 2>/dev/null || true
-      systemctl restart "$ssh_service" >/dev/null 2>&1 || true
+      sshd_transaction_rollback "$txn"
       echo ""
       echo -e "${R}sshd 已重启，但新端口 ${value} 未检测到监听，已回滚配置${N}"
       pause_screen
@@ -321,96 +515,14 @@ apply_sshd_setting(){
     fi
   fi
 
+  sshd_transaction_commit "$txn"
+
   echo ""
   echo -e "${G}${success_message}${N}"
   echo -e "  备份文件: ${C}$backup_path${N}"
   if [ "$key" = "Port" ]; then
     echo -e "  ${Y}重要：${N}请立即开新终端验证新端口可登录，再关闭当前会话！"
   fi
-  return 0
-}
-
-# 幂等：确保 SSH 密码登录全局生效
-# - 主 sshd_config 写入 PasswordAuthentication=yes、KbdInteractiveAuthentication=yes
-# - 清理 /etc/ssh/sshd_config.d/*.conf 里的反向覆盖
-# - sshd -t 校验 + sshd -T 验证实际生效值 + 重启服务
-# 失败时尽量回滚。返回 0=成功或已是预期状态，1=失败
-ensure_password_auth_enabled(){
-  local sshd_bin=""
-  local ssh_service=""
-  local backup_path=""
-  local effective=""
-  local need_restart=0
-
-  if ! require_root; then
-    return 1
-  fi
-
-  if [ ! -f "$SSHD_CONFIG_PATH" ]; then
-    echo -e "${R}未找到 $SSHD_CONFIG_PATH${N}"
-    return 1
-  fi
-
-  sshd_bin=$(get_sshd_binary)
-  if [ -z "$sshd_bin" ]; then
-    echo -e "${R}未找到 sshd 可执行文件${N}"
-    return 1
-  fi
-
-  # 已经 yes 就早退（幂等）
-  effective=$(get_effective_sshd_value PasswordAuthentication)
-  local kbd_effective
-  kbd_effective=$(get_effective_sshd_value KbdInteractiveAuthentication)
-  if [ "$effective" = "yes" ] && { [ -z "$kbd_effective" ] || [ "$kbd_effective" = "yes" ]; }; then
-    echo -e "  ${D}密码登录已启用（PasswordAuthentication=yes），跳过${N}"
-    return 0
-  fi
-
-  echo -e "${Y}==> 确保 SSH 密码登录可用${N}"
-  backup_path="${SSHD_CONFIG_PATH}.bak.$(date +%Y%m%d%H%M%S)"
-  if ! cp "$SSHD_CONFIG_PATH" "$backup_path"; then
-    echo -e "${R}SSH 配置备份失败${N}"
-    return 1
-  fi
-
-  if ! set_sshd_global_directive "PasswordAuthentication" "yes"; then
-    cp "$backup_path" "$SSHD_CONFIG_PATH" 2>/dev/null || true
-    echo -e "${R}写入 PasswordAuthentication 失败，已回滚${N}"
-    return 1
-  fi
-  if ! set_sshd_global_directive "KbdInteractiveAuthentication" "yes"; then
-    cp "$backup_path" "$SSHD_CONFIG_PATH" 2>/dev/null || true
-    echo -e "${R}写入 KbdInteractiveAuthentication 失败，已回滚${N}"
-    return 1
-  fi
-
-  neutralize_sshd_dropin_overrides "PasswordAuthentication" "yes" || true
-  neutralize_sshd_dropin_overrides "KbdInteractiveAuthentication" "yes" || true
-
-  if ! "$sshd_bin" -t -f "$SSHD_CONFIG_PATH"; then
-    cp "$backup_path" "$SSHD_CONFIG_PATH" 2>/dev/null || true
-    echo -e "${R}sshd -t 校验失败，已回滚主配置${N}"
-    return 1
-  fi
-
-  effective=$(get_effective_sshd_value PasswordAuthentication)
-  if [ -n "$effective" ] && [ "$effective" != "yes" ]; then
-    cp "$backup_path" "$SSHD_CONFIG_PATH" 2>/dev/null || true
-    echo -e "${R}sshd -T 显示 PasswordAuthentication 实际为 ${effective}，已回滚${N}"
-    echo -e "${Y}请手动检查 /etc/ssh/sshd_config.d/ 是否有未识别的覆盖${N}"
-    return 1
-  fi
-
-  ssh_service=$(detect_ssh_service_name)
-  if ! systemctl restart "$ssh_service"; then
-    cp "$backup_path" "$SSHD_CONFIG_PATH" 2>/dev/null || true
-    systemctl restart "$ssh_service" >/dev/null 2>&1 || true
-    echo -e "${R}SSH 服务重启失败，已回滚${N}"
-    return 1
-  fi
-
-  cleanup_old_backups "${SSHD_CONFIG_PATH}.bak.*" 5 2>/dev/null || true
-  echo -e "  ${G}PasswordAuthentication = yes (已生效)${N}"
   return 0
 }
 

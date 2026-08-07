@@ -35,6 +35,7 @@ install_ss2022_node(){
   local install_mode="ipv4" mode_label=""
   local PORT TAG LISTEN_CHOICE LISTEN_ADDR METHOD PASSWORD METHOD_CHOICE confirm
   local default_port
+  local txn="" old_port="" old_mode="ipv4"
 
   if ! require_root; then return 1; fi
 
@@ -52,6 +53,8 @@ install_ss2022_node(){
       echo -e "  已取消"
       return 0
     fi
+    old_port=$(get_node_value ss2022 Port 2>/dev/null || true)
+    old_mode=$(get_node_value ss2022 Mode 2>/dev/null || echo ipv4)
   fi
 
   default_port=$(generate_ss2022_random_port)
@@ -63,7 +66,7 @@ install_ss2022_node(){
       continue
     fi
     PORT=$((10#$PORT))
-    if check_port_in_use "$PORT"; then
+    if [ "$PORT" != "$old_port" ] && check_port_in_use "$PORT" tcp; then
       echo -e "${R}端口 ${PORT} 已被其他服务占用${N}"
       local force_port=""
       read -p "  仍然使用此端口？(y/N): " force_port
@@ -167,6 +170,7 @@ install_ss2022_node(){
 
   echo -e "${Y}==> 写入配置...${N}"
   ensure_jq || { pause_screen; return 1; }
+  txn=$(node_transaction_begin ss2022) || { echo -e "${R}节点事务快照失败${N}"; pause_screen; return 1; }
 
   # network=tcp 屏蔽 UDP relay：减小攻击面，单一 TCP 防火墙规则
   local inbound_json
@@ -185,20 +189,27 @@ install_ss2022_node(){
     }')
 
   if ! config_add_inbound "$inbound_json"; then
+    node_transaction_rollback "$txn"
     echo -e "${R}写入 inbound 失败${N}"
     pause_screen
     return 1
   fi
 
   echo -e "${Y}==> 校验并启动...${N}"
-  if ! config_check_and_restart; then
+  if ! config_check_and_restart "$PORT" tcp; then
+    node_transaction_rollback "$txn"
     echo ""
     echo -e "${R}sing-box 校验或重启失败${N}"
     pause_screen
     return 1
   fi
 
-  node_apply_firewall_for_mode "$PORT" tcp "$install_mode"
+  if ! node_apply_firewall_for_mode "$PORT" tcp "$install_mode"; then
+    node_transaction_rollback "$txn"
+    echo -e "${R}防火墙放行失败，节点配置已回滚${N}"
+    pause_screen
+    return 1
+  fi
   print_firewall_hint "$PORT" tcp "Shadowsocks-2022 节点入站"
 
   link=$(build_ss2022_link "$METHOD" "$PASSWORD" "$access_ip" "$PORT" "$TAG" 2>/dev/null || true)
@@ -206,8 +217,7 @@ install_ss2022_node(){
     ipv6_link=$(build_ss2022_link "$METHOD" "$PASSWORD" "$public_ipv6" "$PORT" "${TAG}-ipv6" 2>/dev/null || true)
   fi
 
-  ensure_nodes_dir
-  cat > "$(node_info_path ss2022)" <<EOF
+  if ! write_node_info_file ss2022 <<EOF
 Type=ss2022
 Tag=$TAG
 Mode=$install_mode
@@ -218,6 +228,22 @@ Password=$PASSWORD
 IP=$access_ip
 Link=$link
 EOF
+  then
+    node_transaction_rollback "$txn"
+    echo -e "${R}节点信息保存失败，已完整回滚${N}"
+    pause_screen
+    return 1
+  fi
+
+  if [ -n "$old_port" ] && [ "$old_port" != "$PORT" ]; then
+    if ! node_revoke_firewall_for_mode "$old_port" tcp "$old_mode"; then
+      node_transaction_rollback "$txn"
+      echo -e "${R}旧端口防火墙清理失败，已完整回滚${N}"
+      pause_screen
+      return 1
+    fi
+  fi
+  node_transaction_commit "$txn"
 
   register_sb_command || true
 
@@ -264,17 +290,11 @@ uninstall_ss2022_node(){
     return 0
   fi
 
-  # 必须在 remove_node_info 之前撤防火墙规则，否则读不到 Mode/Port
-  local ss_port ss_mode
-  ss_port=$(get_node_value ss2022 Port 2>/dev/null || true)
-  ss_mode=$(get_node_value ss2022 Mode 2>/dev/null || echo ipv4)
-  if [ -n "$ss_port" ]; then
-    node_revoke_firewall_for_mode "$ss_port" tcp "$ss_mode"
+  if ! uninstall_node_transaction ss2022 ss2022-in tcp; then
+    echo -e "${R}Shadowsocks-2022 节点卸载失败，已恢复原配置${N}"
+    pause_screen
+    return 1
   fi
-
-  config_remove_inbound_by_tag "ss2022-in" || true
-  remove_node_info ss2022
-  post_uninstall_service_step
   echo -e "${G}Shadowsocks-2022 节点已卸载${N}"
   pause_screen
 }
