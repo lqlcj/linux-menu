@@ -354,7 +354,7 @@ print_firewall_hint(){
       ;;
   esac
   if command -v ip6tables >/dev/null 2>&1; then
-    echo -e "    ${L}·${N} IPv6 防火墙菜单 : 主菜单 ${C}6) IPv6 防火墙管理 → 4) 开放端口${N}"
+    echo -e "    ${L}·${N} IPv6 防火墙菜单 : 主菜单 ${C}5) 防火墙管理 → 2) IPv6 防火墙管理 → 4) 开放端口${N}"
   fi
   echo -e "    ${L}·${N} 云厂商安全组    : ${D}阿里云 / 腾讯云 / AWS / Vultr 等控制台需自行加 ${port}/${proto} 入站规则${N}"
   echo ""
@@ -599,7 +599,6 @@ cancel_rollback_pid(){
   [ -n "$pid" ] || return 0
   kill "$pid" 2>/dev/null || true
 }
-
 # ═══ source: 02-utils-ui.sh ═══
 register_sb_command(){
   local source_path="" src_real dst_real
@@ -2180,7 +2179,11 @@ show_system_menu(){
     render_menu_item 5 "网络优化"
     render_menu_item 6 "查看网络优化状态"
     render_menu_item 7 "添加 SWAP"
-    render_menu_item 8 "安装 fail2ban (SSH 防爆破)"
+    render_menu_item 8 "安装 / 配置 fail2ban (SSH 多端口防爆破)"
+    render_menu_item 9 "Reality 域名检测工具"
+    render_menu_item 10 "WARP 谷歌解锁分流"
+    render_menu_item 11 "服务器状态"
+    render_menu_item 12 "本地链路测评"
     render_menu_item 0 "返回上级"
     render_divider
     read -p "  请输入序号: " choice
@@ -2209,6 +2212,18 @@ show_system_menu(){
         ;;
       8)
         setup_fail2ban
+        ;;
+      9)
+        check_reality_dest_domain
+        ;;
+      10)
+        show_warp_menu
+        ;;
+      11)
+        show_server_status
+        ;;
+      12)
+        show_netbench_menu
         ;;
       0)
         return
@@ -2261,7 +2276,6 @@ show_admin_menu(){
     esac
   done
 }
-
 # ═══ source: 22-firewall-ipv6.sh ═══
 show_ipv6_firewall_menu(){
   local ssh_port
@@ -3711,6 +3725,35 @@ FAIL2BAN_MAXRETRY="5"
 FAIL2BAN_BANTIME="600"
 FAIL2BAN_FINDTIME="300"
 
+normalize_fail2ban_port_list(){
+  local raw="${1:-}" item ports="" count=0
+  local -a items=()
+
+  raw="${raw//，/,}"
+  raw="${raw//；/,}"
+  raw="${raw//;/,}"
+  raw="${raw//$'\t'/,}"
+  raw="${raw// /,}"
+  IFS=',' read -r -a items <<< "$raw"
+
+  for item in "${items[@]}"; do
+    [ -n "$item" ] || continue
+    validate_port "$item" || return 1
+    item=$((10#$item))
+
+    case ",${ports}," in
+      *",${item},"*) continue ;;
+    esac
+
+    count=$((count + 1))
+    [ "$count" -le 15 ] || return 2
+    ports="${ports:+${ports},}${item}"
+  done
+
+  [ -n "$ports" ] || return 1
+  printf '%s' "$ports"
+}
+
 setup_fail2ban(){
   if ! require_root; then return 1; fi
   if ! require_debian_family; then
@@ -3718,22 +3761,48 @@ setup_fail2ban(){
     return 1
   fi
 
-  render_section_header "安装 / 配置 fail2ban (SSH)"
+  render_section_header "安装 / 配置 fail2ban (SSH 多端口)"
 
-  local current_ssh_port port
+  local current_ssh_port default_ports saved_ports input_ports ports normalize_status
   current_ssh_port=$(get_current_ssh_port)
+  default_ports="$current_ssh_port"
 
-  echo -e "  ${L}●${N} 当前 sshd 监听端口: ${C}${current_ssh_port}${N}"
+  if [ -f "$FAIL2BAN_JAIL_PATH" ]; then
+    saved_ports=$(awk -F= '
+      /^[[:space:]]*port[[:space:]]*=/ {
+        value=$2
+        gsub(/[[:space:]]/, "", value)
+        print value
+        exit
+      }
+    ' "$FAIL2BAN_JAIL_PATH" 2>/dev/null)
+    if [ -n "$saved_ports" ] && ports=$(normalize_fail2ban_port_list "$saved_ports"); then
+      default_ports="$ports"
+    fi
+  fi
+
+  echo -e "  ${L}●${N} 当前检测到的 SSH 端口: ${C}${current_ssh_port}${N}"
+  if [ "$default_ports" != "$current_ssh_port" ]; then
+    echo -e "  ${L}●${N} 当前 fail2ban 保护端口: ${C}${default_ports}${N}"
+  fi
   echo -e "  ${L}●${N} 配置参数: ${C}maxretry=${FAIL2BAN_MAXRETRY}  bantime=${FAIL2BAN_BANTIME}s  findtime=${FAIL2BAN_FINDTIME}s${N}"
+  echo -e "  ${D}多个端口可用逗号或空格分隔，最多 15 个；仅填写 sshd 实际监听的端口。${N}"
+  echo -e "  ${D}此处只配置防爆破，不会修改 SSH 监听端口，也不会自动开放防火墙。${N}"
   echo ""
 
   while :; do
-    read -p "  请输入需要保护的 SSH 端口 (回车使用 ${current_ssh_port}): " port
-    port="${port:-$current_ssh_port}"
-    if validate_port "$port"; then
+    read -p "  请输入需要保护的 SSH 端口列表 (回车使用 ${default_ports}): " input_ports
+    input_ports="${input_ports:-$default_ports}"
+    if ports=$(normalize_fail2ban_port_list "$input_ports"); then
       break
+    else
+      normalize_status=$?
     fi
-    echo -e "  ${R}端口无效，需为 1-65535 之间的整数${N}"
+    if [ "$normalize_status" -eq 2 ]; then
+      echo -e "  ${R}端口数量过多，最多支持 15 个不重复端口${N}"
+    else
+      echo -e "  ${R}端口列表无效：每项需为 1-65535 之间的整数，并用逗号或空格分隔${N}"
+    fi
   done
 
   echo ""
@@ -3763,7 +3832,7 @@ setup_fail2ban(){
 # Managed by ${APP_NAME} — do not edit by hand, it will be overwritten.
 [sshd]
 enabled  = true
-port     = ${port}
+port     = ${ports}
 backend  = systemd
 maxretry = ${FAIL2BAN_MAXRETRY}
 bantime  = ${FAIL2BAN_BANTIME}
@@ -3788,7 +3857,7 @@ EOF
   echo ""
   echo -e "${G}fail2ban 已配置并启动${N}"
   echo -e "  ${L}●${N} 配置文件 : ${C}${FAIL2BAN_JAIL_PATH}${N}"
-  echo -e "  ${L}●${N} 监听端口 : ${C}${port}${N}"
+  echo -e "  ${L}●${N} 保护端口 : ${C}${ports}${N}"
   echo -e "  ${L}●${N} 最大重试 : ${C}${FAIL2BAN_MAXRETRY}${N} 次"
   echo -e "  ${L}●${N} 发现时间 : ${C}${FAIL2BAN_FINDTIME}${N} 秒"
   echo -e "  ${L}●${N} 禁用时间 : ${C}${FAIL2BAN_BANTIME}${N} 秒"
@@ -3798,7 +3867,6 @@ EOF
 
   pause_screen
 }
-
 # ═══ source: 30-node-render.sh ═══
 render_node_detail(){
   local type="$1"
@@ -9792,6 +9860,13 @@ render_card_top(){
   echo -e "  ${L}╭─${N}${C}★${N} ${title} ${L}${fill}${N} ${right} ${C}★${N}${L}─╮${N}"
 }
 
+# 无标题卡片顶部
+render_card_plain_top(){
+  local fill
+  fill=$(_card_dash_fill "$CARD_INNER_WIDTH")
+  echo -e "  ${L}╭${fill}╮${N}"
+}
+
 # 卡片底部
 render_card_bottom(){
   local fill
@@ -9976,46 +10051,19 @@ render_singbox_version_card_line(){
   render_card_blank
 }
 
-# 主菜单卡片：标题栏 + 协议块 + 系统调优行
+# 主菜单卡片：精简节点概览
 render_main_menu_card(){
-  local ver status status_str title
-  if is_singbox_installed; then
-    ver=$(sing-box version 2>/dev/null | head -1 | awk '{print $3}')
-    [ -z "$ver" ] && ver="未知"
-    status=$(systemctl is-active sing-box 2>/dev/null || echo "未知")
-    if [ "$status" = "active" ]; then
-      status_str="${G}运行中${N}"
-    else
-      status_str="${R}${status}${N}"
-    fi
-  else
-    ver="未安装"
-    status_str="${Y}未安装${N}"
-  fi
-
-  title="${B}${C}管理菜单${N} ${D}·${N} ${C}v${ver}${N}"
-  render_card_top "$title" "$status_str"
+  render_card_plain_top
   render_card_blank
   render_singbox_version_card_line
   render_node_card_block reality
-  render_card_blank
-  render_node_card_block hy2
-  render_card_blank
-  render_node_card_block anytls
-  render_card_blank
-  render_node_card_block tuic
   if node_installed ss2022; then
     render_card_blank
     render_node_card_block ss2022
   fi
   render_card_blank
-  render_tcp_card_line
-  render_quic_card_line
-  render_initcwnd_card_line
-  render_card_blank
   render_card_bottom
 }
-
 # ═══ source: 80-menu-node.sh ═══
 show_node_install_menu(){
   while true; do
@@ -10392,16 +10440,12 @@ show_node_manage_menu(){
     render_section_header "节点管理"
     render_menu_item 1 "创建节点 (Reality / Hysteria2 / AnyTLS / TUIC / SS-2022)"
     render_menu_item 2 "卸载单个节点"
-    render_menu_item 3 "Reality 域名检测工具"
-    render_menu_item 4 "WARP 谷歌解锁分流"
     render_menu_item 0 "返回上级"
     render_divider
     read -p "  请输入序号: " choice
     case $choice in
       1) show_node_install_menu ;;
       2) show_node_uninstall_menu ;;
-      3) check_reality_dest_domain ;;
-      4) show_warp_menu ;;
       0) return ;;
       *) notify_invalid_choice ;;
     esac
@@ -10418,7 +10462,6 @@ show_node_manage_menu(){
 #          内核 WireGuard / ip route，不影响现有 Reality/Hy2/AnyTLS/TUIC 节点
 # 边界   : 只对通过 sing-box 入站节点转发的流量生效，不影响 VPS 本机直连
 # ═══════════════════════════════════════════════════════════════════════
-
 # ═══ source: 90-warp.sh ═══
 warp_log_ok()   { echo -e "  ${G}✓${N} $*" >&2; }
 warp_log_info() { echo -e "  ${C}●${N} $*" >&2; }
@@ -11312,6 +11355,32 @@ show_server_status(){
 }
 
 # ═══ source: 99-menu-main.sh ═══
+show_firewall_menu(){
+  while true; do
+    render_section_header "防火墙管理"
+    render_menu_item 1 "IPv4 防火墙管理"
+    render_menu_item 2 "IPv6 防火墙管理"
+    render_menu_item 0 "返回上级"
+    render_divider
+    read -p "  请输入序号: " choice
+
+    case $choice in
+      1)
+        show_ipv4_firewall_menu
+        ;;
+      2)
+        show_ipv6_firewall_menu
+        ;;
+      0)
+        return
+        ;;
+      *)
+        notify_invalid_choice
+        ;;
+    esac
+  done
+}
+
 show_menu(){
   local main_action_label=""
 
@@ -11331,12 +11400,9 @@ show_menu(){
     render_menu_item 2 "系统基础设置"
     render_menu_item 3 "${main_action_label}"
     render_menu_item 4 "查看状态"
-    render_menu_item 5 "IPv4 防火墙管理"
-    render_menu_item 6 "IPv6 防火墙管理"
-    render_menu_item 7 "卸载脚本"
-    render_menu_item 8 "更新管理"
-    render_menu_item 9 "服务器状态"
-    render_menu_item 10 "本地链路测评"
+    render_menu_item 5 "防火墙管理"
+    render_menu_item 6 "卸载脚本"
+    render_menu_item 7 "更新管理"
     render_menu_item 0 "退出"
     render_divider
     read -p "  请输入序号: " choice
@@ -11359,22 +11425,13 @@ show_menu(){
         show_status_menu
         ;;
       5)
-        show_ipv4_firewall_menu
+        show_firewall_menu
         ;;
       6)
-        show_ipv6_firewall_menu
-        ;;
-      7)
         uninstall_script_completely
         ;;
-      8)
+      7)
         show_update_menu
-        ;;
-      9)
-        show_server_status
-        ;;
-      10)
-        show_netbench_menu
         ;;
       0)
         exit 0

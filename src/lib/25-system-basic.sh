@@ -141,6 +141,35 @@ FAIL2BAN_MAXRETRY="5"
 FAIL2BAN_BANTIME="600"
 FAIL2BAN_FINDTIME="300"
 
+normalize_fail2ban_port_list(){
+  local raw="${1:-}" item ports="" count=0
+  local -a items=()
+
+  raw="${raw//，/,}"
+  raw="${raw//；/,}"
+  raw="${raw//;/,}"
+  raw="${raw//$'\t'/,}"
+  raw="${raw// /,}"
+  IFS=',' read -r -a items <<< "$raw"
+
+  for item in "${items[@]}"; do
+    [ -n "$item" ] || continue
+    validate_port "$item" || return 1
+    item=$((10#$item))
+
+    case ",${ports}," in
+      *",${item},"*) continue ;;
+    esac
+
+    count=$((count + 1))
+    [ "$count" -le 15 ] || return 2
+    ports="${ports:+${ports},}${item}"
+  done
+
+  [ -n "$ports" ] || return 1
+  printf '%s' "$ports"
+}
+
 setup_fail2ban(){
   if ! require_root; then return 1; fi
   if ! require_debian_family; then
@@ -148,22 +177,48 @@ setup_fail2ban(){
     return 1
   fi
 
-  render_section_header "安装 / 配置 fail2ban (SSH)"
+  render_section_header "安装 / 配置 fail2ban (SSH 多端口)"
 
-  local current_ssh_port port
+  local current_ssh_port default_ports saved_ports input_ports ports normalize_status
   current_ssh_port=$(get_current_ssh_port)
+  default_ports="$current_ssh_port"
 
-  echo -e "  ${L}●${N} 当前 sshd 监听端口: ${C}${current_ssh_port}${N}"
+  if [ -f "$FAIL2BAN_JAIL_PATH" ]; then
+    saved_ports=$(awk -F= '
+      /^[[:space:]]*port[[:space:]]*=/ {
+        value=$2
+        gsub(/[[:space:]]/, "", value)
+        print value
+        exit
+      }
+    ' "$FAIL2BAN_JAIL_PATH" 2>/dev/null)
+    if [ -n "$saved_ports" ] && ports=$(normalize_fail2ban_port_list "$saved_ports"); then
+      default_ports="$ports"
+    fi
+  fi
+
+  echo -e "  ${L}●${N} 当前检测到的 SSH 端口: ${C}${current_ssh_port}${N}"
+  if [ "$default_ports" != "$current_ssh_port" ]; then
+    echo -e "  ${L}●${N} 当前 fail2ban 保护端口: ${C}${default_ports}${N}"
+  fi
   echo -e "  ${L}●${N} 配置参数: ${C}maxretry=${FAIL2BAN_MAXRETRY}  bantime=${FAIL2BAN_BANTIME}s  findtime=${FAIL2BAN_FINDTIME}s${N}"
+  echo -e "  ${D}多个端口可用逗号或空格分隔，最多 15 个；仅填写 sshd 实际监听的端口。${N}"
+  echo -e "  ${D}此处只配置防爆破，不会修改 SSH 监听端口，也不会自动开放防火墙。${N}"
   echo ""
 
   while :; do
-    read -p "  请输入需要保护的 SSH 端口 (回车使用 ${current_ssh_port}): " port
-    port="${port:-$current_ssh_port}"
-    if validate_port "$port"; then
+    read -p "  请输入需要保护的 SSH 端口列表 (回车使用 ${default_ports}): " input_ports
+    input_ports="${input_ports:-$default_ports}"
+    if ports=$(normalize_fail2ban_port_list "$input_ports"); then
       break
+    else
+      normalize_status=$?
     fi
-    echo -e "  ${R}端口无效，需为 1-65535 之间的整数${N}"
+    if [ "$normalize_status" -eq 2 ]; then
+      echo -e "  ${R}端口数量过多，最多支持 15 个不重复端口${N}"
+    else
+      echo -e "  ${R}端口列表无效：每项需为 1-65535 之间的整数，并用逗号或空格分隔${N}"
+    fi
   done
 
   echo ""
@@ -193,7 +248,7 @@ setup_fail2ban(){
 # Managed by ${APP_NAME} — do not edit by hand, it will be overwritten.
 [sshd]
 enabled  = true
-port     = ${port}
+port     = ${ports}
 backend  = systemd
 maxretry = ${FAIL2BAN_MAXRETRY}
 bantime  = ${FAIL2BAN_BANTIME}
@@ -218,7 +273,7 @@ EOF
   echo ""
   echo -e "${G}fail2ban 已配置并启动${N}"
   echo -e "  ${L}●${N} 配置文件 : ${C}${FAIL2BAN_JAIL_PATH}${N}"
-  echo -e "  ${L}●${N} 监听端口 : ${C}${port}${N}"
+  echo -e "  ${L}●${N} 保护端口 : ${C}${ports}${N}"
   echo -e "  ${L}●${N} 最大重试 : ${C}${FAIL2BAN_MAXRETRY}${N} 次"
   echo -e "  ${L}●${N} 发现时间 : ${C}${FAIL2BAN_FINDTIME}${N} 秒"
   echo -e "  ${L}●${N} 禁用时间 : ${C}${FAIL2BAN_BANTIME}${N} 秒"
@@ -228,4 +283,3 @@ EOF
 
   pause_screen
 }
-
