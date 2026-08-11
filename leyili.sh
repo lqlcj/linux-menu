@@ -1321,8 +1321,63 @@ verify_sshd_listening_on_port(){
     | awk -v p=":${port}$" '$4 ~ p {found=1} END {exit !found}'
 }
 # ═══ source: 02-utils-ui.sh ═══
+# 安装入口失败时说清原因和下一步。提示随后会被 show_menu 的 clear 抹掉，
+# 所以 _entry.sh 会在进菜单前停下来等回车。
+report_sb_install_failure(){
+  local reason="$1"
+  local bin_dir
+
+  bin_dir=$(dirname -- "$SCRIPT_PATH")
+  echo ""
+  echo -e "  ${R}${B}✗ ${COMMAND_NAME} 命令未安装到 ${SCRIPT_PATH}${N}"
+  case "$reason" in
+    pipe)
+      echo -e "  ${Y}原因：${N}脚本以管道 / 进程替换方式运行，没有可复制的本地文件。"
+      echo -e "  ${Y}解决：${N}用 root 先下载为临时文件再执行："
+      echo -e "    ${C}tmp_script=\$(mktemp)${N}"
+      echo -e "    ${C}curl --proto '=https' --tlsv1.2 -fsSL \"${SELF_INSTALL_URL}\" -o \"\$tmp_script\"${N}"
+      echo -e "    ${C}bash \"\$tmp_script\"; rm -f -- \"\$tmp_script\"${N}"
+      ;;
+    noroot)
+      echo -e "  ${Y}原因：${N}当前用户（UID $(id -u)）无权写入 ${bin_dir}。"
+      echo -e "  ${Y}解决：${N}切换到 root 再运行一次本脚本。"
+      ;;
+    syntax)
+      echo -e "  ${Y}原因：${N}本机 bash 未通过脚本语法检查（版本过旧或文件已损坏）。"
+      echo -e "  ${Y}排查：${N}${C}bash --version | head -1${N}"
+      ;;
+    path)
+      echo -e "  ${Y}原因：${N}文件已写入，但 ${bin_dir} 不在当前 PATH 中。"
+      echo -e "  ${Y}解决：${N}用绝对路径 ${C}${SCRIPT_PATH}${N} 启动，或把目录加进 PATH："
+      echo -e "    ${C}echo 'export PATH=\$PATH:${bin_dir}' >> ~/.bashrc && . ~/.bashrc${N}"
+      ;;
+    *)
+      echo -e "  ${Y}原因：${N}写入失败（只读挂载 / 磁盘已满 / 目录不可写）。"
+      echo -e "  ${Y}排查：${N}${C}df -h ${bin_dir}; ls -ld ${bin_dir}${N}"
+      ;;
+  esac
+  echo ""
+}
+
+# 文件到位不等于命令可用：PATH 里解析不到入口时，用户敲 sb 仍然是 command not found。
+sb_registration_done(){
+  local resolved real_resolved real_target
+
+  hash -r 2>/dev/null || true
+  resolved=$(command -v "$COMMAND_NAME" 2>/dev/null)
+  if [ -n "$resolved" ]; then
+    real_resolved=$(readlink -f "$resolved" 2>/dev/null || printf '%s' "$resolved")
+    real_target=$(readlink -f "$SCRIPT_PATH" 2>/dev/null || printf '%s' "$SCRIPT_PATH")
+    if [ "$real_resolved" = "$real_target" ]; then
+      return 0
+    fi
+  fi
+  report_sb_install_failure path
+  return 1
+}
+
 register_sb_command(){
-  local source_path="" src_real dst_real tmp_file="" actual_sha=""
+  local source_path="" src_real dst_real tmp_file="" actual_sha="" fail_reason="write"
 
   if [ -n "${BASH_SOURCE[0]:-}" ] && [ -f "${BASH_SOURCE[0]}" ]; then
     source_path="${BASH_SOURCE[0]}"
@@ -1336,7 +1391,11 @@ register_sb_command(){
     src_real=$(readlink -f "$source_path" 2>/dev/null || printf '%s' "$source_path")
     dst_real=$(readlink -f "$SCRIPT_PATH" 2>/dev/null || printf '%s' "$SCRIPT_PATH")
     if [ -n "$src_real" ] && [ "$src_real" = "$dst_real" ]; then
-      chmod 755 "$SCRIPT_PATH" 2>/dev/null && return 0
+      # 已可执行就不再 chmod：非 root 用 sb 进菜单时 chmod 必失败，那不是错误
+      if [ -x "$SCRIPT_PATH" ] || chmod 755 "$SCRIPT_PATH" 2>/dev/null; then
+        sb_registration_done
+        return $?
+      fi
       echo -e "${Y}警告：无法修正 ${SCRIPT_PATH} 的执行权限${N}" >&2
       return 1
     fi
@@ -1347,16 +1406,20 @@ register_sb_command(){
       echo -e "${Y}警告：拒绝覆盖符号链接脚本入口 ${SCRIPT_PATH}${N}" >&2
       return 1
     fi
-    if bash -n "$source_path" >/dev/null 2>&1 \
-       && atomic_replace_file "$source_path" "$SCRIPT_PATH" 755; then
-      return 0
+    if ! bash -n "$source_path" >/dev/null 2>&1; then
+      fail_reason="syntax"
+    elif atomic_replace_file "$source_path" "$SCRIPT_PATH" 755; then
+      sb_registration_done
+      return $?
     fi
+  else
+    fail_reason="pipe"
   fi
 
   # 无本地源时不静默执行可变 URL。只有显式提供固定 SHA-256 才允许下载安装。
-  if [ -n "$SELF_INSTALL_URL" ] && [ -n "$SELF_INSTALL_SHA256" ]; then
-    case "$SELF_INSTALL_URL" in https://*) ;; *) return 1 ;; esac
-    tmp_file=$(mktemp) || return 1
+  if [ -n "$SELF_INSTALL_URL" ] && [ -n "$SELF_INSTALL_SHA256" ] \
+     && [ "${SELF_INSTALL_URL#https://}" != "$SELF_INSTALL_URL" ] \
+     && tmp_file=$(mktemp); then
     if curl --proto '=https' --proto-redir '=https' --tlsv1.2 -fsSL --max-time 15 \
          "$SELF_INSTALL_URL" -o "$tmp_file" \
        && bash -n "$tmp_file" >/dev/null 2>&1; then
@@ -1365,14 +1428,17 @@ register_sb_command(){
          && [ "$actual_sha" = "$(printf '%s' "$SELF_INSTALL_SHA256" | tr 'A-F' 'a-f')" ] \
          && atomic_replace_file "$tmp_file" "$SCRIPT_PATH" 755; then
         rm -f -- "$tmp_file"
-        return 0
+        sb_registration_done
+        return $?
       fi
     fi
     rm -f -- "$tmp_file"
   fi
 
-  echo -e "${Y}警告：${N} 无法自动安装 ${B}${APP_NAME}${N} 到 ${SCRIPT_PATH}。"
-  echo -e "  请从本地文件运行脚本；无本地源时需同时设置 ${B}SELF_INSTALL_URL${N} 与 ${B}SELF_INSTALL_SHA256${N}。"
+  if [ "$fail_reason" = "write" ] && [ "$(id -u)" -ne 0 ]; then
+    fail_reason="noroot"
+  fi
+  report_sb_install_failure "$fail_reason"
   return 1
 }
 
@@ -14069,7 +14135,12 @@ if [ "${LEYILI_SOURCE_ONLY:-0}" != "1" ]; then
   if ! acquire_global_lock; then
     exit 1
   fi
-  register_sb_command || true
+  # show_menu 第一件事就是 clear，安装失败的提示会被立刻抹掉；
+  # 先停下来等回车，否则用户到下次敲 sb 才发现命令不存在。
+  # 只在有终端时暂停：管道运行时 stdin 是脚本本身，read 会吃掉一行脚本内容。
+  if ! register_sb_command && [ -t 0 ]; then
+    read -r -p "  按回车继续进入菜单..." _ || true
+  fi
 
   show_menu
 fi
