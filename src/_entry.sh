@@ -7,7 +7,12 @@ if [ "${LEYILI_SOURCE_ONLY:-0}" != "1" ]; then
   if ! acquire_global_lock; then
     exit 1
   fi
-  register_sb_command || true
+  # show_menu 第一件事就是 clear，安装失败的提示会被立刻抹掉；
+  # 先停下来等回车，否则用户到下次敲 sb 才发现命令不存在。
+  # 只在有终端时暂停：管道运行时 stdin 是脚本本身，read 会吃掉一行脚本内容。
+  if ! register_sb_command && [ -t 0 ]; then
+    read -r -p "  按回车继续进入菜单..." _ || true
+  fi
 
   show_menu
 fi

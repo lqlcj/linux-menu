@@ -25,6 +25,23 @@ rm -f -- "$tmp_script"
 | `SELF_INSTALL_URL` | 自定义脚本更新来源，必须为 HTTPS |
 | `SELF_INSTALL_SHA256` | 固定自更新文件的 SHA-256；未设置时自更新要求人工输入 `UNVERIFIED` |
 
+## `sb` 命令不可用
+
+`sb` 是首次运行时脚本把自身复制到 `/usr/local/bin/sb` 得到的。装不上时，脚本会在进入菜单前打印具体原因并等待回车（早期版本这行提示会被菜单的 `clear` 立刻抹掉，导致直到下次敲 `sb` 才发现命令不存在）：
+
+| 原因 | 说明 |
+| --- | --- |
+| 管道运行 | `curl … \| bash`、`bash <(curl …)` 没有可复制的本地文件，必须按上面的方式先下载为临时文件 |
+| 非 root | 无权写入 `/usr/local/bin` |
+| 写入失败 | `/usr` 只读挂载或磁盘已满 |
+| 不在 PATH | 文件已就位但命令解析不到，可直接用绝对路径 `/usr/local/bin/sb` 启动 |
+
+已经出问题的机器，重新执行一次上面的安装命令即可恢复。先看现状：
+
+```bash
+ls -l /usr/local/bin/sb; echo "$PATH"
+```
+
 ## 菜单结构
 
 ```text

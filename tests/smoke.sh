@@ -137,6 +137,30 @@ assert_eq 'old-rules' "$(tr -d '\r\n' < "$persistent_file")" 'firewall immediate
 [ ! -d "$fw_txn" ] || fail 'successful firewall rollback left its transaction directory'
 unset -f iptables-restore
 
+# sb 入口：文件写进去了不等于命令可用，PATH 解析不到时必须报错并给出修复办法。
+sb_probe_dir="${test_dir}/sbbin"
+mkdir -p "$sb_probe_dir"
+SCRIPT_PATH="${sb_probe_dir}/${COMMAND_NAME}"
+printf '#!/bin/bash\n' > "$SCRIPT_PATH"
+chmod 755 "$SCRIPT_PATH"
+
+set +e
+sb_path_output=$(PATH="/usr/bin:/bin"; sb_registration_done 2>&1)
+sb_path_rc=$?
+set -e
+assert_eq '1' "$sb_path_rc" 'sb entry outside PATH'
+assert_contains "$sb_path_output" 'PATH' 'sb PATH hint'
+assert_contains "$sb_path_output" "$SCRIPT_PATH" 'sb PATH hint'
+
+sb_ok_rc=0
+( PATH="${sb_probe_dir}:${PATH}"; sb_registration_done >/dev/null 2>&1 ) || sb_ok_rc=$?
+assert_eq '0' "$sb_ok_rc" 'sb entry inside PATH'
+
+# 安装失败要给出可直接粘贴的下一步，而不是一句笼统的警告。
+assert_contains "$(report_sb_install_failure pipe)" 'mktemp' 'sb pipe hint'
+assert_contains "$(report_sb_install_failure pipe)" "$SELF_INSTALL_URL" 'sb pipe hint'
+assert_contains "$(report_sb_install_failure noroot)" 'root' 'sb noroot hint'
+
 # 固定供应链标识与已废弃的危险逻辑。
 assert_eq '2C317FBD5D886B4E89BAE8DA6D9152172A2B2F0C' "$SAGERNET_KEY_FINGERPRINT" 'SagerNet key fingerprint'
 assert_eq 'db558913a68c00c07524b211472b968231874b5f' "$WARP_RULESET_COMMIT" 'WARP ruleset commit'
