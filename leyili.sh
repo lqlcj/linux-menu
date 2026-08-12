@@ -727,7 +727,7 @@ firewall_remove_all_owned_ports(){
 }
 
 detect_firewall_backend(){
-  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -qi "^Status: active"; then
+  if ufw_is_active; then
     printf '%s' "ufw"
     return
   fi
@@ -738,6 +738,19 @@ detect_firewall_backend(){
   fi
 
   printf '%s' "none"
+}
+
+# 优先读取 ufw 自身的启用状态文件，避免每次菜单刷新都启动 ufw 的 Python 前端
+# 并再次遍历整套防火墙规则。旧安装没有状态文件时才回退到 ufw status。
+ufw_is_active(){
+  command -v ufw >/dev/null 2>&1 || return 1
+
+  if [ -r /etc/ufw/ufw.conf ]; then
+    grep -Eqi '^[[:space:]]*ENABLED[[:space:]]*=[[:space:]]*yes([[:space:]]|$)' /etc/ufw/ufw.conf
+    return $?
+  fi
+
+  ufw status 2>/dev/null | grep -qi '^Status: active'
 }
 
 allow_port_in_firewall(){
@@ -1042,27 +1055,107 @@ ip6_get_input_policy(){
   ip6tables -L INPUT -n 2>/dev/null | head -n1 | awk '{gsub(/\)/, "", $4); print $4}'
 }
 
-ip6_list_opened_ports_compact(){
-  ip6tables-save 2>/dev/null | awk '
-    /^-A INPUT/ {
-      proto=""; port=""
-      for (i = 1; i <= NF; i++) {
-        if ($i == "-p")      proto = $(i + 1)
-        if ($i == "--dport") port  = $(i + 1)
-      }
-      if (port == "") next
-      if (proto == "tcp") {
-        if (!(port in tcp_seen)) { tcp_list = tcp_list (tcp_list ? ", " : "") port; tcp_seen[port]=1 }
-      } else if (proto == "udp") {
-        if (!(port in udp_seen)) { udp_list = udp_list (udp_list ? ", " : "") port; udp_seen[port]=1 }
-      }
+# 从 iptables-save / ip6tables-save 快照中读取链的默认策略。
+firewall_policy_from_saved_rules(){
+  local chain="${1:-INPUT}"
+  awk -v chain="$chain" '
+    $0 == "*filter" { in_filter = 1; next }
+    in_filter && $0 == "COMMIT" { exit }
+    in_filter && $1 == (":" chain) { print $2; exit }'
+}
+
+# 列出从 INPUT 可达的全部子链中，最终跳转到 ACCEPT 的显式 TCP/UDP 端口。
+# 这样既能覆盖脚本专属链，也能覆盖 ufw 等管理器创建的子链；DROP/REJECT
+# 端口不会被误报。输入必须是 iptables-save / ip6tables-save 的完整输出。
+# 用法：... | firewall_list_opened_ports_from_saved_rules [lines|compact]
+firewall_list_opened_ports_from_saved_rules(){
+  local style="${1:-lines}"
+
+  awk -v style="$style" '
+    function add_port(proto, port, key) {
+      proto = tolower(proto)
+      if ((proto != "tcp" && proto != "udp") || port == "") return
+      key = proto SUBSEP port
+      if (seen[key]) return
+      seen[key] = 1
+      ordered_proto[++opened_count] = proto
+      ordered_port[opened_count] = port
+      if (proto == "tcp") tcp_port[++tcp_count] = port
+      else                udp_port[++udp_count] = port
+    }
+    $0 == "*filter" {
+      in_filter = 1
+      next
+    }
+    in_filter && $0 == "COMMIT" {
+      in_filter = 0
+      next
+    }
+    in_filter {
+      saved_rule[++rule_count] = $0
+      if ($1 ~ /^:/) known_chain[substr($1, 2)] = 1
     }
     END {
-      out = ""
-      if (tcp_list != "") out = "TCP " tcp_list
-      if (udp_list != "") out = out (out ? "  " : "") "UDP " udp_list
-      print out
+      reachable["INPUT"] = 1
+      changed = 1
+      while (changed) {
+        changed = 0
+        for (rule_no = 1; rule_no <= rule_count; rule_no++) {
+          field_count = split(saved_rule[rule_no], field, /[[:space:]]+/)
+          if (field[1] != "-A" || !(field[2] in reachable)) continue
+          target = ""
+          for (i = 3; i <= field_count; i++) {
+            if ((field[i] == "-j" || field[i] == "-g") && i < field_count) {
+              target = field[i + 1]
+            }
+          }
+          if ((target in known_chain) && !(target in reachable)) {
+            reachable[target] = 1
+            changed = 1
+          }
+        }
+      }
+
+      for (rule_no = 1; rule_no <= rule_count; rule_no++) {
+        field_count = split(saved_rule[rule_no], field, /[[:space:]]+/)
+        if (field[1] != "-A" || !(field[2] in reachable)) continue
+        proto = ""
+        port = ""
+        target = ""
+        for (i = 3; i <= field_count; i++) {
+          if (field[i] == "-p" && i < field_count && field[i - 1] != "!") {
+            proto = field[i + 1]
+          } else if ((field[i] == "--dport" || field[i] == "--dports" || field[i] == "--destination-port") \
+                     && i < field_count && field[i - 1] != "!") {
+            port = field[i + 1]
+          } else if ((field[i] == "-j" || field[i] == "-g") && i < field_count) {
+            target = field[i + 1]
+          }
+        }
+        if (target == "ACCEPT") add_port(proto, port)
+      }
+
+      if (style == "compact") {
+        output = ""
+        if (tcp_count > 0) {
+          output = "TCP "
+          for (i = 1; i <= tcp_count; i++) output = output (i > 1 ? ", " : "") tcp_port[i]
+        }
+        if (udp_count > 0) {
+          output = output (output != "" ? "  " : "") "UDP "
+          for (i = 1; i <= udp_count; i++) output = output (i > 1 ? ", " : "") udp_port[i]
+        }
+        print output
+      } else {
+        for (i = 1; i <= opened_count; i++) {
+          printf "  %s  %s\n", toupper(ordered_proto[i]), ordered_port[i]
+        }
+      }
     }'
+}
+
+ip6_list_opened_ports_compact(){
+  ip6tables-save 2>/dev/null | firewall_list_opened_ports_from_saved_rules compact
 }
 
 ip6_detect_ssh_port(){
@@ -1275,13 +1368,13 @@ ip4_check_current_ssh_v4(){
 ip4_detect_conflicts(){
   local conflicts=""
 
-  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -qi "^Status: active"; then
+  if ufw_is_active; then
     conflicts="${conflicts}ufw "
   fi
   if command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active firewalld >/dev/null 2>&1; then
     conflicts="${conflicts}firewalld "
   fi
-  if [ -d /opt/1panel ] || systemctl list-unit-files 2>/dev/null | grep -q '^1panel'; then
+  if ip4_detect_1panel; then
     conflicts="${conflicts}1Panel "
   fi
 
@@ -1290,8 +1383,16 @@ ip4_detect_conflicts(){
 
 # 单独检测 1Panel 是否在场（用于 IPv4 菜单托管接管）
 ip4_detect_1panel(){
+  local unit_dir unit
+
   [ -d /opt/1panel ] && return 0
-  systemctl list-unit-files 2>/dev/null | grep -q '^1panel' && return 0
+  for unit_dir in /etc/systemd/system /run/systemd/system /lib/systemd/system /usr/lib/systemd/system; do
+    [ -d "$unit_dir" ] || continue
+    for unit in "$unit_dir"/1panel*.service; do
+      [ -e "$unit" ] || [ -L "$unit" ] || continue
+      return 0
+    done
+  done
   return 1
 }
 
@@ -3501,7 +3602,7 @@ show_admin_menu(){
 }
 # ═══ source: 22-firewall-ipv6.sh ═══
 show_ipv6_firewall_menu(){
-  local ssh_port
+  local ssh_port input_policy opened_ports rules refresh_status=1
 
   if ! require_root; then
     return 1
@@ -3512,15 +3613,20 @@ show_ipv6_firewall_menu(){
     return 1
   fi
 
+  # 菜单状态一次读取自同一份规则快照，减少反复执行 ip6tables/ss 的卡顿。
+  ssh_port=$(ip6_detect_ssh_port)
+
   while true; do
-    ssh_port=$(ip6_detect_ssh_port)
+    if [ "$refresh_status" -eq 1 ]; then
+      rules=$(ip6tables-save 2>/dev/null)
+      input_policy=$(printf '%s\n' "$rules" | firewall_policy_from_saved_rules INPUT)
+      opened_ports=$(printf '%s\n' "$rules" | firewall_list_opened_ports_from_saved_rules compact)
+      refresh_status=0
+    fi
 
     render_section_header "IPv6 防火墙管理"
     echo -e "  ${L}│${N}  SSH 端口  ${D}·${N}  ${C}${ssh_port}${N}"
 
-    local input_policy opened_ports
-    input_policy=$(ip6_get_input_policy)
-    opened_ports=$(ip6_list_opened_ports_compact)
     if [ -n "$opened_ports" ]; then
       echo -e "  ${L}│${N}  已开放    ${D}·${N}  ${C}${opened_ports}${N}"
     elif [ "$input_policy" = "ACCEPT" ]; then
@@ -3548,15 +3654,19 @@ show_ipv6_firewall_menu(){
         ;;
       3)
         ip6_close_all_inbound
+        refresh_status=1
         ;;
       4)
         ip6_open_port
+        refresh_status=1
         ;;
       5)
         ip6_close_port
+        refresh_status=1
         ;;
       6)
         ip6_emergency_disable
+        refresh_status=1
         ;;
       0)
         return
@@ -3569,11 +3679,12 @@ show_ipv6_firewall_menu(){
 }
 
 ip6_view_rules(){
-  local input_policy output_policy forward_policy opened
+  local input_policy output_policy forward_policy opened rules
 
-  input_policy=$(ip6_get_input_policy)
-  output_policy=$(ip6tables -L OUTPUT -n 2>/dev/null | head -n1 | awk '{gsub(/\)/, "", $4); print $4}')
-  forward_policy=$(ip6tables -L FORWARD -n 2>/dev/null | head -n1 | awk '{gsub(/\)/, "", $4); print $4}')
+  rules=$(ip6tables-save 2>/dev/null)
+  input_policy=$(printf '%s\n' "$rules" | firewall_policy_from_saved_rules INPUT)
+  output_policy=$(printf '%s\n' "$rules" | firewall_policy_from_saved_rules OUTPUT)
+  forward_policy=$(printf '%s\n' "$rules" | firewall_policy_from_saved_rules FORWARD)
 
   echo ""
   echo -e "  ${B}${C}默认策略${N}"
@@ -3583,15 +3694,7 @@ ip6_view_rules(){
   echo ""
 
   echo -e "  ${B}${C}已开放的入站端口${N}"
-  opened=$(ip6tables-save 2>/dev/null | awk '
-    /^-A INPUT/ {
-      proto=""; port=""
-      for (i = 1; i <= NF; i++) {
-        if ($i == "-p") proto = $(i + 1)
-        if ($i == "--dport") port = $(i + 1)
-      }
-      if (port != "") printf "  %s  %s\n", toupper(proto), port
-    }' | sort -u)
+  opened=$(printf '%s\n' "$rules" | firewall_list_opened_ports_from_saved_rules lines)
 
   if [ -z "$opened" ]; then
     echo -e "  ${D}(无)${N}"
@@ -3602,6 +3705,11 @@ ip6_view_rules(){
 
   echo -e "  ${B}${C}完整 INPUT 规则${N}"
   ip6tables -L INPUT -n -v --line-numbers
+  if firewall_managed_chain_exists 6; then
+    echo ""
+    echo -e "  ${B}${C}${IP6_LEYILI_CHAIN} 规则${N}"
+    ip6tables -L "$IP6_LEYILI_CHAIN" -n -v --line-numbers
+  fi
   pause_screen
 }
 
@@ -3879,8 +3987,16 @@ show_ipv4_firewall_menu(){
     return 1
   fi
 
+  # SSH 端口与防火墙管理器状态在进入菜单时读取一次。操作完成后函数会返回，
+  # 再次进入时自然刷新；无需在每个菜单回合重复启动 ss/ufw/systemctl。
+  ssh_port=$(ip6_detect_ssh_port)
+  conflicts=$(ip4_detect_conflicts)
+  case " $conflicts " in
+    *" 1Panel "*) have_1panel=1 ;;
+  esac
+
   # 一次性提示：检测到 1Panel 时引导用户清理脚本残留 IPv4 规则
-  if ip4_detect_1panel && [ "${IP4_1PANEL_HANDOFF_PROMPTED:-0}" -ne 1 ]; then
+  if [ "$have_1panel" -eq 1 ] && [ "${IP4_1PANEL_HANDOFF_PROMPTED:-0}" -ne 1 ]; then
     echo ""
     echo -e "  ${R}${B}检测到 1Panel 在管理 IPv4 防火墙${N}"
     render_divider
@@ -3898,19 +4014,10 @@ show_ipv4_firewall_menu(){
     else
       echo -e "  ${D}已跳过自动清理（菜单仍会禁用写入操作）${N}"
     fi
-    sleep 1
     IP4_1PANEL_HANDOFF_PROMPTED=1
   fi
 
   while true; do
-    ssh_port=$(ip6_detect_ssh_port)
-    conflicts=$(ip4_detect_conflicts)
-    if ip4_detect_1panel; then
-      have_1panel=1
-    else
-      have_1panel=0
-    fi
-
     render_section_header "IPv4 防火墙管理"
     echo -e "  ${L}│${N}  SSH 端口  ${D}·${N}  ${C}${ssh_port}${N}"
     if [ "$have_1panel" -eq 1 ]; then
@@ -3963,11 +4070,12 @@ show_ipv4_firewall_menu(){
 }
 
 ip4_view_rules(){
-  local input_policy output_policy forward_policy opened
+  local input_policy output_policy forward_policy opened rules
 
-  input_policy=$(ip4_get_input_policy)
-  output_policy=$(iptables -L OUTPUT -n 2>/dev/null | head -n1 | awk '{gsub(/\)/, "", $4); print $4}')
-  forward_policy=$(iptables -L FORWARD -n 2>/dev/null | head -n1 | awk '{gsub(/\)/, "", $4); print $4}')
+  rules=$(iptables-save 2>/dev/null)
+  input_policy=$(printf '%s\n' "$rules" | firewall_policy_from_saved_rules INPUT)
+  output_policy=$(printf '%s\n' "$rules" | firewall_policy_from_saved_rules OUTPUT)
+  forward_policy=$(printf '%s\n' "$rules" | firewall_policy_from_saved_rules FORWARD)
 
   echo ""
   echo -e "  ${B}${C}默认策略${N}"
@@ -3977,15 +4085,7 @@ ip4_view_rules(){
   echo ""
 
   echo -e "  ${B}${C}已开放的入站端口${N}"
-  opened=$(iptables-save 2>/dev/null | awk '
-    /^-A INPUT/ {
-      proto=""; port=""
-      for (i = 1; i <= NF; i++) {
-        if ($i == "-p") proto = $(i + 1)
-        if ($i == "--dport") port = $(i + 1)
-      }
-      if (port != "") printf "  %s  %s\n", toupper(proto), port
-    }' | sort -u)
+  opened=$(printf '%s\n' "$rules" | firewall_list_opened_ports_from_saved_rules lines)
 
   if [ -z "$opened" ]; then
     echo -e "  ${D}(无)${N}"
@@ -3996,6 +4096,11 @@ ip4_view_rules(){
 
   echo -e "  ${B}${C}完整 INPUT 规则${N}"
   iptables -L INPUT -n -v --line-numbers
+  if firewall_managed_chain_exists 4; then
+    echo ""
+    echo -e "  ${B}${C}${IP4_LEYILI_CHAIN} 规则${N}"
+    iptables -L "$IP4_LEYILI_CHAIN" -n -v --line-numbers
+  fi
   pause_screen
 }
 

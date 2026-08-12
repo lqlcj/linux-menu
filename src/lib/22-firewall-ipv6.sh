@@ -1,5 +1,5 @@
 show_ipv6_firewall_menu(){
-  local ssh_port
+  local ssh_port input_policy opened_ports rules refresh_status=1
 
   if ! require_root; then
     return 1
@@ -10,15 +10,20 @@ show_ipv6_firewall_menu(){
     return 1
   fi
 
+  # 菜单状态一次读取自同一份规则快照，减少反复执行 ip6tables/ss 的卡顿。
+  ssh_port=$(ip6_detect_ssh_port)
+
   while true; do
-    ssh_port=$(ip6_detect_ssh_port)
+    if [ "$refresh_status" -eq 1 ]; then
+      rules=$(ip6tables-save 2>/dev/null)
+      input_policy=$(printf '%s\n' "$rules" | firewall_policy_from_saved_rules INPUT)
+      opened_ports=$(printf '%s\n' "$rules" | firewall_list_opened_ports_from_saved_rules compact)
+      refresh_status=0
+    fi
 
     render_section_header "IPv6 防火墙管理"
     echo -e "  ${L}│${N}  SSH 端口  ${D}·${N}  ${C}${ssh_port}${N}"
 
-    local input_policy opened_ports
-    input_policy=$(ip6_get_input_policy)
-    opened_ports=$(ip6_list_opened_ports_compact)
     if [ -n "$opened_ports" ]; then
       echo -e "  ${L}│${N}  已开放    ${D}·${N}  ${C}${opened_ports}${N}"
     elif [ "$input_policy" = "ACCEPT" ]; then
@@ -46,15 +51,19 @@ show_ipv6_firewall_menu(){
         ;;
       3)
         ip6_close_all_inbound
+        refresh_status=1
         ;;
       4)
         ip6_open_port
+        refresh_status=1
         ;;
       5)
         ip6_close_port
+        refresh_status=1
         ;;
       6)
         ip6_emergency_disable
+        refresh_status=1
         ;;
       0)
         return
@@ -67,11 +76,12 @@ show_ipv6_firewall_menu(){
 }
 
 ip6_view_rules(){
-  local input_policy output_policy forward_policy opened
+  local input_policy output_policy forward_policy opened rules
 
-  input_policy=$(ip6_get_input_policy)
-  output_policy=$(ip6tables -L OUTPUT -n 2>/dev/null | head -n1 | awk '{gsub(/\)/, "", $4); print $4}')
-  forward_policy=$(ip6tables -L FORWARD -n 2>/dev/null | head -n1 | awk '{gsub(/\)/, "", $4); print $4}')
+  rules=$(ip6tables-save 2>/dev/null)
+  input_policy=$(printf '%s\n' "$rules" | firewall_policy_from_saved_rules INPUT)
+  output_policy=$(printf '%s\n' "$rules" | firewall_policy_from_saved_rules OUTPUT)
+  forward_policy=$(printf '%s\n' "$rules" | firewall_policy_from_saved_rules FORWARD)
 
   echo ""
   echo -e "  ${B}${C}默认策略${N}"
@@ -81,15 +91,7 @@ ip6_view_rules(){
   echo ""
 
   echo -e "  ${B}${C}已开放的入站端口${N}"
-  opened=$(ip6tables-save 2>/dev/null | awk '
-    /^-A INPUT/ {
-      proto=""; port=""
-      for (i = 1; i <= NF; i++) {
-        if ($i == "-p") proto = $(i + 1)
-        if ($i == "--dport") port = $(i + 1)
-      }
-      if (port != "") printf "  %s  %s\n", toupper(proto), port
-    }' | sort -u)
+  opened=$(printf '%s\n' "$rules" | firewall_list_opened_ports_from_saved_rules lines)
 
   if [ -z "$opened" ]; then
     echo -e "  ${D}(无)${N}"
@@ -100,6 +102,11 @@ ip6_view_rules(){
 
   echo -e "  ${B}${C}完整 INPUT 规则${N}"
   ip6tables -L INPUT -n -v --line-numbers
+  if firewall_managed_chain_exists 6; then
+    echo ""
+    echo -e "  ${B}${C}${IP6_LEYILI_CHAIN} 规则${N}"
+    ip6tables -L "$IP6_LEYILI_CHAIN" -n -v --line-numbers
+  fi
   pause_screen
 }
 
