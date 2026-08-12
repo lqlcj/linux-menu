@@ -10,8 +10,16 @@ show_ipv4_firewall_menu(){
     return 1
   fi
 
+  # SSH 端口与防火墙管理器状态在进入菜单时读取一次。操作完成后函数会返回，
+  # 再次进入时自然刷新；无需在每个菜单回合重复启动 ss/ufw/systemctl。
+  ssh_port=$(ip6_detect_ssh_port)
+  conflicts=$(ip4_detect_conflicts)
+  case " $conflicts " in
+    *" 1Panel "*) have_1panel=1 ;;
+  esac
+
   # 一次性提示：检测到 1Panel 时引导用户清理脚本残留 IPv4 规则
-  if ip4_detect_1panel && [ "${IP4_1PANEL_HANDOFF_PROMPTED:-0}" -ne 1 ]; then
+  if [ "$have_1panel" -eq 1 ] && [ "${IP4_1PANEL_HANDOFF_PROMPTED:-0}" -ne 1 ]; then
     echo ""
     echo -e "  ${R}${B}检测到 1Panel 在管理 IPv4 防火墙${N}"
     render_divider
@@ -29,19 +37,10 @@ show_ipv4_firewall_menu(){
     else
       echo -e "  ${D}已跳过自动清理（菜单仍会禁用写入操作）${N}"
     fi
-    sleep 1
     IP4_1PANEL_HANDOFF_PROMPTED=1
   fi
 
   while true; do
-    ssh_port=$(ip6_detect_ssh_port)
-    conflicts=$(ip4_detect_conflicts)
-    if ip4_detect_1panel; then
-      have_1panel=1
-    else
-      have_1panel=0
-    fi
-
     render_section_header "IPv4 防火墙管理"
     echo -e "  ${L}│${N}  SSH 端口  ${D}·${N}  ${C}${ssh_port}${N}"
     if [ "$have_1panel" -eq 1 ]; then
@@ -94,11 +93,12 @@ show_ipv4_firewall_menu(){
 }
 
 ip4_view_rules(){
-  local input_policy output_policy forward_policy opened
+  local input_policy output_policy forward_policy opened rules
 
-  input_policy=$(ip4_get_input_policy)
-  output_policy=$(iptables -L OUTPUT -n 2>/dev/null | head -n1 | awk '{gsub(/\)/, "", $4); print $4}')
-  forward_policy=$(iptables -L FORWARD -n 2>/dev/null | head -n1 | awk '{gsub(/\)/, "", $4); print $4}')
+  rules=$(iptables-save 2>/dev/null)
+  input_policy=$(printf '%s\n' "$rules" | firewall_policy_from_saved_rules INPUT)
+  output_policy=$(printf '%s\n' "$rules" | firewall_policy_from_saved_rules OUTPUT)
+  forward_policy=$(printf '%s\n' "$rules" | firewall_policy_from_saved_rules FORWARD)
 
   echo ""
   echo -e "  ${B}${C}默认策略${N}"
@@ -108,15 +108,7 @@ ip4_view_rules(){
   echo ""
 
   echo -e "  ${B}${C}已开放的入站端口${N}"
-  opened=$(iptables-save 2>/dev/null | awk '
-    /^-A INPUT/ {
-      proto=""; port=""
-      for (i = 1; i <= NF; i++) {
-        if ($i == "-p") proto = $(i + 1)
-        if ($i == "--dport") port = $(i + 1)
-      }
-      if (port != "") printf "  %s  %s\n", toupper(proto), port
-    }' | sort -u)
+  opened=$(printf '%s\n' "$rules" | firewall_list_opened_ports_from_saved_rules lines)
 
   if [ -z "$opened" ]; then
     echo -e "  ${D}(无)${N}"
@@ -127,6 +119,11 @@ ip4_view_rules(){
 
   echo -e "  ${B}${C}完整 INPUT 规则${N}"
   iptables -L INPUT -n -v --line-numbers
+  if firewall_managed_chain_exists 4; then
+    echo ""
+    echo -e "  ${B}${C}${IP4_LEYILI_CHAIN} 规则${N}"
+    iptables -L "$IP4_LEYILI_CHAIN" -n -v --line-numbers
+  fi
   pause_screen
 }
 

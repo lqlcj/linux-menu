@@ -91,6 +91,42 @@ firewall_output=$(printf '0\n' | show_firewall_menu 2>/dev/null)
 assert_contains "$firewall_output" 'ITEM:1:IPv4 防火墙管理' 'firewall menu'
 assert_contains "$firewall_output" 'ITEM:2:IPv6 防火墙管理' 'firewall menu'
 
+# 开放端口展示必须追踪 INPUT 引用的子链，只列最终 ACCEPT 的 TCP/UDP 规则。
+saved_firewall_rules='*raw
+:PREROUTING ACCEPT [0:0]
+:OUTPUT ACCEPT [0:0]
+COMMIT
+*mangle
+:INPUT ACCEPT [0:0]
+-A INPUT -p tcp --dport 1234 -j ACCEPT
+COMMIT
+*filter
+:INPUT DROP [0:0]
+:FORWARD ACCEPT [0:0]
+:OUTPUT ACCEPT [0:0]
+:LEYILI_INPUT - [0:0]
+:UFW_USER_INPUT - [0:0]
+:UNUSED_INPUT - [0:0]
+-A INPUT -j LEYILI_INPUT
+-A INPUT -j UFW_USER_INPUT
+-A LEYILI_INPUT -p tcp -m tcp --dport 443 -j ACCEPT
+-A LEYILI_INPUT -p udp -m multiport --dports 8443,9443 -j ACCEPT
+-A UFW_USER_INPUT -p tcp --dport 22 -j ACCEPT
+-A UFW_USER_INPUT -p tcp --dport 25 -j DROP
+-A UNUSED_INPUT -p tcp --dport 9999 -j ACCEPT
+COMMIT'
+assert_eq 'DROP' "$(printf '%s\n' "$saved_firewall_rules" | firewall_policy_from_saved_rules INPUT)" 'firewall saved policy'
+opened_ports=$(printf '%s\n' "$saved_firewall_rules" | firewall_list_opened_ports_from_saved_rules lines)
+assert_contains "$opened_ports" 'TCP  443' 'managed-chain opened port'
+assert_contains "$opened_ports" 'UDP  8443,9443' 'multiport opened ports'
+assert_contains "$opened_ports" 'TCP  22' 'ufw-chain opened port'
+assert_not_contains "$opened_ports" '25' 'rejected port filtering'
+assert_not_contains "$opened_ports" '1234' 'non-filter table filtering'
+assert_not_contains "$opened_ports" '9999' 'unreachable-chain filtering'
+assert_eq 'TCP 443, 22  UDP 8443,9443' \
+  "$(printf '%s\n' "$saved_firewall_rules" | firewall_list_opened_ports_from_saved_rules compact)" \
+  'compact opened ports'
+
 node_output=$(printf '0\n' | show_node_manage_menu 2>/dev/null)
 assert_contains "$node_output" 'ITEM:3:查看状态 / 节点配置' 'node menu'
 

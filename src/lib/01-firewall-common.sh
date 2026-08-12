@@ -167,7 +167,7 @@ firewall_remove_all_owned_ports(){
 }
 
 detect_firewall_backend(){
-  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -qi "^Status: active"; then
+  if ufw_is_active; then
     printf '%s' "ufw"
     return
   fi
@@ -178,6 +178,19 @@ detect_firewall_backend(){
   fi
 
   printf '%s' "none"
+}
+
+# 优先读取 ufw 自身的启用状态文件，避免每次菜单刷新都启动 ufw 的 Python 前端
+# 并再次遍历整套防火墙规则。旧安装没有状态文件时才回退到 ufw status。
+ufw_is_active(){
+  command -v ufw >/dev/null 2>&1 || return 1
+
+  if [ -r /etc/ufw/ufw.conf ]; then
+    grep -Eqi '^[[:space:]]*ENABLED[[:space:]]*=[[:space:]]*yes([[:space:]]|$)' /etc/ufw/ufw.conf
+    return $?
+  fi
+
+  ufw status 2>/dev/null | grep -qi '^Status: active'
 }
 
 allow_port_in_firewall(){
@@ -482,27 +495,107 @@ ip6_get_input_policy(){
   ip6tables -L INPUT -n 2>/dev/null | head -n1 | awk '{gsub(/\)/, "", $4); print $4}'
 }
 
-ip6_list_opened_ports_compact(){
-  ip6tables-save 2>/dev/null | awk '
-    /^-A INPUT/ {
-      proto=""; port=""
-      for (i = 1; i <= NF; i++) {
-        if ($i == "-p")      proto = $(i + 1)
-        if ($i == "--dport") port  = $(i + 1)
-      }
-      if (port == "") next
-      if (proto == "tcp") {
-        if (!(port in tcp_seen)) { tcp_list = tcp_list (tcp_list ? ", " : "") port; tcp_seen[port]=1 }
-      } else if (proto == "udp") {
-        if (!(port in udp_seen)) { udp_list = udp_list (udp_list ? ", " : "") port; udp_seen[port]=1 }
-      }
+# 从 iptables-save / ip6tables-save 快照中读取链的默认策略。
+firewall_policy_from_saved_rules(){
+  local chain="${1:-INPUT}"
+  awk -v chain="$chain" '
+    $0 == "*filter" { in_filter = 1; next }
+    in_filter && $0 == "COMMIT" { exit }
+    in_filter && $1 == (":" chain) { print $2; exit }'
+}
+
+# 列出从 INPUT 可达的全部子链中，最终跳转到 ACCEPT 的显式 TCP/UDP 端口。
+# 这样既能覆盖脚本专属链，也能覆盖 ufw 等管理器创建的子链；DROP/REJECT
+# 端口不会被误报。输入必须是 iptables-save / ip6tables-save 的完整输出。
+# 用法：... | firewall_list_opened_ports_from_saved_rules [lines|compact]
+firewall_list_opened_ports_from_saved_rules(){
+  local style="${1:-lines}"
+
+  awk -v style="$style" '
+    function add_port(proto, port, key) {
+      proto = tolower(proto)
+      if ((proto != "tcp" && proto != "udp") || port == "") return
+      key = proto SUBSEP port
+      if (seen[key]) return
+      seen[key] = 1
+      ordered_proto[++opened_count] = proto
+      ordered_port[opened_count] = port
+      if (proto == "tcp") tcp_port[++tcp_count] = port
+      else                udp_port[++udp_count] = port
+    }
+    $0 == "*filter" {
+      in_filter = 1
+      next
+    }
+    in_filter && $0 == "COMMIT" {
+      in_filter = 0
+      next
+    }
+    in_filter {
+      saved_rule[++rule_count] = $0
+      if ($1 ~ /^:/) known_chain[substr($1, 2)] = 1
     }
     END {
-      out = ""
-      if (tcp_list != "") out = "TCP " tcp_list
-      if (udp_list != "") out = out (out ? "  " : "") "UDP " udp_list
-      print out
+      reachable["INPUT"] = 1
+      changed = 1
+      while (changed) {
+        changed = 0
+        for (rule_no = 1; rule_no <= rule_count; rule_no++) {
+          field_count = split(saved_rule[rule_no], field, /[[:space:]]+/)
+          if (field[1] != "-A" || !(field[2] in reachable)) continue
+          target = ""
+          for (i = 3; i <= field_count; i++) {
+            if ((field[i] == "-j" || field[i] == "-g") && i < field_count) {
+              target = field[i + 1]
+            }
+          }
+          if ((target in known_chain) && !(target in reachable)) {
+            reachable[target] = 1
+            changed = 1
+          }
+        }
+      }
+
+      for (rule_no = 1; rule_no <= rule_count; rule_no++) {
+        field_count = split(saved_rule[rule_no], field, /[[:space:]]+/)
+        if (field[1] != "-A" || !(field[2] in reachable)) continue
+        proto = ""
+        port = ""
+        target = ""
+        for (i = 3; i <= field_count; i++) {
+          if (field[i] == "-p" && i < field_count && field[i - 1] != "!") {
+            proto = field[i + 1]
+          } else if ((field[i] == "--dport" || field[i] == "--dports" || field[i] == "--destination-port") \
+                     && i < field_count && field[i - 1] != "!") {
+            port = field[i + 1]
+          } else if ((field[i] == "-j" || field[i] == "-g") && i < field_count) {
+            target = field[i + 1]
+          }
+        }
+        if (target == "ACCEPT") add_port(proto, port)
+      }
+
+      if (style == "compact") {
+        output = ""
+        if (tcp_count > 0) {
+          output = "TCP "
+          for (i = 1; i <= tcp_count; i++) output = output (i > 1 ? ", " : "") tcp_port[i]
+        }
+        if (udp_count > 0) {
+          output = output (output != "" ? "  " : "") "UDP "
+          for (i = 1; i <= udp_count; i++) output = output (i > 1 ? ", " : "") udp_port[i]
+        }
+        print output
+      } else {
+        for (i = 1; i <= opened_count; i++) {
+          printf "  %s  %s\n", toupper(ordered_proto[i]), ordered_port[i]
+        }
+      }
     }'
+}
+
+ip6_list_opened_ports_compact(){
+  ip6tables-save 2>/dev/null | firewall_list_opened_ports_from_saved_rules compact
 }
 
 ip6_detect_ssh_port(){
@@ -715,13 +808,13 @@ ip4_check_current_ssh_v4(){
 ip4_detect_conflicts(){
   local conflicts=""
 
-  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -qi "^Status: active"; then
+  if ufw_is_active; then
     conflicts="${conflicts}ufw "
   fi
   if command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active firewalld >/dev/null 2>&1; then
     conflicts="${conflicts}firewalld "
   fi
-  if [ -d /opt/1panel ] || systemctl list-unit-files 2>/dev/null | grep -q '^1panel'; then
+  if ip4_detect_1panel; then
     conflicts="${conflicts}1Panel "
   fi
 
@@ -730,8 +823,16 @@ ip4_detect_conflicts(){
 
 # 单独检测 1Panel 是否在场（用于 IPv4 菜单托管接管）
 ip4_detect_1panel(){
+  local unit_dir unit
+
   [ -d /opt/1panel ] && return 0
-  systemctl list-unit-files 2>/dev/null | grep -q '^1panel' && return 0
+  for unit_dir in /etc/systemd/system /run/systemd/system /lib/systemd/system /usr/lib/systemd/system; do
+    [ -d "$unit_dir" ] || continue
+    for unit in "$unit_dir"/1panel*.service; do
+      [ -e "$unit" ] || [ -L "$unit" ] || continue
+      return 0
+    done
+  done
   return 1
 }
 
