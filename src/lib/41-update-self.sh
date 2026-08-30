@@ -111,16 +111,13 @@ update_self_script(){
   fi
 
   size=$(wc -c < "$tmp_file" 2>/dev/null | tr -d ' ')
-  if [ -z "$size" ] || [ "$size" -lt 50000 ] || [ "$size" -gt 2097152 ]; then
+  if ! leyili_payload_size_ok "$tmp_file"; then
     echo -e "${R}新脚本大小异常（${size:-未知} 字节），已放弃更新${N}"
     pause_screen
     return 1
   fi
 
-  if ! head -n 1 "$tmp_file" | grep -Eq '^#!/(usr/)?bin/(env )?bash' \
-     || ! grep -Fq 'APP_NAME="Leyili"' "$tmp_file" \
-     || ! grep -Fq 'show_menu' "$tmp_file" \
-     || ! grep -Fq 'acquire_global_lock' "$tmp_file"; then
+  if ! leyili_payload_has_markers "$tmp_file"; then
     echo -e "${R}下载内容缺少 Leyili 脚本结构标记，已放弃更新${N}"
     pause_screen
     return 1
