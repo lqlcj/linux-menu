@@ -197,6 +197,59 @@ assert_contains "$(report_sb_install_failure pipe)" 'mktemp' 'sb pipe hint'
 assert_contains "$(report_sb_install_failure pipe)" "$SELF_INSTALL_URL" 'sb pipe hint'
 assert_contains "$(report_sb_install_failure noroot)" 'root' 'sb noroot hint'
 
+# 脚本正文校验：自更新和入口安装共用同一套判据，真脚本必须过，垃圾内容必须挡。
+leyili_payload_has_markers "$SCRIPT_UNDER_TEST" || fail 'real script failed marker validation'
+leyili_payload_size_ok "$SCRIPT_UNDER_TEST" || fail 'real script failed size validation'
+
+payload_probe="${test_dir}/payload"
+printf '<html>404: Not Found</html>\n' > "$payload_probe"
+! leyili_payload_has_markers "$payload_probe" || fail 'error page passed marker validation'
+! leyili_payload_size_ok "$payload_probe" || fail 'tiny file passed size validation'
+
+# 只有 shebang 和结构标记、但被截断的内容也必须挡下（大小下限）。
+{ printf '#!/bin/bash\n'; printf 'APP_NAME="Leyili"\nshow_menu\nacquire_global_lock\n'; } > "$payload_probe"
+leyili_payload_has_markers "$payload_probe" || fail 'marker check rejected a valid marker set'
+! leyili_payload_size_ok "$payload_probe" || fail 'truncated payload passed size validation'
+
+# 非 HTTPS 来源必须直接拒绝，不允许发起任何请求。
+curl(){ fail 'fetch_leyili_payload issued a request for a non-HTTPS URL'; }
+wget(){ fail 'fetch_leyili_payload issued a request for a non-HTTPS URL'; }
+fetch_rc=0
+( SELF_INSTALL_URL="http://example.com/leyili.sh"; fetch_leyili_payload "${test_dir}/never" ) || fetch_rc=$?
+assert_eq '1' "$fetch_rc" 'non-HTTPS self-install URL'
+unset -f curl wget
+
+# 管道运行（无本地文件可复制）时必须自动装好入口，不再要求用户复制命令。
+# 校验后的正文来自 fetch_leyili_payload，这里桩掉网络只验证安装链路。
+sb_pipe_dir="${test_dir}/sbpipe"
+mkdir -p "$sb_pipe_dir"
+SCRIPT_PATH="${sb_pipe_dir}/${COMMAND_NAME}"
+detect_self_source_path(){ printf '%s' ''; }
+fetch_leyili_payload(){ printf '#!/bin/bash\n# fetched\n' > "$1"; }
+sb_pipe_rc=0
+( PATH="${sb_pipe_dir}:${PATH}"; register_sb_command >/dev/null 2>&1 ) || sb_pipe_rc=$?
+assert_eq '0' "$sb_pipe_rc" 'pipe-mode auto install'
+[ -x "$SCRIPT_PATH" ] || fail 'pipe-mode auto install did not produce an executable entry'
+assert_contains "$(cat "$SCRIPT_PATH")" '# fetched' 'pipe-mode entry content'
+
+# 获取失败时不能假装成功，且要报出管道 / 获取失败的原因。
+rm -f -- "$SCRIPT_PATH"
+fetch_leyili_payload(){ return 1; }
+sb_fail_rc=0
+sb_fail_output=$( ( PATH="${sb_pipe_dir}:${PATH}"; register_sb_command ) 2>&1 ) || sb_fail_rc=$?
+assert_eq '1' "$sb_fail_rc" 'pipe-mode fetch failure'
+assert_contains "$sb_fail_output" "$SELF_INSTALL_URL" 'pipe-mode fetch failure hint'
+[ ! -e "$SCRIPT_PATH" ] || fail 'failed fetch still wrote an entry'
+
+# 入口是符号链接时一律拒绝覆盖，管道路径也不例外。
+ln -s /dev/null "$SCRIPT_PATH"
+fetch_leyili_payload(){ fail 'symlink entry should be refused before fetching'; }
+sb_link_rc=0
+( register_sb_command >/dev/null 2>&1 ) || sb_link_rc=$?
+assert_eq '1' "$sb_link_rc" 'symlink entry refused'
+rm -f -- "$SCRIPT_PATH"
+unset -f detect_self_source_path fetch_leyili_payload
+
 # 固定供应链标识与已废弃的危险逻辑。
 assert_eq '2C317FBD5D886B4E89BAE8DA6D9152172A2B2F0C' "$SAGERNET_KEY_FINGERPRINT" 'SagerNet key fingerprint'
 assert_eq 'db558913a68c00c07524b211472b968231874b5f' "$WARP_RULESET_COMMIT" 'WARP ruleset commit'
