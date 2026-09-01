@@ -9861,7 +9861,7 @@ install_hy2_node(){
       enabled: true,
       server_name: $sni,
       alpn: ["h3"],
-      acme: {domain: [$sni], email: $email}
+      certificate_provider: {type: "acme", domain: [$sni], email: $email}
     }'); then
       node_transaction_rollback "$txn"
       pause_screen
@@ -10364,7 +10364,12 @@ modify_hy2_params(){
   local jq_filter='(.inbounds[] | select(.tag == "hy2-in"))
     |= ( .listen_port = ($port | tonumber)
        | .tls.server_name = $sni
-       | (if $sni != "" and (.tls.acme | type) == "object" then .tls.acme.domain = [$sni] else . end)
+       | if (.tls.acme | type) == "object"
+         then .tls.certificate_provider = ({type: "acme"} + .tls.acme) | del(.tls.acme)
+         else . end
+       | if $sni != "" and (.tls.certificate_provider | type) == "object"
+         then .tls.certificate_provider.domain = [$sni]
+         else . end
        | (if $pw != "" then .users[0].password = $pw else . end)
        | (if $opw != "" and (.obfs | type) == "object" then .obfs.password = $opw else . end)
        | .users[0] |= del(.up_mbps, .down_mbps)
@@ -11042,7 +11047,7 @@ install_tuic_node(){
       enabled: true,
       server_name: $sni,
       alpn: ["h3"],
-      acme: {domain: [$sni], email: $email}
+      certificate_provider: {type: "acme", domain: [$sni], email: $email}
     }'); then
       node_transaction_rollback "$txn"
       pause_screen
@@ -12129,7 +12134,12 @@ modify_tuic_params(){
            | .users[0].password = $pw
            | .congestion_control = $cc
            | .tls.server_name = $sni
-           | (if .tls.acme then .tls.acme.domain = [$sni] else . end))'
+           | if (.tls.acme | type) == "object"
+             then .tls.certificate_provider = ({type: "acme"} + .tls.acme) | del(.tls.acme)
+             else . end
+           | if (.tls.certificate_provider | type) == "object"
+             then .tls.certificate_provider.domain = [$sni]
+             else . end))'
   if ! jq --arg port "$new_port" \
           --arg sni "$new_sni" \
           --arg uuid "$new_uuid" \

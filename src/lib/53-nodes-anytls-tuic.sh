@@ -477,7 +477,7 @@ install_tuic_node(){
       enabled: true,
       server_name: $sni,
       alpn: ["h3"],
-      acme: {domain: [$sni], email: $email}
+      certificate_provider: {type: "acme", domain: [$sni], email: $email}
     }'); then
       node_transaction_rollback "$txn"
       pause_screen

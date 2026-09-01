@@ -575,7 +575,12 @@ modify_tuic_params(){
            | .users[0].password = $pw
            | .congestion_control = $cc
            | .tls.server_name = $sni
-           | (if .tls.acme then .tls.acme.domain = [$sni] else . end))'
+           | if (.tls.acme | type) == "object"
+             then .tls.certificate_provider = ({type: "acme"} + .tls.acme) | del(.tls.acme)
+             else . end
+           | if (.tls.certificate_provider | type) == "object"
+             then .tls.certificate_provider.domain = [$sni]
+             else . end))'
   if ! jq --arg port "$new_port" \
           --arg sni "$new_sni" \
           --arg uuid "$new_uuid" \
