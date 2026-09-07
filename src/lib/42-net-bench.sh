@@ -199,7 +199,7 @@ _nb_sysinfo(){
   _nb_report "【给 AI 的说明】"
   _nb_report "本报告由 ${APP_NAME} 脚本在 VPS 上自动实测生成，方向为「VPS → 家庭宽带公网 IP」。"
   _nb_report "请基于以下数据分析链路质量（延迟/抖动/丢包/回程线路/MTU/带宽），并给出"
-  _nb_report "Linux 内核 sysctl 与代理协议（sing-box: Reality/Hysteria2/TUIC 等）的调参建议。"
+  _nb_report "Linux 内核 sysctl 与 TCP/UDP 网络参数的调优建议。"
   _nb_report ""
   _nb_report "── VPS 基本信息 ──"
   _nb_report "测试时间       : $(date '+%Y-%m-%d %H:%M:%S %Z')"
@@ -301,7 +301,7 @@ _nb_mtu_probe(){
     echo -e "  路径 MTU ≈ ${C}${mtu}${N}（最大不分片载荷 ${size}B）"
     _nb_report "路径 MTU ≈ ${mtu}（最大不分片 ICMP 载荷 ${size}B + ${overhead}B 头）"
     if [ "$mtu" -lt 1500 ]; then
-      _nb_report "提示: 路径 MTU < 1500，WireGuard/Hysteria2 等隧道协议的 MTU 建议 ≤ $((mtu - 80))"
+      _nb_report "提示: 路径 MTU < 1500，应用发送的数据包应留出封装开销，避免分片。"
     fi
   else
     echo -e "  ${Y}未能确定路径 MTU（各档大包均无响应）${N}"
@@ -490,8 +490,8 @@ _nb_iperf_server_teardown(){
   wait "$pid" 2>/dev/null || true
   echo ""
   echo -e "${Y}==> 停止 iperf3 服务端并撤销临时防火墙放行...${N}"
-  node_revoke_firewall_for_mode "$port" tcp dualstack
-  node_revoke_firewall_for_mode "$port" udp dualstack
+  firewall_revoke_port_for_mode "$port" tcp dualstack
+  firewall_revoke_port_for_mode "$port" udp dualstack
 }
 
 _nb_iperf_server_mode(){
@@ -524,8 +524,8 @@ _nb_iperf_server_mode(){
 
   echo ""
   echo -e "${Y}==> 临时放行防火墙并启动 iperf3 服务端...${N}"
-  node_apply_firewall_for_mode "$port" tcp dualstack
-  node_apply_firewall_for_mode "$port" udp dualstack
+  firewall_apply_port_for_mode "$port" tcp dualstack
+  firewall_apply_port_for_mode "$port" udp dualstack
 
   log=$(mktemp)
   # --forceflush: 结果实时落盘；极老版本不认此参数 → 秒退，去掉重试一次
@@ -541,8 +541,8 @@ _nb_iperf_server_mode(){
     echo -e "  ${R}iperf3 服务端启动失败:${N}"
     sed 's/^/    /' "$log"
     rm -f "$log"
-    node_revoke_firewall_for_mode "$port" tcp dualstack
-    node_revoke_firewall_for_mode "$port" udp dualstack
+    firewall_revoke_port_for_mode "$port" tcp dualstack
+    firewall_revoke_port_for_mode "$port" udp dualstack
     return 1
   fi
 

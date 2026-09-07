@@ -75,7 +75,7 @@ detect_primary_ipv4(){
   fi
 
   # curl 也失败时，宁可返回先前探到的内网 IP 也别返回空——
-  # 至少能让用户在节点信息里看到检测结果，避免上层卡在「未检测到可用的 IPv4 地址」
+  # 保留本机地址，便于服务器状态页展示网络信息
   if [ -z "$detected" ]; then
     detected="$local_fallback"
   fi
@@ -124,18 +124,4 @@ detect_primary_ipv6(){
   fi
 
   printf '%s' "$detected"
-}
-
-describe_install_mode(){
-  case "$1" in
-    ipv6-in-ipv4-out)
-      printf '%s' '仅 IPv6 入站'
-      ;;
-    dualstack)
-      printf '%s' '双栈入站'
-      ;;
-    *)
-      printf '%s' '仅 IPv4 入站'
-      ;;
-  esac
 }

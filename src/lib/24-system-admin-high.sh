@@ -181,7 +181,7 @@ configure_ssh_port(){
   fi
 
   echo ""
-  if ! node_apply_firewall_for_mode "$ssh_port" tcp dualstack; then
+  if ! firewall_apply_port_for_mode "$ssh_port" tcp dualstack; then
     echo -e "${R}新 SSH 端口防火墙放行失败，已中止修改${N}"
     pause_screen
     return 1

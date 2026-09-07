@@ -1,6 +1,6 @@
 # Leyili Linux Menu
 
-面向 Debian / Ubuntu 系 VPS 的自用运维菜单，集中管理 sing-box 节点、网络设置、防火墙、WARP、fail2ban、系统调优和卸载清理。
+面向 Debian / Ubuntu 系 VPS 的自用运维菜单，集中管理用户与 SSH、网络设置、防火墙、fail2ban、系统调优和卸载清理。
 
 ## 安装
 
@@ -61,41 +61,36 @@ ls -l /usr/local/bin/sb; echo "$PATH"
 ```text
 1  管理员设置
 2  系统基础设置
-3  创建节点 / 节点管理
-   └─ 查看状态 / 节点配置
-4  网络管理
+3  网络管理
    ├─ fail2ban（SSH 多端口防爆破）
-   ├─ Reality 域名检测工具
-   ├─ WARP 谷歌解锁分流
    ├─ 服务器状态
    └─ 本地链路测评
-5  防火墙管理
+4  防火墙管理
    ├─ IPv4 防火墙管理
    └─ IPv6 防火墙管理
-6  卸载脚本
-7  更新管理
+5  卸载脚本
+6  更新管理
+   ├─ 更新脚本
+   └─ 清理配置备份
 0  退出
 ```
-
-首页卡片保持精简，不再展示未安装的 Hysteria2 / AnyTLS / TUIC，也不展示 TCP、QUIC、initcwnd 调优状态行。
 
 fail2ban 可输入逗号、空格或中文分隔符分开的 SSH 端口，自动去重，最多保护 15 个端口；它不会修改 SSH 监听端口，也不会自动开放防火墙。
 
 ## 安全与回滚边界
 
 - 全局使用私有权限、进程互斥锁、临时文件和同目录原子替换。
-- Reality、Hysteria2、AnyTLS、TUIC、SS-2022、WARP、SSH、fail2ban 和关键配置修改均先创建快照，校验或重启失败时立即恢复。
+- SSH、fail2ban 和关键配置修改均先创建快照，校验或重启失败时立即恢复。
 - 防火墙只采用“操作前快照、失败立即恢复”，不会创建定时器、后台任务或延迟自动回滚。
 - iptables/ip6tables 规则写入脚本专属链 `LEYILI_INPUT`、`LEYILI6_INPUT`；ufw/firewalld 只撤销脚本登记为自己新增的端口。
 - 回滚本身若失败，会明确报警并保留权限为 700 的私有事务目录，不会继续报告成功。
-- WARP 规则集固定到明确提交，SagerNet 仓库公钥校验固定指纹；账号替换先验证临时文件再原子覆盖。
 - 自更新先校验 HTTPS、文件结构、大小、Bash 语法和可选 SHA-256，再原子替换脚本入口。
 
 ## 完整卸载
 
-完整卸载只清理脚本能够确认所有权的内容：固定节点 tag、节点信息和证书、WARP、端口跳跃、脚本专属防火墙链、脚本登记的 ufw/firewalld 端口、sing-box 软件包及明确的旧版遗留组件。
+完整卸载只清理脚本能够确认所有权的内容：脚本专属防火墙链、脚本登记的 ufw/firewalld 端口、链路测评数据和专用 nexttrace，以及脚本入口。防火墙清理失败会立即尝试回滚，前序步骤失败时保留脚本入口，便于重试。
 
-它不会 `purge` sing-box，也不会删除整个 `/etc/sing-box`。用户自定义 inbound、DNS、路由、outbound 和其它文件会保留；预先存在的 SagerNet sources/key 能恢复则恢复，所有权不明确时优先保留。前序步骤失败时脚本入口也会保留，便于重新执行卸载。
+脚本已移除代理节点搭建与管理功能。更新脚本不会自动卸载旧版部署的服务或删除其配置；需要清理旧部署时，请另行管理。
 
 TCP/QUIC 调优、initcwnd、SSH、用户账户、sudoers、自动更新设置、1Panel 和脚本创建的 SWAP 默认不属于完整卸载范围，可在各自菜单单独管理。
 
@@ -114,4 +109,4 @@ CI 会执行：
 - 重新构建后校验 `leyili.sh` 与源码完全一致；
 - `git diff --check`、ShellCheck error 级检查和菜单/事务冒烟测试。
 
-Windows/Git Bash 只能完成构建和静态测试。发布前仍应在干净的 Debian/Ubuntu 测试机回归 systemd、sshd、fail2ban、iptables/ip6tables、ufw/firewalld、sing-box、WARP 和真实网络连通性。
+Windows/Git Bash 只能完成构建和静态测试。发布前仍应在干净的 Debian/Ubuntu 测试机回归 systemd、sshd、fail2ban、iptables/ip6tables、ufw/firewalld 和真实网络连通性。

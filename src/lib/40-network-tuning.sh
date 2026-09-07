@@ -212,8 +212,7 @@ ${qdisc_algo:+net.core.default_qdisc = ${qdisc_algo}}
 net.ipv4.tcp_congestion_control = ${cc_algo}
 # TFO = 1 仅客户端方向；服务端在国内出口常被运营商干扰 cookie，
 # 首包失败比首包提前 1RTT 更常见，因此服务端关闭
-# 注意：本机 sing-box 入站也不要开 tcp_fast_open（服务端 accept 方向需 bit2，
-# 即此值需为 3 才生效）；两侧保持一致，避免节点开了 TFO 但内核未支撑的空配
+# 服务端 accept 方向需 bit2；应用启用 TFO 时需同时检查内核设置。
 net.ipv4.tcp_fastopen = 1
 
 # --- 缓冲区 (按地区 BDP 与内存档计算) ---
@@ -230,8 +229,7 @@ net.ipv4.tcp_wmem = 16384 524288 ${buffer_max}
 net.ipv4.tcp_adv_win_scale = 2
 
 # --- 长连接 / 慢启动 / MTU ---
-# 16K：NaiveProxy 实测值，TCP-in-TLS 隧道防 HoL 阻塞 / 顿挫感的关键
-# (Cloudflare 早期推荐 128K 是面向 web server 吞吐场景，不适用代理转发)
+# 限制尚未发送的数据量，减少发送队列积压。
 net.ipv4.tcp_notsent_lowat = ${notsent_lowat}
 net.ipv4.tcp_slow_start_after_idle = 0
 net.ipv4.tcp_window_scaling = 1
@@ -257,7 +255,7 @@ net.ipv4.tcp_keepalive_time = 120
 net.ipv4.tcp_keepalive_intvl = 10
 net.ipv4.tcp_keepalive_probes = 5
 
-# --- 代理服务器专用 ---
+# --- 连接管理 ---
 # 不缓存上次连接的 RTT/cwnd 指纹 (面对全球客户端必加)
 net.ipv4.tcp_no_metrics_save = 1
 # ECN: 2 = 被动接受不主动发起 (RFC 8311 推荐，避开国内运营商对 ECN 标记的误判)
@@ -441,11 +439,9 @@ apply_quic_tuning(){
 # Managed by Leyili
 # leyili-quic-profile: region=${region} mem_tier=${mem_tier}
 # 由 leyili.sh QUIC/UDP 协议优化生成 (${region_label} / ${mem_label})
-# 用户偏好：Reality TCP 主用、UDP 仅备用 → 本文件不写 net.core.* 通用键，
-# 避免字典序在后覆盖 TCP 调优。QUIC/UDP socket 缓冲沿用 99-proxy-optimized
-# 设置的 net.core.rmem_max / wmem_max；如出现 sing-box "failed to sufficiently
-# increase receive buffer size" 警告，再考虑单独提升 TCP 那份的 rmem_max。
-# 不跑 TUIC / Hysteria2 时无需此文件，可在菜单 "移除 QUIC 调优" 删除
+# 本文件不写 net.core.* 通用键，避免覆盖 TCP 调优。
+# QUIC/UDP socket 缓冲沿用 TCP 调优中的 net.core.rmem_max / wmem_max。
+# 无需 UDP 调优时可在菜单 "移除 QUIC 调优" 删除。
 
 # --- conntrack（按内存档限制，避免小内存机器被固定 1M 条目拖垮）---
 # 容器/LXC 内可能写不进去，sysctl -p 失败时由上层提示
@@ -568,8 +564,6 @@ apply_quic_optimization(){
   echo -e "  说明        : ${C}仅写 conntrack，net.core.* 沿用 TCP 调优${N}"
   echo -e "  配置文件    : ${C}$QUIC_TUNING_PATH${N}"
   echo ""
-  echo -e "  ${D}提示：调优生效后建议重启 sing-box 让 TUIC/HY2 重新分配缓冲区${N}"
-  echo -e "  ${D}      systemctl restart sing-box${N}"
   pause_screen
 }
 
@@ -1287,7 +1281,7 @@ show_quic_optimization_picker(){
 
   while true; do
     render_section_header "QUIC/UDP 协议优化"
-    echo -e "  ${D}面向 TUIC / Hysteria2，调整 UDP 缓冲区与 conntrack${N}"
+    echo -e "  ${D}调整 UDP 连接跟踪参数，缓冲区沿用 TCP 调优设置${N}"
     echo ""
     render_menu_item 1 "香港   ${D}(亚洲低延迟)${N}"
     render_menu_item 2 "日本   ${D}(亚洲低延迟)${N}"
@@ -1740,7 +1734,7 @@ show_swap_picker(){
   echo -e "  ${B}选择内存档位（脚本按档位推荐 SWAP 大小）：${N}"
   render_menu_item 1 "≤ 512 MB    ${D}→ SWAP 1 GB    (小机器跑 apt/编译必需)${N}"
   render_menu_item 2 "1 GB        ${D}→ SWAP 2 GB    (主流入门套餐推荐)${N}"
-  render_menu_item 3 "≥ 2 GB      ${D}→ SWAP 2 GB    (跑代理/转发足够)${N}"
+  render_menu_item 3 "≥ 2 GB      ${D}→ SWAP 2 GB${N}"
   render_menu_item 4 "自定义大小（MB）"
   render_menu_item 0 "返回"
   render_divider

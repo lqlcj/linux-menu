@@ -200,8 +200,7 @@ show_server_status(){
   echo ""
 
   echo -e "  ${B}${C}›  服务${N}"
-  printf "  ${L}●${N} %-10s : %s\n" "sing-box" "$(status_service_state sing-box sing-box)"
+  printf "  ${L}●${N} %-10s : %s\n" "fail2ban" "$(status_service_state fail2ban fail2ban-client)"
 
   pause_screen
 }
-

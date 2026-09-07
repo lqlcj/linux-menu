@@ -1,82 +1,3 @@
-show_status_menu(){
-  if ! require_singbox_installed; then
-    return
-  fi
-
-  while true; do
-    render_section_header "查看状态"
-    render_menu_item 1 "查看运行状态"
-    render_menu_item 2 "修改节点参数"
-    render_menu_item 3 "实时日志"
-    render_menu_item 4 "重启服务"
-    render_menu_item 5 "停止服务"
-    render_menu_item 6 "启动服务"
-    render_menu_item 7 "查看客户端链接 / 二维码"
-    render_menu_item 8 "查看配置"
-    render_menu_item 9 "编辑配置"
-    render_menu_item 10 "清理配置备份"
-    render_menu_item 0 "返回上级"
-    render_divider
-    read -p "  请输入序号: " choice
-
-    case $choice in
-      1)
-        systemctl status sing-box --no-pager || true
-        pause_screen
-        ;;
-      2)
-        modify_node_params
-        ;;
-      3)
-        echo -e "${Y}按 Ctrl+C 退出日志${N}"
-        journalctl -u sing-box -f || true
-        ;;
-      4)
-        if systemctl restart sing-box; then
-          echo -e "${G}服务已重启${N}"
-        else
-          echo -e "${R}重启失败，请检查上方输出${N}"
-        fi
-        sleep 1
-        ;;
-      5)
-        if systemctl stop sing-box; then
-          echo -e "${Y}服务已停止${N}"
-        else
-          echo -e "${R}停止失败，请检查上方输出${N}"
-        fi
-        sleep 1
-        ;;
-      6)
-        if systemctl start sing-box; then
-          echo -e "${G}服务已启动${N}"
-        else
-          echo -e "${R}启动失败，请检查上方输出${N}"
-        fi
-        sleep 1
-        ;;
-      7)
-        show_client_link
-        ;;
-      8)
-        view_singbox_config
-        ;;
-      9)
-        edit_singbox_config
-        ;;
-      10)
-        cleanup_config_backups
-        ;;
-      0)
-        return
-        ;;
-      *)
-        notify_invalid_choice
-        ;;
-    esac
-  done
-}
-
 show_system_menu(){
   while true; do
     render_section_header "系统基础设置"
@@ -127,10 +48,8 @@ show_network_menu(){
   while true; do
     render_section_header "网络管理"
     render_menu_item 1 "安装 / 配置 fail2ban (SSH 多端口防爆破)"
-    render_menu_item 2 "Reality 域名检测工具"
-    render_menu_item 3 "WARP 谷歌解锁分流"
-    render_menu_item 4 "服务器状态"
-    render_menu_item 5 "本地链路测评"
+    render_menu_item 2 "服务器状态"
+    render_menu_item 3 "本地链路测评"
     render_menu_item 0 "返回上级"
     render_divider
     read -p "  请输入序号: " choice
@@ -140,15 +59,9 @@ show_network_menu(){
         setup_fail2ban
         ;;
       2)
-        check_reality_dest_domain
-        ;;
-      3)
-        show_warp_menu
-        ;;
-      4)
         show_server_status
         ;;
-      5)
+      3)
         show_netbench_menu
         ;;
       0)
@@ -199,6 +112,24 @@ show_admin_menu(){
       *)
         notify_invalid_choice
         ;;
+    esac
+  done
+}
+
+show_update_menu(){
+  local choice
+  while true; do
+    render_section_header "更新管理"
+    render_menu_item 1 "更新脚本"
+    render_menu_item 2 "清理配置备份"
+    render_menu_item 0 "返回上级"
+    render_divider
+    read -p "  请输入序号: " choice
+    case $choice in
+      1) update_self_script ;;
+      2) cleanup_config_backups ;;
+      0) return ;;
+      *) notify_invalid_choice ;;
     esac
   done
 }

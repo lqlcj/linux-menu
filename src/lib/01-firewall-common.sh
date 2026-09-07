@@ -360,12 +360,12 @@ firewall_remove_managed_chain(){
   fi
 }
 
-# 节点入站统一开放端口：
+# 服务入站统一开放端口：
 # - ufw / firewalld 走 allow_port_in_firewall（双栈，一条命令同时开 v4+v6）
 # - 若 v4 / v6 INPUT 默认策略 = DROP（脚本本身的 iptables / ip6tables 防火墙菜单初始化过），
 #   主动追加该协议主端口的 ACCEPT 规则并持久化
-# 用法：node_apply_firewall_for_mode <port> <proto:tcp|udp> <mode:ipv4|dualstack|ipv6-in-ipv4-out>
-node_apply_firewall_for_mode(){
+# 用法：firewall_apply_port_for_mode <port> <proto:tcp|udp> <mode:ipv4|dualstack|ipv6>
+firewall_apply_port_for_mode(){
   local port="$1"
   local proto="${2:-tcp}"
   local mode="${3:-ipv4}"
@@ -374,7 +374,7 @@ node_apply_firewall_for_mode(){
   case "$mode" in
     ipv4)              need_v4=1 ;;
     dualstack)         need_v4=1; need_v6=1 ;;
-    ipv6-in-ipv4-out)  need_v6=1 ;;
+    ipv6)  need_v6=1 ;;
     *)                 need_v4=1 ;;
   esac
 
@@ -417,9 +417,9 @@ node_apply_firewall_for_mode(){
   return 0
 }
 
-# 节点入站统一撤销端口（uninstall / 改端口时配套使用）
-# 用法：node_revoke_firewall_for_mode <port> <proto> <mode>
-node_revoke_firewall_for_mode(){
+# 服务入站统一撤销端口（uninstall / 改端口时配套使用）
+# 用法：firewall_revoke_port_for_mode <port> <proto> <mode>
+firewall_revoke_port_for_mode(){
   local port="$1"
   local proto="${2:-tcp}"
   local mode="${3:-ipv4}"
@@ -428,7 +428,7 @@ node_revoke_firewall_for_mode(){
   case "$mode" in
     ipv4)              need_v4=1 ;;
     dualstack)         need_v4=1; need_v6=1 ;;
-    ipv6-in-ipv4-out)  need_v6=1 ;;
+    ipv6)  need_v6=1 ;;
     *)                 need_v4=1 ;;
   esac
 
@@ -461,34 +461,6 @@ node_revoke_firewall_for_mode(){
     fi
   fi
   return 0
-}
-
-# 给用户打印"请自行放行端口"的提示，覆盖 IPv4(ufw/firewalld)、IPv6(本脚本菜单)、云安全组
-print_firewall_hint(){
-  local port="$1"
-  local proto="${2:-tcp}"
-  local label="${3:-}"
-  local backend
-  backend=$(detect_firewall_backend)
-
-  echo ""
-  echo -e "  ${Y}${B}请自行放行入站端口：${C}${port}/${proto}${N}${label:+  ${D}(${label})${N}}"
-  case "$backend" in
-    ufw)
-      echo -e "    ${L}·${N} ufw    : ${C}ufw allow ${port}/${proto}${N}"
-      ;;
-    firewalld)
-      echo -e "    ${L}·${N} firewalld : ${C}firewall-cmd --permanent --add-port=${port}/${proto} && firewall-cmd --reload${N}"
-      ;;
-    *)
-      echo -e "    ${L}·${N} 本机未启用 ufw/firewalld（如启用过 IPv6 防火墙菜单，请走下条）"
-      ;;
-  esac
-  if command -v ip6tables >/dev/null 2>&1; then
-    echo -e "    ${L}·${N} IPv6 防火墙菜单 : 主菜单 ${C}5) 防火墙管理 → 2) IPv6 防火墙管理 → 4) 开放端口${N}"
-  fi
-  echo -e "    ${L}·${N} 云厂商安全组    : ${D}阿里云 / 腾讯云 / AWS / Vultr 等控制台需自行加 ${port}/${proto} 入站规则${N}"
-  echo ""
 }
 
 ip6_get_input_policy(){

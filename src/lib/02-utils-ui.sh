@@ -262,7 +262,3 @@ validate_port(){
 
   [ "$port" -ge 1 ] && [ "$port" -le 65535 ]
 }
-
-sanitize_sni(){
-  printf '%s' "$1" | tr -d '\r\n' | tr -d '"'
-}

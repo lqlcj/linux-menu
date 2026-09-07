@@ -146,7 +146,7 @@ ip4_view_listening(){
 }
 
 ip4_init_firewall(){
-  local ssh_port confirm conflicts txn node node_port node_mode node_proto
+  local ssh_port confirm conflicts txn
 
   # 缺 ss 工具无法验证 sshd 监听，直接拒绝，避免写错 SSH 放行端口。
   if ! command -v ss >/dev/null 2>&1; then
@@ -167,9 +167,8 @@ ip4_init_firewall(){
   echo -e "    1) 仅重建脚本专属链 ${C}${IP4_LEYILI_CHAIN}${N}，保留用户与 fail2ban 规则"
   echo "    2) 放行回环、已建立连接与 ICMP"
   echo -e "    3) 放行 SSH ${C}${ssh_port}/tcp${N}、80/tcp、443/tcp"
-  echo "    4) 自动恢复全部已安装节点的 IPv4 主端口"
-  echo "    5) INPUT 默认策略 = DROP"
-  echo "    6) OUTPUT / FORWARD 保持原样"
+  echo "    4) INPUT 默认策略 = DROP"
+  echo "    5) OUTPUT / FORWARD 保持原样"
   echo ""
   echo -e "  ${D}所有写入均先快照；任一步失败会立即恢复活动规则与持久化文件。${N}"
   echo ""
@@ -231,22 +230,6 @@ ip4_init_firewall(){
     pause_screen
     return 1
   fi
-
-  for node in reality hy2 anytls tuic ss2022; do
-    node_installed "$node" || continue
-    node_port=$(get_node_value "$node" Port 2>/dev/null || true)
-    node_mode=$(get_node_value "$node" Mode 2>/dev/null || echo ipv4)
-    [ -n "$node_port" ] || continue
-    { [ "$node_mode" = "ipv4" ] || [ "$node_mode" = "dualstack" ]; } || continue
-    case "$node" in hy2|tuic) node_proto="udp" ;; *) node_proto="tcp" ;; esac
-    if ! firewall_add_managed_port 4 "$node_proto" "$node_port"; then
-      firewall_transaction_rollback 4 "$txn"
-      echo -e "${R}恢复 ${node} 端口失败，已恢复原规则${N}"
-      pause_screen
-      return 1
-    fi
-    echo -e "  ${G}已恢复 ${node}：${node_port}/${node_proto}${N}"
-  done
 
   if ! iptables -P INPUT DROP \
      || ! verify_sshd_listening_on_port "$ssh_port" \
