@@ -1,0 +1,2 @@
+# 本机 Claude Code 设置，可能含凭据，禁止入库
+.claude/settings.local.json
