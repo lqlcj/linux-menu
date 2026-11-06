@@ -78,6 +78,9 @@ firewall_output=$(printf '0\n' | show_firewall_menu 2>/dev/null)
 assert_contains "$firewall_output" 'ITEM:1:IPv4 防火墙管理' 'firewall menu'
 assert_contains "$firewall_output" 'ITEM:2:IPv6 防火墙管理' 'firewall menu'
 
+admin_output=$(printf '0\n' | show_admin_menu 2>/dev/null)
+assert_contains "$admin_output" 'ITEM:7:关闭 SSH 密码登录 (仅密钥)' 'admin menu'
+
 # Exercise nested menus and renumbered actions without changing the host.
 navigation_output=$(
   show_server_status(){ printf 'ACTION:status\n'; }
@@ -139,9 +142,77 @@ port_rc=$?
 set -e
 assert_eq '2' "$port_rc" 'fail2ban 15-port limit'
 
+# 白名单：地址/CIDR 去重、滤掉回环、拒绝非法项，"-" 清空。
+assert_eq '203.0.113.7,2001:db8::/32,198.51.100.0/24' \
+  "$(normalize_fail2ban_ignoreip_list '203.0.113.7 ，2001:db8::/32; 127.0.0.1/8 ::1 198.51.100.0/24,203.0.113.7')" \
+  'fail2ban ignoreip normalization'
+assert_eq '' "$(normalize_fail2ban_ignoreip_list '-')" 'fail2ban ignoreip clear'
+for bad_ip in '1.2.3.256' '1.2.3.4/33' '2001:db8::/129' 'example.com' '1.2.3.4/' '1.2.3.4/8/8' '1.2.3.4/abc'; do
+  set +e
+  normalize_fail2ban_ignoreip_list "$bad_ip" >/dev/null
+  ip_rc=$?
+  set -e
+  assert_eq '1' "$ip_rc" "fail2ban ignoreip rejects ${bad_ip}"
+done
+
+# jail 渲染：严格参数、aggressive、累进封禁、recidive 全端口，白名单写进两个 jail。
+jail_text=$(fail2ban_render_jail '22,2222' '203.0.113.7,198.51.100.0/24' '/var/log/fail2ban.log' 1)
+assert_contains "$jail_text" 'port         = 22,2222' 'fail2ban jail port'
+assert_contains "$jail_text" 'mode         = aggressive' 'fail2ban jail mode'
+assert_contains "$jail_text" "maxretry     = ${FAIL2BAN_MAXRETRY}" 'fail2ban jail maxretry'
+assert_contains "$jail_text" 'bantime.increment = true' 'fail2ban jail increment'
+assert_contains "$jail_text" "journalmatch = ${FAIL2BAN_SSHD_JOURNALMATCH}" 'fail2ban jail journalmatch'
+assert_contains "$jail_text" '[recidive]' 'fail2ban recidive jail'
+assert_contains "$jail_text" 'banaction = %(banaction_allports)s' 'fail2ban recidive allports'
+assert_contains "$jail_text" 'logpath   = /var/log/fail2ban.log' 'fail2ban recidive logpath'
+[ "$(printf '%s\n' "$jail_text" | grep -c '^ignoreip.*= 127.0.0.1/8 ::1 203.0.113.7 198.51.100.0/24$')" = '2' ] \
+  || fail 'fail2ban ignoreip must be applied to both jails'
+assert_not_contains "$(fail2ban_render_jail 22 '' /x 0)" 'bantime.increment' 'fail2ban old version skips increment'
+[ "$FAIL2BAN_DBPURGEAGE" -gt "$FAIL2BAN_BANTIME_MAXTIME" ] || fail 'dbpurgeage must exceed bantime.maxtime'
+assert_contains "$(fail2ban_render_daemon_conf '')" "dbpurgeage = ${FAIL2BAN_DBPURGEAGE}" 'fail2ban daemon conf'
+assert_not_contains "$(fail2ban_render_daemon_conf '')" 'logtarget' 'fail2ban daemon conf keeps file logtarget'
+assert_contains "$(fail2ban_render_daemon_conf /var/log/fail2ban.log)" 'logtarget = /var/log/fail2ban.log' 'fail2ban daemon conf logtarget'
+
 # 通用托管文件事务必须同时恢复当前文件和预先存在的 original 备份。
 test_dir=$(mktemp -d)
 trap 'rm -rf -- "$test_dir"' EXIT HUP INT TERM
+
+# 已保存配置读取只看 [sshd] 段，兼容旧版单段文件。
+f2b_etc="${test_dir}/fail2ban"
+mkdir -p "$f2b_etc/jail.d" "$f2b_etc/fail2ban.d"
+(
+  FAIL2BAN_ETC_DIR="$f2b_etc"
+  FAIL2BAN_JAIL_PATH="$f2b_etc/jail.d/leyili-sshd.local"
+  FAIL2BAN_DAEMON_CONF_PATH="$f2b_etc/fail2ban.d/leyili.local"
+  printf '[sshd]\nenabled  = true\nport     = 22,2222\nmaxretry = 5\n' > "$FAIL2BAN_JAIL_PATH"
+  assert_eq '22,2222' "$(fail2ban_saved_jail_value port)" 'legacy jail port'
+  assert_eq '' "$(fail2ban_saved_jail_value ignoreip)" 'legacy jail ignoreip'
+  fail2ban_render_jail '2200' '203.0.113.7' /x 1 > "$FAIL2BAN_JAIL_PATH"
+  assert_eq '2200' "$(fail2ban_saved_jail_value port)" 'new jail port'
+  assert_eq '127.0.0.1/8 ::1 203.0.113.7' "$(fail2ban_saved_jail_value ignoreip)" 'new jail ignoreip'
+  assert_eq '203.0.113.7' "$(normalize_fail2ban_ignoreip_list "$(fail2ban_saved_jail_value ignoreip)")" 'saved ignoreip round trip'
+
+  # logtarget 取最后生效的值，并忽略脚本自己的文件。
+  printf '[DEFAULT]\nlogtarget = /var/log/fail2ban.log\n' > "$f2b_etc/fail2ban.conf"
+  assert_eq '/var/log/fail2ban.log' "$(fail2ban_effective_logtarget)" 'fail2ban default logtarget'
+  printf '[Definition]\nlogtarget = SYSTEMD-JOURNAL\n' > "$f2b_etc/fail2ban.local"
+  printf '[Definition]\nlogtarget = /tmp/should-be-ignored\n' > "$FAIL2BAN_DAEMON_CONF_PATH"
+  assert_eq 'SYSTEMD-JOURNAL' "$(fail2ban_effective_logtarget)" 'fail2ban overridden logtarget'
+
+  # 事务回滚：恢复旧 jail，删除本次新建的守护配置，并按快照恢复服务状态。
+  systemctl(){ printf 'SYSTEMCTL:%s\n' "$*" >> "$test_dir/f2b-systemctl.log"; [ "$1" != is-enabled ] && [ "$1" != is-active ]; }
+  rm -f -- "$FAIL2BAN_DAEMON_CONF_PATH"
+  printf 'old-jail\n' > "$FAIL2BAN_JAIL_PATH"
+  f2b_txn=$(TMPDIR="$test_dir" fail2ban_transaction_begin)
+  printf 'new-jail\n' > "$FAIL2BAN_JAIL_PATH"
+  printf 'new-daemon\n' > "$FAIL2BAN_DAEMON_CONF_PATH"
+  fail2ban_transaction_restore "$f2b_txn"
+  assert_eq 'old-jail' "$(tr -d '\r\n' < "$FAIL2BAN_JAIL_PATH")" 'fail2ban jail rollback'
+  [ ! -e "$FAIL2BAN_DAEMON_CONF_PATH" ] || fail 'fail2ban rollback kept a newly created daemon conf'
+  [ ! -d "$f2b_txn" ] || fail 'fail2ban rollback left its transaction directory'
+  assert_contains "$(cat "$test_dir/f2b-systemctl.log")" 'SYSTEMCTL:disable fail2ban' 'fail2ban rollback disables'
+  assert_contains "$(cat "$test_dir/f2b-systemctl.log")" 'SYSTEMCTL:stop fail2ban' 'fail2ban rollback stops'
+)
 
 # Uninstall must restore firewall snapshots on failure and retain the entry.
 # All writable paths are temporary; host service and firewall calls are mocked.

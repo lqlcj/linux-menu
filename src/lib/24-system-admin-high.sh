@@ -310,6 +310,87 @@ enable_root_ssh_login(){
   fi
 }
 
+# 有 authorized_keys 且公钥认证未被关掉，才算"能用密钥登录"
+ssh_user_has_usable_key(){
+  local user="$1" home_dir
+
+  [ "$(get_effective_sshd_value PubkeyAuthentication "$user")" != "no" ] || return 1
+  home_dir=$(getent passwd "$user" | cut -d: -f6)
+  [ -n "$home_dir" ] || return 1
+  [ -s "$home_dir/.ssh/authorized_keys" ] || [ -s "$home_dir/.ssh/authorized_keys2" ]
+}
+
+# 关闭密码登录（含 keyboard-interactive），只允许密钥。
+# 前提：至少一个能 SSH 登录且有 sudo / root 权限的账户已配置公钥，否则拒绝执行。
+disable_ssh_password_login(){
+  local confirm="" user root_login="" key_user=""
+  local sudo_users=""
+
+  if ! require_root; then
+    return 1
+  fi
+
+  echo ""
+  echo -e "  ${B}检查可用密钥登录的管理员账户...${N}"
+  root_login=$(get_effective_sshd_value PermitRootLogin root)
+  case "$root_login" in
+    no|forced-commands-only) ;;
+    *)
+      if ssh_user_has_usable_key root; then
+        key_user="root"
+        echo -e "    ${G}✓${N}  ${C}root${N}  ${D}(公钥)${N}"
+      else
+        echo -e "    ${R}✗${N}  ${C}root${N}  ${D}(无 authorized_keys)${N}"
+      fi
+      ;;
+  esac
+
+  sudo_users=$(getent group sudo 2>/dev/null | awk -F: '{print $4}' | tr ',' '\n' | grep -v '^root$' | grep -v '^$')
+  while IFS= read -r user; do
+    [ -n "$user" ] || continue
+    if ssh_user_has_usable_key "$user"; then
+      key_user="${key_user:-$user}"
+      echo -e "    ${G}✓${N}  ${C}${user}${N}  ${D}(公钥)${N}"
+    else
+      echo -e "    ${R}✗${N}  ${C}${user}${N}  ${D}(无 authorized_keys)${N}"
+    fi
+  done <<EOF
+$sudo_users
+EOF
+
+  if [ -z "$key_user" ]; then
+    echo ""
+    echo -e "${R}没有任何可 SSH 登录的管理员账户配置了公钥，关闭密码登录会把自己锁在外面，已中止${N}"
+    echo -e "${Y}先在本地电脑执行：${N}${C}ssh-copy-id -p <端口> <用户>@<服务器IP>${N}"
+    echo -e "${Y}并确认能用密钥登录后再回来执行此项。${N}"
+    pause_screen
+    return 1
+  fi
+
+  echo ""
+  echo -e "${Y}警告：${N} 关闭后只能用密钥登录。请确认你${B}已经用密钥成功登录过${N}，而不只是放了公钥文件。"
+  read -p "  确认关闭 SSH 密码登录？(y/N): " confirm
+  if [ "$confirm" != "y" ] && [ "$confirm" != "Y" ]; then
+    echo -e "  已取消"
+    sleep 1
+    return 0
+  fi
+
+  # keyboard-interactive 走 PAM 同样能输密码，必须一起关
+  if ! apply_sshd_setting "KbdInteractiveAuthentication" "no" "keyboard-interactive 认证已关闭"; then
+    return 1
+  fi
+  if ! apply_sshd_setting "PasswordAuthentication" "no" "SSH 密码登录已关闭"; then
+    return 1
+  fi
+  cleanup_old_backups "${SSHD_CONFIG_PATH}.bak.*" 5
+  echo -e "  当前设置: ${C}PasswordAuthentication no / KbdInteractiveAuthentication no${N}"
+  echo ""
+  echo -e "  ${B}${R}【强烈建议】${N}${B}保留当前 SSH 窗口！${N}"
+  echo -e "  ${B}先开新终端用密钥登录成功，再关闭当前窗口。${N}"
+  pause_screen
+}
+
 configure_passwordless_sudo(){
   local username=""
   local dropin_path=""

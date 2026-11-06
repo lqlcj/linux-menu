@@ -201,6 +201,17 @@ show_server_status(){
 
   echo -e "  ${B}${C}›  服务${N}"
   printf "  ${L}●${N} %-10s : %s\n" "fail2ban" "$(status_service_state fail2ban fail2ban-client)"
+  if [ "$(id -u)" -eq 0 ] && command -v fail2ban-client >/dev/null 2>&1; then
+    local f2b_jail f2b_status f2b_failed f2b_banned f2b_total
+    for f2b_jail in sshd recidive; do
+      f2b_status=$(timeout 3 fail2ban-client status "$f2b_jail" 2>/dev/null) || continue
+      f2b_failed=$(printf '%s\n' "$f2b_status" | awk -F: '/Total failed/ {gsub(/[[:space:]]/, "", $2); print $2}')
+      f2b_banned=$(printf '%s\n' "$f2b_status" | awk -F: '/Currently banned/ {gsub(/[[:space:]]/, "", $2); print $2}')
+      f2b_total=$(printf '%s\n' "$f2b_status" | awk -F: '/Total banned/ {gsub(/[[:space:]]/, "", $2); print $2}')
+      printf "  ${L}●${N} %-10s : 当前封禁 %s   累计封禁 %s   累计失败 %s\n" \
+        "  ${f2b_jail}" "${f2b_banned:-0}" "${f2b_total:-0}" "${f2b_failed:-0}"
+    done
+  fi
 
   pause_screen
 }

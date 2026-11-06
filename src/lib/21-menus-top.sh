@@ -83,6 +83,7 @@ show_admin_menu(){
     render_menu_item 4 "修改 SSH 端口"
     render_menu_item 5 "禁止 root 登录"
     render_menu_item 6 "配置 sudo 免密"
+    render_menu_item 7 "关闭 SSH 密码登录 (仅密钥)"
     render_menu_item 0 "返回上级"
     render_divider
     read -p "  请输入序号: " choice
@@ -105,6 +106,9 @@ show_admin_menu(){
         ;;
       6)
         configure_passwordless_sudo
+        ;;
+      7)
+        disable_ssh_password_login
         ;;
       0)
         return
